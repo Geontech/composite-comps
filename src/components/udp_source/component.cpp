@@ -1,3 +1,22 @@
+/*
+ * Copyright (C) 2024 Geon Technologies, LLC
+ *
+ * This file is part of composite-comps.
+ *
+ * composite-comps is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * composite-comps is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see http://www.gnu.org/licenses/.
+ */
+
 #include "component.hpp"
 
 #include <arpa/inet.h>
@@ -43,7 +62,7 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string {
 
 
 udp_source::udp_source() :
-  caddie::component("udp_source"),
+  composite::component("udp_source"),
   m_socket(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) {
     add_port(m_out_port.get());
     add_property("interface", &m_interface);
@@ -102,7 +121,7 @@ auto udp_source::initialize() -> void {
 
 auto udp_source::start() -> void {
     m_filler = std::jthread(&udp_source::keep_full, this);
-    caddie::component::start();
+    composite::component::start();
 }
 
 auto udp_source::stop() -> void {
@@ -110,11 +129,11 @@ auto udp_source::stop() -> void {
     if (m_filler.joinable()) {
         m_filler.join();
     }
-    caddie::component::stop();
+    composite::component::stop();
 }
 
-auto udp_source::process() -> caddie::retval {
-    using enum caddie::retval;
+auto udp_source::process() -> composite::retval {
+    using enum composite::retval;
     auto data = std::unique_ptr<udpsrc::net::mmsgs>{nullptr};
     {
         auto lk = std::scoped_lock{m_mtx};
@@ -135,7 +154,7 @@ auto udp_source::process() -> caddie::retval {
         if (m_pfds.at(0).revents & POLLIN) [[likely]] {
             if (auto recvd = recvmmsg(m_socket, data->msgs.data(), data->msgs.size(), 0, &timeout); recvd != -1) {
                 data->buffers->resize(recvd);
-                m_out_port->send_data(std::move(data->buffers));
+                m_out_port->send_data(std::move(data->buffers), std::chrono::system_clock::now());
             }
         }
     }
@@ -153,7 +172,7 @@ auto udp_source::keep_full(std::stop_token token) -> void {
 }
 
 extern "C" {
-    auto create() -> std::shared_ptr<caddie::component> {
+    auto create() -> std::shared_ptr<composite::component> {
         return std::make_shared<udp_source>();
     }
 }

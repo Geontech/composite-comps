@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(udp_source VERSION 0.1.0 LANGUAGES CXX)
+project(psd VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -32,16 +32,23 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Custom compile options
+add_compile_options(-march=native -mtune=native -ffast-math)
+
 # Library
-add_library(udp_source MODULE
+add_library(psd MODULE
     component.cpp
 )
-# Link
-target_link_libraries(udp_source
+# Includes
+target_include_directories(psd
+    PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../include
+)
+target_link_libraries(psd
     PRIVATE
     composite::composite
 )
 # Install
-install(TARGETS udp_source
+install(TARGETS psd
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )

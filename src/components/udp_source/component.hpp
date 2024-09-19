@@ -1,5 +1,24 @@
+/*
+ * Copyright (C) 2024 Geon Technologies, LLC
+ *
+ * This file is part of composite-comps.
+ *
+ * composite-comps is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * composite-comps is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see http://www.gnu.org/licenses/.
+ */
+
 #include <array>
-#include <caddie/component.hpp>
+#include <composite/component.hpp>
 #include <mutex>
 #include <poll.h>
 #include <queue>
@@ -28,8 +47,8 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string;
 
 } // namespace udpsrc::net
 
-class udp_source : public caddie::component {
-    using output_port_t = caddie::output_port<std::vector<std::vector<uint8_t>>>;
+class udp_source : public composite::component {
+    using output_port_t = composite::output_port<std::vector<std::vector<uint8_t>>>;
     static constexpr std::uint32_t RECV_BUF_SIZE{0xFFFF};
 public:
     udp_source();
@@ -37,7 +56,7 @@ public:
     auto initialize() -> void override;
     auto start() -> void override;
     auto stop() -> void override;
-    auto process() -> caddie::retval override;
+    auto process() -> composite::retval override;
 
 private:
     // Ports

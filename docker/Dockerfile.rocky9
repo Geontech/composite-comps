@@ -1,0 +1,61 @@
+FROM rockylinux:9-minimal AS base
+
+LABEL maintainer="Geon Technologies" \
+      description="composite-based components"
+
+RUN microdnf -y update && microdnf -y upgrade
+
+RUN adduser -s /bin/bash composite-dev
+
+FROM base AS build
+
+RUN set -ex; \
+    microdnf install -y gcc-toolset-13-gcc-c++; \
+    microdnf install -y cmake; \
+    microdnf install -y git; \
+    microdnf install -y fftw-devel;
+
+FROM build AS composite
+
+WORKDIR /opt
+
+RUN set -ex; \
+    . /opt/rh/gcc-toolset-13/enable; \
+    git clone https://github.com/geontech/composite.git; \
+    cd composite; \
+    cmake -B docker-build \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release; \
+    cmake --build  docker-build --target install --parallel 4
+
+FROM build AS project
+
+COPY --link --from=composite /usr/local /usr/local
+
+COPY include /opt/composite-comps/include
+COPY src /opt/composite-comps/src
+COPY examples /opt/composite-comps/examples
+COPY CMakeLists.txt /opt/composite-comps
+WORKDIR /opt/composite-comps
+
+RUN set -ex; \
+    . /opt/rh/gcc-toolset-13/enable; \
+    cmake -B docker-build \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release; \
+    cmake --build docker-build --target install --parallel 4
+
+FROM base
+
+COPY --link --from=composite /usr/local/bin /usr/local/bin
+COPY --link --from=project /usr/local/lib64 /usr/local/lib64
+COPY --link --from=project /opt/composite-comps/examples /usr/local/share/composite/examples
+
+RUN microdnf install -y libstdc++
+
+ENV LD_LIBRARY_PATH=/usr/local/lib64
+ENV BIN_ARGS=""
+
+USER composite-dev
+
+CMD /usr/local/bin/composite-cli ${BIN_ARGS}

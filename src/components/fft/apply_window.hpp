@@ -17,27 +17,16 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include <composite/component.hpp>
-#include <vector>
+#pragma once
 
-class file_writer : public composite::component {
-    using input_port_t = composite::input_port<std::vector<std::vector<uint8_t>>>;
-public:
-    file_writer();
-    ~file_writer() override;
-    auto initialize() -> void override;
-    auto process() -> composite::retval override;
+#include "avx_helpers.hpp"
 
-private:
-    // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
+template <typename T>
+auto apply_window(const T* data, const float* window, float* dst) -> void {
+    avx::window_cvt_i_ps(data, window, dst);
+}
 
-    // Properties
-    std::string m_filename;
-    uint64_t m_num_bytes{};
-
-    // Members
-    int m_file{-1};
-    uint64_t m_total_bytes{};
-
-}; // class file_writer
+template <typename T>
+auto apply_window(const T* data, const double* window, double* dst) -> void {
+    avx::window_cvt_i_pd(data, window, dst);
+}
