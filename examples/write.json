@@ -1,0 +1,57 @@
+{
+    "name" : "Write raw data",
+    "components" : [
+        {
+            "name" : "udp_source",
+            "properties" : [
+                {
+                    "type" : "uint32",
+                    "name" : "msg_size",
+                    "value" : 1032 
+                },
+                {
+                    "type" : "uint32",
+                    "name" : "num_msgs",
+                    "value" : 64 
+                },
+                {
+                    "type" : "string",
+                    "name" : "ip_addr",
+                    "value" : "127.0.0.1" 
+                },
+                {
+                    "type" : "uint32",
+                    "name" : "port",
+                    "value" : 9999
+                }
+            ]
+        },
+        {
+            "name" : "file_writer",
+            "properties" : [
+                {
+                    "type" : "string",
+                    "name" : "filename",
+                    "value" : "example.dat"
+                },
+                {
+                    "type" : "uint64",
+                    "name" : "num_bytes",
+                    "value" : 100000000
+                }
+            ]
+        }
+    ],
+    "connections" : [
+        {
+            "output" : {
+                "component" : "udp_source",
+                "port" : "data_out"
+            },
+            "input" : {
+                "component" : "file_writer",
+                "port" : "data_in"
+            }
+        }
+    ]
+}

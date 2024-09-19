@@ -1,6 +1,28 @@
+/*
+ * Copyright (C) 2024 Geon Technologies, LLC
+ *
+ * This file is part of composite-comps.
+ *
+ * composite-comps is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * composite-comps is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see http://www.gnu.org/licenses/.
+ */
+
 #include <map>
 #include <span>
 #include <vrtgen/vrtgen.hpp>
+
+namespace overlay {
+namespace v49 {
 
 auto is_data(const vrtgen::packing::Header& header) -> bool {
     using enum vrtgen::packing::PacketType;
@@ -12,9 +34,9 @@ auto is_context(const vrtgen::packing::Header& header) -> bool {
     return (header.packet_type() == CONTEXT);
 }
 
-class v49_overlay {
+class overlay {
 public:
-    explicit v49_overlay(std::span<const uint8_t> data) :
+    explicit overlay(std::span<const uint8_t> data) :
       m_data(data) {
         m_header.unpack_from(m_data.data());
         auto curr_idx = m_header.size();
@@ -108,4 +130,7 @@ private:
     vrtgen::packing::Header m_header;
     std::map<std::string, std::size_t> m_positions;
 
-}; // class v49_overlay
+}; // class overlay
+
+} // namespace overlay
+} // namespace v49

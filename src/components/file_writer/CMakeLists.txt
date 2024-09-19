@@ -1,3 +1,22 @@
+#
+# Copyright (C) 2024 Geon Technologies, LLC
+#
+# This file is part of composite-comps.
+#
+# composite-comps is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# composite-comps is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program.  If not, see http://www.gnu.org/licenses/.
+#
+
 cmake_minimum_required(VERSION 3.15)
 project(file_writer VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
@@ -13,16 +32,6 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Use FetchContent for dependencies
-include(FetchContent)
-# vrtgen dependency
-FetchContent_Declare(vrtgen
-    GIT_REPOSITORY https://github.com/geontech/vrtgen.git
-    GIT_TAG v0.7.12
-)
-# Make all deps available
-FetchContent_MakeAvailable(vrtgen)
-
 # Library
 add_library(file_writer MODULE
     component.cpp
@@ -36,7 +45,7 @@ target_include_directories(file_writer
 # Link
 target_link_libraries(file_writer
     PRIVATE
-    caddie::caddie
+    composite::composite
 )
 # Install
 install(TARGETS file_writer

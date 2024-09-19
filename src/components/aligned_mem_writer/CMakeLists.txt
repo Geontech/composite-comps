@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(udp_source VERSION 0.1.0 LANGUAGES CXX)
+project(aligned_mem_writer VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -33,15 +33,20 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Library
-add_library(udp_source MODULE
+add_library(aligned_mem_writer MODULE
     component.cpp
 )
+# Includes
+target_include_directories(aligned_mem_writer
+    PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../include
+)
 # Link
-target_link_libraries(udp_source
+target_link_libraries(aligned_mem_writer
     PRIVATE
     composite::composite
 )
 # Install
-install(TARGETS udp_source
+install(TARGETS aligned_mem_writer
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )

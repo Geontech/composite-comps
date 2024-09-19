@@ -17,27 +17,17 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include <composite/component.hpp>
-#include <vector>
+#include "component.hpp"
 
-class file_writer : public composite::component {
-    using input_port_t = composite::input_port<std::vector<std::vector<uint8_t>>>;
-public:
-    file_writer();
-    ~file_writer() override;
-    auto initialize() -> void override;
-    auto process() -> composite::retval override;
+#include <string_view>
 
-private:
-    // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
-
-    // Properties
-    std::string m_filename;
-    uint64_t m_num_bytes{};
-
-    // Members
-    int m_file{-1};
-    uint64_t m_total_bytes{};
-
-}; // class file_writer
+extern "C" {
+    auto create(std::string_view type) -> std::shared_ptr<composite::component> {
+        if (type == "f32") {
+            return std::make_shared<psd<float>>();
+        } else if (type == "f64") {
+            return std::make_shared<psd<double>>();
+        }
+        return std::make_shared<psd<float>>();
+    }
+}

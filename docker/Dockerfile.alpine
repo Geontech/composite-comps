@@ -1,0 +1,61 @@
+FROM alpine:3.20 AS base
+
+LABEL maintainer="Geon Technologies" \
+      description="composite-based components"
+
+RUN apk update && apk upgrade
+
+RUN adduser -D composite-dev -s /bin/sh
+
+FROM base AS build
+
+RUN set -ex; \
+    apk add --no-cache build-base; \
+    apk add --no-cache gdb; \
+    apk add --no-cache cmake; \
+    apk add --no-cache git; \
+    apk add --no-cache linux-headers; \
+    apk add --no-cache fftw-dev;
+
+FROM build AS composite
+
+WORKDIR /opt
+
+RUN set -ex; \
+    git clone https://github.com/geontech/composite.git; \
+    cd composite; \
+    cmake -B docker-build \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release; \
+    cmake --build  docker-build --target install --parallel 4
+
+FROM build AS project
+
+COPY --link --from=composite /usr/local /usr/local
+
+COPY include /opt/composite-comps/include
+COPY src /opt/composite-comps/src
+COPY examples /opt/composite-comps/examples
+COPY CMakeLists.txt /opt/composite-comps
+WORKDIR /opt/composite-comps
+
+RUN set -ex; \
+    cmake -B docker-build \
+        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCMAKE_BUILD_TYPE=Release; \
+    cmake --build docker-build --target install --parallel 4
+
+FROM base
+
+COPY --link --from=composite /usr/local/bin /usr/local/bin
+COPY --link --from=project /usr/local/lib /usr/local/lib
+COPY --link --from=project /opt/composite-comps/examples /usr/local/share/composite/examples
+
+RUN apk add --no-cache libstdc++
+
+ENV LD_LIBRARY_PATH=/usr/local/lib
+ENV BIN_ARGS=""
+
+USER composite-dev
+
+CMD /usr/local/bin/composite-cli ${BIN_ARGS}
