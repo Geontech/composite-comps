@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(psd VERSION 0.1.0 LANGUAGES CXX)
+project(stov VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -29,26 +29,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
 set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Custom compile options
-add_compile_options(-march=cascadelake -ffast-math)
+add_compile_options(-march=cascadelake)
 
 # Library
-add_library(psd MODULE
+add_library(stov MODULE
     component.cpp
 )
 # Includes
-target_include_directories(psd
+target_include_directories(stov
     PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../include
+    ${vrtgen_SOURCE_DIR}/include
 )
-target_link_libraries(psd
+# Link
+target_link_libraries(stov
     PRIVATE
     composite::composite
 )
 # Install
-install(TARGETS psd
+install(TARGETS stov
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )

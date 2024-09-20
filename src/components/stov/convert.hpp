@@ -20,6 +20,7 @@
 #pragma once
 
 #include <concepts>
+#include <cstdint>
 #include <immintrin.h>
 
 namespace avx {
@@ -36,7 +37,8 @@ constexpr bool avxable_pd =
     std::is_same_v<T, int64_t> || std::is_same_v<T, uint64_t>;
 
 template <typename T>
-inline auto cvt_pd(const T* data) -> __m512i {
+requires avxable_pd<T>
+inline auto cvt_64(const T* data) -> __m512i {
     auto retval = __m512i{};
     // Load payload (type T))
     // Up-convert based on incoming type to 64-bit variant (signed or unsigned)
@@ -59,7 +61,8 @@ inline auto cvt_pd(const T* data) -> __m512i {
 }
 
 template <typename T>
-inline auto cvt_ps(const T* data) -> __m512i {
+requires avxable_ps<T>
+inline auto cvt_32(const T* data) -> __m512i {
     auto retval = __m512i{};
     // Load payload (type T))
     // Up-convert based on incoming type to 32-bit variant (signed or unsigned)
@@ -75,11 +78,12 @@ inline auto cvt_ps(const T* data) -> __m512i {
     return retval;
 }
 
+} // namespace avx
+
 template <typename T>
-requires avxable_ps<T>
-inline auto window_cvt_i_ps(const T* data, const float* window, float* dst) -> void {
+auto convert(const T* data, float* dst) -> void {
     // Load and convert
-    auto data_m512i = cvt_ps(data);
+    auto data_m512i = avx::cvt_32(data);
     // Convert u/int64 to floats
     auto payload_m512 = __m512{};
     if constexpr (std::is_signed_v<T>) {
@@ -87,36 +91,21 @@ inline auto window_cvt_i_ps(const T* data, const float* window, float* dst) -> v
     } else {
         payload_m512 = _mm512_cvtepu32_ps(data_m512i);
     }
-    if (window != nullptr) {
-        // Load window doubles
-        auto window_m512 = _mm512_load_ps(window);
-        // Multiply payload by window
-        payload_m512 = _mm512_mul_ps(payload_m512, window_m512);
-    }
     // Stored result into dst
     _mm512_store_ps(dst, payload_m512);
 }
 
 template <typename T>
-requires avxable_pd<T>
-inline auto window_cvt_i_pd(const T* data, const double* window, double* dst) -> void {
+auto convert(const T* data, double* dst) -> void {
     // Load and convert
-    auto data_m512i = cvt_pd(data);
-    // Convert u/int64 to doubles
-    auto payload_m512d = __m512d{};
+    auto data_m512i = avx::cvt_64(data);
+    // Convert u/int64 to floats
+    auto payload_m512 = __m512d{};
     if constexpr (std::is_signed_v<T>) {
-        payload_m512d = _mm512_cvtepi64_pd(data_m512i);
+        payload_m512 = _mm512_cvtepi64_pd(data_m512i);
     } else {
-        payload_m512d = _mm512_cvtepu64_pd(data_m512i);
-    }
-    if (window != nullptr) {
-        // Load window doubles
-        auto window_m512d = _mm512_load_pd(window);
-        // Multiply payload by window
-        payload_m512d = _mm512_mul_pd(payload_m512d, window_m512d);
+        payload_m512 = _mm512_cvtepu64_pd(data_m512i);
     }
     // Stored result into dst
-    _mm512_store_pd(dst, payload_m512d);
+    _mm512_store_pd(dst, payload_m512);
 }
-
-} // namespace avx

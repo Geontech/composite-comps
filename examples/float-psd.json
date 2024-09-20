@@ -1,0 +1,117 @@
+{
+    "name" : "PSD float version",
+    "properties": [
+        {
+            "type" : "string",
+            "name" : "window",
+            "value" : "BLACKMAN_HARRIS"
+        },
+        {
+            "type" : "uint32",
+            "name" : "fft_size",
+            "value" : 8192
+        }
+    ],
+    "components" : [
+        {
+            "name" : "udp_source",
+            "properties" : [
+                {
+                    "type" : "uint32",
+                    "name" : "msg_size",
+                    "value" : 1044
+                },
+                {
+                    "type" : "uint32",
+                    "name" : "num_msgs",
+                    "value" : 64
+                },
+                {
+                    "type" : "string",
+                    "name" : "interface",
+                    "value" : "data0" 
+                },
+                {
+                    "type" : "string",
+                    "name" : "ip_addr",
+                    "value" : "239.103.10.1" 
+                },
+                {
+                    "type" : "uint32",
+                    "name" : "port",
+                    "value" : 10101
+                }
+            ]
+        },
+        {
+            "name" : "stov",
+            "create_arg" : "cf32",
+            "properties" : [
+                {
+                    "type" : "string",
+                    "name" : "transport",
+                    "value" : "vita49"
+                },
+                {
+                    "type" : "uint32",
+                    "name" : "output_size",
+                    "value" : 8192
+                }
+            ]
+        },
+        {
+            "name" : "fft",
+            "create_arg" : "f32",
+            "properties" : [
+                {
+                    "type" : "uint32",
+                    "name" : "fftw_threads",
+                    "value" : 2
+                }
+            ]
+        },
+        {
+            "name" : "psd",
+            "create_arg" : "f32",
+            "properties" : [
+                {
+                    "type" : "float",
+                    "name" : "sample_rate",
+                    "value" : 24576000
+                }
+            ]
+        }
+    ],
+    "connections" : [
+        {
+            "output" : {
+                "component" : "udp_source",
+                "port" : "data_out"
+            },
+            "input" : {
+                "component" : "stov",
+                "port" : "data_in"
+            }
+        },
+        {
+            "output" : {
+                "component" : "stov",
+                "port" : "data_out"
+            },
+            "input" : {
+                "component" : "fft",
+                "port" : "data_in"
+            }
+        },
+        {
+            "output" : {
+                "component" : "fft",
+                "port" : "data_out"
+            },
+            "input" : {
+                "component" : "psd",
+                "port" : "data_in"
+            }
+        }
+    ]
+}

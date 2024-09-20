@@ -19,14 +19,26 @@
 
 #pragma once
 
-#include "avx_helpers.hpp"
+#include <immintrin.h>
 
-template <typename T>
-auto apply_window(const T* data, const float* window, float* dst) -> void {
-    avx::window_cvt_i_ps(data, window, dst);
+auto apply_window(const float* data, const float* window, float* dst) -> void {
+    // Load payload data
+    auto payload_m512 = _mm512_load_ps(data);
+    // Load window floats
+    auto window_m512 = _mm512_load_ps(window);
+    // Multiply payload by window
+    payload_m512 = _mm512_mul_ps(payload_m512, window_m512);
+    // Stored result into dst
+    _mm512_store_ps(dst, payload_m512);
 }
 
-template <typename T>
-auto apply_window(const T* data, const double* window, double* dst) -> void {
-    avx::window_cvt_i_pd(data, window, dst);
+auto apply_window(const double* data, const double* window, double* dst) -> void {
+    // Load payload data
+    auto payload_m512d = _mm512_load_pd(data);
+    // Load window doubles
+    auto window_m512d = _mm512_load_pd(window);
+    // Multiply payload by window
+    payload_m512d = _mm512_mul_pd(payload_m512d, window_m512d);
+    // Stored result into dst
+    _mm512_store_pd(dst, payload_m512d);
 }
