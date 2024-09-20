@@ -57,6 +57,7 @@ public:
             m_bytes_written += num_written;
             if (m_bytes_written >= m_num_bytes) {
                 m_in_port->clear();
+                m_in_port.reset();
                 return FINISH;
             }
         }

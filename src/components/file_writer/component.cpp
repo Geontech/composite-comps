@@ -64,6 +64,7 @@ auto file_writer::process() -> composite::retval {
         m_total_bytes += num_written;
         if (m_total_bytes >= m_num_bytes) {
             m_in_port->clear();
+            m_in_port.reset();
             return composite::retval::FINISH;
         }
     }

@@ -22,6 +22,50 @@
 #include <vrtgen/vrtgen.hpp>
 
 namespace overlay {
+
+namespace sdds {
+
+static constexpr double TIME_TIC = 250e-12;
+static constexpr double TIME_TWO32 = 4294967296.0;
+static constexpr uint64_t PS250_PER_SEC = 4000000000;
+
+class overlay {
+    static constexpr std::size_t DATA_IDX = 56;
+    static constexpr std::size_t DATA_LEN = 1024;
+public:
+    explicit overlay(std::span<const uint8_t> data) :
+      m_data(data) {
+    }
+
+    auto ttag() const -> uint64_t {
+        return vrtgen::swap::from_be(*reinterpret_cast<const uint64_t*>(m_data.data() + 8));
+    }
+
+    auto ttage() const -> uint32_t {
+        return vrtgen::swap::from_be(*reinterpret_cast<const uint32_t*>(m_data.data() + 16));
+    }
+
+    auto secs() const -> uint32_t {
+        return static_cast<uint32_t>(ttag() / PS250_PER_SEC);
+    }
+
+    auto psecs() const -> uint64_t {
+        return (ttag() * uint64_t{250u}) - (static_cast<uint64_t>(secs()) * uint64_t{1'000'000'000'000u});
+    }
+
+    template<typename T>
+    auto payload() const -> std::span<const T> {
+        auto data = reinterpret_cast<const T*>(m_data.data() + DATA_IDX);
+        return std::span<const T>(data, DATA_LEN / sizeof(T));
+    }
+
+private:
+    std::span<const uint8_t> m_data;
+
+}; // class overlay
+
+} // namespace sdds
+
 namespace v49 {
 
 auto is_data(const vrtgen::packing::Header& header) -> bool {
@@ -132,5 +176,5 @@ private:
 
 }; // class overlay
 
-} // namespace overlay
 } // namespace v49
+} // namespace overlay

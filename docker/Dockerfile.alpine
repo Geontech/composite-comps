@@ -35,7 +35,6 @@ COPY --link --from=composite /usr/local /usr/local
 
 COPY include /opt/composite-comps/include
 COPY src /opt/composite-comps/src
-COPY examples /opt/composite-comps/examples
 COPY CMakeLists.txt /opt/composite-comps
 WORKDIR /opt/composite-comps
 
@@ -49,13 +48,15 @@ FROM base
 
 COPY --link --from=composite /usr/local/bin /usr/local/bin
 COPY --link --from=project /usr/local/lib /usr/local/lib
-COPY --link --from=project /opt/composite-comps/examples /usr/local/share/composite/examples
 
-RUN apk add --no-cache libstdc++
+RUN apk add --no-cache libstdc++ fftw
+COPY examples /usr/local/share/composite/examples
+RUN chmod a+r /usr/local/share/composite/examples/*.json
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 ENV BIN_ARGS=""
 
 USER composite-dev
+WORKDIR /home/composite-dev
 
 CMD /usr/local/bin/composite-cli ${BIN_ARGS}
