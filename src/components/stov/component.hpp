@@ -40,6 +40,7 @@ public:
         add_port(m_out_port.get());
         add_property("output_size", &m_output_size);
         add_property("transport", &m_transport);
+        add_property("byteswap", &m_byteswap);
     }
 
     ~stov() override = default;
@@ -84,12 +85,14 @@ public:
                 if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
                     convert(
                         reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<float*>(m_output_buf->data() + m_output_idx)
+                        reinterpret_cast<float*>(m_output_buf->data() + m_output_idx),
+                        m_byteswap
                     );
                 } else { // double or std::complex<double>
                     convert(
                         reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<double*>(m_output_buf->data() + m_output_idx)
+                        reinterpret_cast<double*>(m_output_buf->data() + m_output_idx),
+                        m_byteswap
                     );
                 }
                 m_output_idx += stride;
@@ -110,11 +113,12 @@ private:
 
     // Properties
     uint32_t m_output_size{};
-    uint32_t m_output_idx{};
     std::string m_transport;
+    bool m_byteswap{false};
 
     // Members
     std::unique_ptr<output_t> m_output_buf;
+    uint32_t m_output_idx{};
     typename output_port_t::timestamp_type m_output_ts;
 
 }; // class stov
