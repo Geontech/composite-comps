@@ -18,6 +18,7 @@
 #
 
 add_subdirectory(aligned_mem_writer)
+add_subdirectory(exp_smooth)
 add_subdirectory(fft)
 add_subdirectory(file_writer)
 add_subdirectory(psd)
