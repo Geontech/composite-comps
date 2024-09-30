@@ -13,6 +13,8 @@ RUN set -ex; \
     microdnf install -y gcc-toolset-13-gcc-c++; \
     microdnf install -y cmake; \
     microdnf install -y git; \
+    microdnf install -y vim; \
+    microdnf install -y gdb; \
     microdnf install -y fftw-devel;
 
 FROM build AS composite
