@@ -22,42 +22,34 @@
 #include <aligned_mem.hpp>
 
 #include <immintrin.h>
-#include <memory>
 
 template <typename T>
 class work {};
 
 template <>
 class work<float> {
+    using psd_data_t = aligned::aligned_mem<float>;
 public:
     explicit work(float alpha) {
         m_alpha_vec = _mm512_set1_ps(alpha);
         m_one_minus_alpha_vec = _mm512_set1_ps(1 - alpha);
     }
 
-    auto process(aligned::aligned_mem<float>* curr_psd) -> void {
-        if (m_exp_data == nullptr) {
-            m_exp_data = aligned::make_aligned<float>(64, curr_psd->size());
-            std::copy(curr_psd->data(), curr_psd->data() + curr_psd->size(), m_exp_data->data());
-            return;
-        }
+    auto process(psd_data_t* curr_psd, psd_data_t* prev_psd) const -> void {
         for (auto i=0u; i < curr_psd->size(); i += 16) {
             // Load data
             auto curr_data = _mm512_load_ps(curr_psd->data() + i);
-            auto exp_data = _mm512_load_ps(m_exp_data->data() + i);
+            auto prev_data = _mm512_load_ps(prev_psd->data() + i);
             // Multiply current data by alpha
             curr_data = _mm512_mul_ps(curr_data, m_alpha_vec);
             // Multiply prev by (1-alpha) and add to current
-            exp_data = _mm512_fmadd_ps(exp_data, m_one_minus_alpha_vec, curr_data);
+            curr_data = _mm512_fmadd_ps(prev_data, m_one_minus_alpha_vec, curr_data);
             // Store result into psd
-            _mm512_store_ps(curr_psd->data() + i, exp_data);
-            // Store for feedback
-            _mm512_store_ps(m_exp_data->data() + i, exp_data);
+            _mm512_store_ps(curr_psd->data() + i, curr_data);
         }
     }
 
 private:
-    std::unique_ptr<aligned::aligned_mem<float>> m_exp_data{nullptr};
     __m512 m_alpha_vec;
     __m512 m_one_minus_alpha_vec;
 
@@ -65,37 +57,29 @@ private:
 
 template <>
 class work<double> {
+    using psd_data_t = aligned::aligned_mem<double>;
 public:
     explicit work(double alpha) {
         m_alpha_vec = _mm512_set1_pd(alpha);
-        m_one_minus_alpha_vec = _mm512_set1_pd(1- alpha);
+        m_one_minus_alpha_vec = _mm512_set1_pd(1 - alpha);
     }
 
-    auto process(aligned::aligned_mem<double>* curr_psd) -> void {
-        if (m_exp_data == nullptr) {
-            m_exp_data = aligned::make_aligned<double>(64, curr_psd->size());
-            std::copy(curr_psd->data(), curr_psd->data() + curr_psd->size(), m_exp_data->data());
-            return;
-        }
-        for (auto i=0u; i < curr_psd->size(); i += 16) {
+    auto process(psd_data_t* curr_psd, psd_data_t* prev_psd) const -> void {
+        for (auto i=0u; i < curr_psd->size(); i += 8) {
             // Load data
             auto curr_data = _mm512_load_pd(curr_psd->data() + i);
-            auto exp_data = _mm512_load_pd(m_exp_data->data() + i);
+            auto prev_data = _mm512_load_pd(prev_psd->data() + i);
             // Multiply current data by alpha
             curr_data = _mm512_mul_pd(curr_data, m_alpha_vec);
             // Multiply prev by (1-alpha) and add to current
-            exp_data = _mm512_fmadd_pd(exp_data, m_one_minus_alpha_vec, curr_data);
+            curr_data = _mm512_fmadd_pd(prev_data, m_one_minus_alpha_vec, curr_data);
             // Store result into psd
-            _mm512_store_pd(curr_psd->data() + i, exp_data);
-            // Store for feedback
-            _mm512_store_pd(m_exp_data->data() + i, exp_data);
+            _mm512_store_pd(curr_psd->data() + i, curr_data);
         }
     }
 
 private:
-    std::unique_ptr<aligned::aligned_mem<double>> m_exp_data{nullptr};
     __m512d m_alpha_vec;
     __m512d m_one_minus_alpha_vec;
 
-}; // class work<float>
-
+}; // class work<double>

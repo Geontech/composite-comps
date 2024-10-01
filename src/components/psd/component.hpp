@@ -17,9 +17,10 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include "aligned_mem.hpp"
-#include "psd_work.hpp"
-#include "windows.hpp"
+#include "work.hpp"
+
+#include <aligned_mem.hpp>
+#include <windows.hpp>
 
 #include <composite/component.hpp>
 #include <complex>
@@ -60,7 +61,7 @@ public:
             }
         );
         auto window_sum = std::accumulate(m_window->data(), m_window->data() + m_window->size(), T{});
-        m_psd_work = std::make_unique<psd_work<T>>(window_sum, m_sample_rate);
+        m_work = std::make_unique<work<T>>(window_sum, m_sample_rate);
     }
 
     auto process() -> composite::retval override {
@@ -70,10 +71,12 @@ public:
             return NOOP;
         }
         // Perform PSD
-        auto psd = m_psd_work->process(data.get());
-        std::transform(psd->data(), psd->data() + psd->size(), psd->data(), [](const float& val) {
-            return 10 * std::log10(val);
+        auto psd = m_work->process(data.get());
+        std::transform(psd->data(), psd->data() + psd->size(), psd->data(), [](const T& val) {
+            return std::log2(val);
         });
+        // Apply log multiplier
+        m_work->apply_multiplier(psd.get());
         // Send data
         m_out_port->send_data(std::move(psd), ts);
 
@@ -92,6 +95,6 @@ private:
 
     // Members
     std::unique_ptr<window_t> m_window;
-    std::unique_ptr<psd_work<T>> m_psd_work;
+    std::unique_ptr<work<T>> m_work;
 
 }; // class psd

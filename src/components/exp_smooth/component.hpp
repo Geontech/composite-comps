@@ -52,10 +52,19 @@ public:
             m_out_port->send_data(std::move(data), ts);
             return NORMAL;
         }
+        // Handle first PSD
+        if (!m_prev_psd) {
+            m_prev_psd = std::move(data);
+            m_prev_psd_ts = ts;
+            return NORMAL;
+        }
         // Run algorithm
-        m_work->process(data.get());
-        // Send updated data
-        m_out_port->send_data(std::move(data), ts);
+        m_work->process(data.get(), m_prev_psd.get());
+        // Send previous PSD data and timestamp
+        m_out_port->send_data(std::move(m_prev_psd), m_prev_psd_ts);
+        // Save current PSD for next pass
+        m_prev_psd = std::move(data);
+        m_prev_psd_ts = ts;
         return NORMAL;
     }
 
@@ -69,5 +78,7 @@ private:
 
     // Members
     std::unique_ptr<work<T>> m_work;
+    typename input_port_t::buffer_type m_prev_psd;
+    composite::timestamp m_prev_psd_ts;
 
 }; // class exp_smooth

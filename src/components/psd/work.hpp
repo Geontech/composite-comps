@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "aligned_mem.hpp"
+#include <aligned_mem.hpp>
 
 #include <algorithm>
 #include <complex>
@@ -27,14 +27,15 @@
 #include <immintrin.h>
 
 template <typename T>
-class psd_work {};
+class work {};
 
 template <>
-class psd_work<float> {
+class work<float> {
 public:
-    psd_work(float window_sum, float sample_rate) {
+    work(float window_sum, float sample_rate) {
         m_window_sum_512 = _mm512_set1_ps(window_sum);
         m_fs_512 = _mm512_set1_ps(sample_rate);
+        m_log_const = _mm512_set1_ps(float{10} / std::log2f(10));
         m_real_idx_512i = _mm512_set_epi32(30,28,26,24,22,20,18,16,14,12,10,8,6,4,2,0);
         m_imag_idx_512i = _mm512_set_epi32(31,29,27,25,23,21,19,17,15,13,11,9,7,5,3,1);
     }
@@ -60,20 +61,33 @@ public:
         return psd;
     }
 
+    auto apply_multiplier(aligned::aligned_mem<float>* data) const -> void {
+        for (auto i=0u; i < data->size(); i += 16) {
+            // Load data
+            auto ps_data = _mm512_load_ps(data->data() + i);  
+            // Apply constant
+            ps_data = _mm512_mul_ps(ps_data, m_log_const);
+            // Store result
+            _mm512_store_ps(data->data() + i, ps_data);
+        }
+    }
+
 private:
     __m512 m_window_sum_512;
     __m512 m_fs_512;
+    __m512 m_log_const;
     __m512i m_real_idx_512i;
     __m512i m_imag_idx_512i;
 
 }; // class psd_work<float>
 
 template <>
-class psd_work<double> {
+class work<double> {
 public:
-    psd_work(double window_sum, double sample_rate) {
+    work(double window_sum, double sample_rate) {
         m_window_sum_512 = _mm512_set1_pd(window_sum);
         m_fs_512 = _mm512_set1_pd(sample_rate);
+        m_log_const = _mm512_set1_pd(double{10} / std::log2(10));
         m_real_idx_512i = _mm512_set_epi64(14,12,10,8,6,4,2,0);
         m_imag_idx_512i = _mm512_set_epi64(15,13,11,9,7,5,3,1);
     }
@@ -99,10 +113,22 @@ public:
         return psd;
     }
 
+    auto apply_multiplier(aligned::aligned_mem<double>* data) const -> void {
+        for (auto i=0u; i < data->size(); i += 8) {
+            // Load data
+            auto ps_data = _mm512_load_pd(data->data() + i);  
+            // Apply constant
+            ps_data = _mm512_mul_pd(ps_data, m_log_const);
+            // Store result
+            _mm512_store_pd(data->data() + i, ps_data);
+        }
+    }
+
 private:
     __m512d m_window_sum_512;
     __m512d m_fs_512;
+    __m512d m_log_const;
     __m512i m_real_idx_512i;
     __m512i m_imag_idx_512i;
 
-}; // class psd_work<double>
+}; // class work<double>
