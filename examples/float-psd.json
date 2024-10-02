@@ -10,17 +10,17 @@
             "type" : "uint32",
             "name" : "fft_size",
             "value" : 8192
+        },
+        {
+            "type" : "uint32",
+            "name" : "msg_size",
+            "value" : 1044
         }
     ],
     "components" : [
         {
             "name" : "udp_source",
             "properties" : [
-                {
-                    "type" : "uint32",
-                    "name" : "msg_size",
-                    "value" : 1044
-                },
                 {
                     "type" : "uint32",
                     "name" : "num_msgs",
@@ -56,6 +56,11 @@
                     "type" : "uint32",
                     "name" : "output_size",
                     "value" : 8192
+                },
+                {
+                    "type" : "bool",
+                    "name" : "byteswap",
+                    "value" : true
                 }
             ]
         },

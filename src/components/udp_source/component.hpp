@@ -33,13 +33,13 @@ namespace udpsrc::net {
 
 class mmsgs {
 public:
-    using buffer_type = std::vector<std::vector<uint8_t>>;
+    using buffer_type = std::vector<uint8_t>;
 
     mmsgs(size_t num_msgs, size_t msg_size);
 
     std::vector<struct mmsghdr> msgs;
     std::vector<struct iovec> iovecs;
-    std::unique_ptr<buffer_type> buffers = std::make_unique<buffer_type>();
+    std::unique_ptr<buffer_type> buffer;
 
 }; // class mmsgs
 
@@ -48,7 +48,8 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string;
 } // namespace udpsrc::net
 
 class udp_source : public composite::component {
-    using output_port_t = composite::output_port<std::vector<std::vector<uint8_t>>>;
+    using output_t = std::vector<uint8_t>;
+    using output_port_t = composite::output_port<output_t>;
     static constexpr std::uint32_t RECV_BUF_SIZE{0xFFFF};
 public:
     udp_source();

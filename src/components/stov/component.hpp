@@ -30,7 +30,7 @@
 
 template <typename T>
 class stov : public composite::component {
-    using input_t = std::vector<std::vector<uint8_t>>;
+    using input_t = std::vector<uint8_t>;
     using input_port_t = composite::input_port<input_t>;
     using output_t = aligned::aligned_mem<T>;
     using output_port_t = composite::output_port<output_t>;
@@ -41,6 +41,7 @@ public:
         add_property("output_size", &m_output_size);
         add_property("transport", &m_transport);
         add_property("byteswap", &m_byteswap);
+        add_property("msg_size", &m_msg_size);
     }
 
     ~stov() override = default;
@@ -51,16 +52,16 @@ public:
         if (data == nullptr) {
             return NORMAL;
         }
-        for (auto& v : *data) {
+        for (auto idx = size_t{}; idx < data->size(); idx += m_msg_size) {
             auto payload = std::span<const std::complex<int16_t>>{};
             auto ts = composite::timestamp{};
             if (m_transport == "sdds") {
-                auto packet = overlay::sdds::overlay(v);
+                auto packet = overlay::sdds::overlay({data->data() + idx, m_msg_size});
                 // TODO - validations regarding parity and ttv
                 ts = composite::timestamp{packet.secs(), packet.psecs()};
                 payload = packet.payload<std::complex<int16_t>>();
             } else if (m_transport == "vita49") {
-                auto packet = overlay::v49::overlay(v);
+                auto packet = overlay::v49::overlay({data->data() + idx, m_msg_size});
                 if (auto& header = packet.header(); !overlay::v49::is_data(header)) {
                     continue;
                 }
@@ -115,6 +116,7 @@ private:
     uint32_t m_output_size{};
     std::string m_transport;
     bool m_byteswap{false};
+    uint32_t m_msg_size{};
 
     // Members
     std::unique_ptr<output_t> m_output_buf;
