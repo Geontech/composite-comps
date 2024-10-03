@@ -56,7 +56,7 @@ public:
             m_window->data(),
             m_window->data() + m_window->size(),
             m_window->data(),
-            [](const float& val) {
+            [](float val) {
                 return val * val;
             }
         );
@@ -72,8 +72,14 @@ public:
         }
         // Perform PSD
         auto psd = m_work->process(data.get());
-        std::transform(psd->data(), psd->data() + psd->size(), psd->data(), [](const T& val) {
-            return std::log2(val);
+        std::transform(psd->data(), psd->data() + psd->size(), psd->data(), [](T val) {
+            if (val > T{0}) {
+                if constexpr (std::is_same_v<T, float>) {
+                    return std::log2f(val);
+                }
+                return std::log2(val);
+            }
+            return val;
         });
         // Apply log multiplier
         m_work->apply_multiplier(psd.get());
