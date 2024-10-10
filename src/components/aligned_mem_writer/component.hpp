@@ -27,7 +27,7 @@
 template <typename T>
 class aligned_mem_writer : public composite::component {
     using input_t = aligned::aligned_mem<T>;
-    using input_port_t = composite::input_port<input_t>;
+    using input_port_t = composite::input_port<std::unique_ptr<input_t>>;
 public:
     aligned_mem_writer() : composite::component("aligned_mem_writer") {
         add_port(m_in_port.get());

@@ -32,8 +32,8 @@ class psd : public composite::component {
     using fft_t = aligned::aligned_mem<std::complex<T>>;
     using psd_t = aligned::aligned_mem<T>;
     using window_t = aligned::aligned_mem<T>;
-    using input_port_t = composite::input_port<fft_t>;
-    using output_port_t = composite::output_port<psd_t>;
+    using input_port_t = composite::input_port<std::unique_ptr<fft_t>>;
+    using output_port_t = composite::output_port<std::unique_ptr<psd_t>>;
 public:
     psd() : composite::component("psd") {
         add_port(m_in_port.get());
