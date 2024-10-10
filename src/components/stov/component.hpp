@@ -31,9 +31,9 @@
 template <typename T>
 class stov : public composite::component {
     using input_t = std::vector<uint8_t>;
-    using input_port_t = composite::input_port<input_t>;
+    using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using output_t = aligned::aligned_mem<T>;
-    using output_port_t = composite::output_port<output_t>;
+    using output_port_t = composite::output_port<std::unique_ptr<output_t>>;
 public:
     stov() : composite::component("stov") {
         add_port(m_in_port.get());
@@ -115,7 +115,7 @@ private:
     // Properties
     uint32_t m_output_size{};
     std::string m_transport;
-    bool m_byteswap{false};
+    bool m_byteswap{true};
     uint32_t m_msg_size{};
 
     // Members

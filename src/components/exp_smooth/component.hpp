@@ -26,8 +26,8 @@
 template <typename T>
 class exp_smooth : public composite::component {
     using input_t = aligned::aligned_mem<T>;
-    using input_port_t = composite::input_port<input_t>;
-    using output_port_t = composite::output_port<input_t>;
+    using input_port_t = composite::input_port<std::unique_ptr<input_t>>;
+    using output_port_t = composite::output_port<std::unique_ptr<input_t>>;
 public:
     exp_smooth() : composite::component("exp_smooth") {
         add_port(m_in_port.get());

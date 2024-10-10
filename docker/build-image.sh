@@ -1,8 +1,8 @@
 #!/bin/bash
 
 image=composite-comps
-os=alpine
-tag=dev-local-tmp
+os=rocky9
+tag=dev-local
 
 while getopts i:s:t: flag
 do
