@@ -19,6 +19,8 @@
 
 #include "component.hpp"
 
+#include <byteswap.h>
+
 histogram::histogram() : composite::component("histogram") {
     add_port(m_in_port.get());
     add_port(m_out_port.get());
@@ -41,25 +43,29 @@ auto histogram::process() -> composite::retval {
     }
     // Histogram
     for (auto idx = size_t{}; idx < data->size(); idx += m_msg_size) {
-        auto payload = std::span<const std::complex<int16_t>>{};
+        auto payload = std::span<const std::complex<uint16_t>>{};
         if (m_transport == "sdds") {
             auto packet = overlay::sdds::overlay({data->data() + idx, m_msg_size});
-            payload = packet.payload<std::complex<int16_t>>();
+            payload = packet.payload<std::complex<uint16_t>>();
         } else if (m_transport == "vita49") {
             auto packet = overlay::v49::overlay({data->data() + idx, m_msg_size});
             if (auto& header = packet.header(); !overlay::v49::is_data(header)) {
                 continue;
             }
-            payload = packet.payload<std::complex<int16_t>>();
+            payload = packet.payload<std::complex<uint16_t>>();
         }
         // Get sample values
         for (auto& sample : payload) {
-            auto sample_val = (m_byteswap ? static_cast<int16_t>(ntohs(sample.real())) : sample.real());
+            auto sample_val = static_cast<int16_t>(m_byteswap ? bswap_16(sample.real()) : sample.real());
             sample_val += static_cast<int16_t>(m_histogram->size() / 2);
-            if (sample_val >= 0 && sample_val < m_histogram->size()) {
+            if (sample_val <= 0) {
+                m_histogram->front() += 1;
+            } else if (sample_val >= m_histogram->size() - 1) {
+                m_histogram->back() += 1;
+            } else {
                 m_histogram->at(sample_val) += 1;
-                ++m_histogram_samples;
             }
+            ++m_histogram_samples;
         }
     }
     // Send histogram data
