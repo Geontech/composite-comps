@@ -57,13 +57,13 @@ auto histogram::process() -> composite::retval {
         // Get sample values
         for (auto& sample : payload) {
             auto sample_val = static_cast<int16_t>(m_byteswap ? bswap_16(sample.real()) : sample.real());
-            sample_val += static_cast<int16_t>(m_histogram->size() / 2);
-            if (sample_val <= 0) {
+            auto sample_val_32 = static_cast<int32_t>(sample_val) + static_cast<int32_t>(m_histogram->size() / 2);
+            if (sample_val_32 >= 0 && sample_val_32 < m_histogram->size()) {
+                m_histogram->at(sample_val_32) += 1;
+            } else if (sample_val_32 < 0) {
                 m_histogram->front() += 1;
-            } else if (sample_val >= m_histogram->size() - 1) {
-                m_histogram->back() += 1;
             } else {
-                m_histogram->at(sample_val) += 1;
+                m_histogram->back() += 1;
             }
             ++m_histogram_samples;
         }
