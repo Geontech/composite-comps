@@ -22,7 +22,7 @@ FROM build AS composite
 WORKDIR /opt
 
 RUN set -ex; \
-    git clone https://github.com/geontech/composite.git; \
+    git clone --branch v0.1.0 https://github.com/geontech/composite.git; \
     cd composite; \
     cmake -B docker-build \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
