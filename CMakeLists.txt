@@ -23,7 +23,7 @@ include(GNUInstallDirs)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # composite dependency
-find_package(composite)
+find_package(composite 0.1.0 REQUIRED)
 
 # Use FetchContent for other dependencies
 include(FetchContent)
