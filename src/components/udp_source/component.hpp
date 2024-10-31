@@ -50,7 +50,6 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string;
 class udp_source : public composite::component {
     using output_t = std::vector<uint8_t>;
     using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
-    static constexpr std::uint32_t RECV_BUF_SIZE{0xFFFF};
 public:
     udp_source();
     ~udp_source() override;
@@ -67,7 +66,7 @@ private:
     std::string m_interface;
     std::string m_ip_addr;
     uint32_t m_port{};
-    uint32_t m_recv_buf_size{RECV_BUF_SIZE};
+    uint32_t m_recv_buf_size{};
     uint32_t m_msg_size{};
     uint32_t m_num_msgs{};
 

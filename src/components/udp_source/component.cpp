@@ -84,7 +84,9 @@ auto udp_source::initialize() -> void {
     m_pfds.at(0).fd = m_socket;
     m_pfds.at(0).events = POLLIN;
     // Set receive buffer size
-    setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&m_recv_buf_size, sizeof(m_recv_buf_size));
+    if (m_recv_buf_size > 0) {
+        setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&m_recv_buf_size, sizeof(m_recv_buf_size));
+    }
     // Set receive timeout
     using timeval_t = struct timeval;
     auto tv = timeval_t{.tv_sec = 1, .tv_usec = 0};
@@ -156,10 +158,7 @@ auto udp_source::process() -> composite::retval {
         if (m_pfds.at(0).revents & POLLIN) [[likely]] {
             if (auto recvd = recvmmsg(m_socket, data->msgs.data(), data->msgs.size(), 0, &timeout); recvd != -1) {
                 data->buffer->resize(recvd * m_msg_size);
-                auto now = std::chrono::system_clock::now();
-                auto secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch());
-                auto nsecs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch());
-                m_out_port->send_data(std::move(data->buffer), {static_cast<uint32_t>(secs.count()), static_cast<uint64_t>((nsecs - secs).count())});
+                m_out_port->send_data(std::move(data->buffer), {});
             }
         }
     }
