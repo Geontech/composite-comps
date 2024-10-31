@@ -48,6 +48,7 @@ target_include_directories(stov
 target_link_libraries(stov
     PRIVATE
     composite::composite
+    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS stov

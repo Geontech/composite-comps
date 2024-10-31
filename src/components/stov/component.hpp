@@ -26,6 +26,7 @@
 #include <composite/component.hpp>
 #include <complex>
 #include <cstdint>
+#include <spdlog/spdlog.h>
 #include <vector>
 
 template <typename T>
@@ -62,9 +63,14 @@ public:
                 payload = packet.payload<std::complex<int16_t>>();
             } else if (m_transport == "vita49") {
                 auto packet = overlay::v49::overlay({data->data() + idx, m_msg_size});
-                if (auto& header = packet.header(); !overlay::v49::is_data(header)) {
+                auto& header = packet.header();
+                if (!overlay::v49::is_data(header)) {
                     continue;
                 }
+                if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
+                    spdlog::error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
+                }
+                m_pkt_count = header.packet_count();
                 if (auto int_ts = packet.integer_timestamp()) {
                     ts.seconds = int_ts.value();
                 }
@@ -122,5 +128,6 @@ private:
     std::unique_ptr<output_t> m_output_buf;
     uint32_t m_output_idx{};
     typename output_port_t::timestamp_type m_output_ts;
+    uint8_t m_pkt_count{};
 
 }; // class stov

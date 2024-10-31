@@ -32,7 +32,12 @@ FetchContent_Declare(vrtgen
     GIT_REPOSITORY https://github.com/geontech/vrtgen.git
     GIT_TAG v0.7.12
 )
+# spdlog dependency
+FetchContent_Declare(spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.14.1
+)
 # Make all deps available
-FetchContent_MakeAvailable(vrtgen)
+FetchContent_MakeAvailable(vrtgen spdlog)
 
 add_subdirectory(src)
