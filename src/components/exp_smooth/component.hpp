@@ -20,6 +20,7 @@
 #include "work.hpp"
 #include <aligned_mem.hpp>
 
+#include <cmath>
 #include <composite/component.hpp>
 #include <tuple>
 
@@ -32,12 +33,15 @@ public:
     exp_smooth() : composite::component("exp_smooth") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        add_property("alpha", &m_alpha);
+        add_property("num_averages", &m_num_averages);
     }
 
     ~exp_smooth() override = default;
 
     auto initialize() -> void override {
+        if (m_num_averages > 0) {
+            m_alpha -= std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
+        }
         m_work = std::make_unique<work<T>>(m_alpha);
     }
 
@@ -74,9 +78,10 @@ private:
     std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
 
     // Properties
-    T m_alpha{1.0};
+    uint32_t m_num_averages{};
 
     // Members
+    T m_alpha{1};
     std::unique_ptr<work<T>> m_work;
     typename input_port_t::buffer_type m_prev_psd;
     composite::timestamp m_prev_psd_ts;
