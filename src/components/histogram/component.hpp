@@ -48,6 +48,7 @@ private:
     bool m_byteswap{true};
     uint32_t m_adc_bits{};
     float m_sample_rate{};
+    bool m_display_as_bits{};
 
     // Members
     std::unique_ptr<histogram_t> m_histogram;
