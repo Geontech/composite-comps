@@ -23,7 +23,7 @@ WORKDIR /opt
 
 RUN set -ex; \
     . /opt/rh/gcc-toolset-13/enable; \
-    git clone --branch 11-add-rest-server-for-command-and-control https://github.com/geontech/composite.git; \
+    git clone --branch v0.2.0 https://github.com/geontech/composite.git; \
     cd composite; \
     cmake -B docker-build \
         -DCMAKE_INSTALL_PREFIX=/usr/local \
