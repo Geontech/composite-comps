@@ -25,10 +25,10 @@ histogram::histogram() : composite::component("histogram") {
     add_port(m_in_port.get());
     add_port(m_out_port.get());
     add_property("transport", &m_transport);
-    add_property("msg_size", &m_msg_size);
+    add_property("msg_size", &m_msg_size).units("bytes");
     add_property("byteswap", &m_byteswap);
-    add_property("adc_bits", &m_adc_bits);
-    add_property("sample_rate", &m_sample_rate);
+    add_property("adc_bits", &m_adc_bits).units("bits");
+    add_property("sample_rate", &m_sample_rate).units("sps");
     add_property("display_as_bits", &m_display_as_bits);
 }
 

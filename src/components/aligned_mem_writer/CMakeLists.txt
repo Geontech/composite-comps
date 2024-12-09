@@ -45,6 +45,7 @@ target_include_directories(aligned_mem_writer
 target_link_libraries(aligned_mem_writer
     PRIVATE
     composite::composite
+    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS aligned_mem_writer

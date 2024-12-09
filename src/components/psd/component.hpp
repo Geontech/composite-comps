@@ -38,15 +38,25 @@ public:
     psd() : composite::component("psd") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        add_property("window", &m_window_type);
-        add_property("fft_size", &m_fft_size);
-        add_property("sample_rate", &m_sample_rate);
+        using enum composite::config_type;
+        add_property("window", &m_window_type).configurability(RUNTIME).change_listener([this]() {
+            if ((m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING")) {
+                return true;
+            }
+            return false;
+        });
+        add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
+            return std::has_single_bit(m_fft_size);
+        });
+        add_property("sample_rate", &m_sample_rate).units("sps").configurability(RUNTIME).change_listener([this]() {
+            return m_sample_rate > T{};
+        });
     }
 
     ~psd() override = default;
 
-    auto initialize() -> void override {
-        // Init window
+    auto property_change_handler() -> void override {
+        // Create window
         if (m_window_type == "BLACKMAN_HARRIS") {
             m_window = windows::blackman_harris<T>(m_fft_size, false);
         } else if (m_window_type == "HAMMING") {
@@ -60,6 +70,7 @@ public:
                 return val * val;
             }
         );
+        // Create work class
         auto window_sum = std::accumulate(m_window->data(), m_window->data() + m_window->size(), T{});
         m_work = std::make_unique<work<T>>(window_sum, m_sample_rate);
     }

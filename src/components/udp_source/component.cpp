@@ -29,6 +29,8 @@
 #include <poll.h>
 #include <queue>
 #include <ranges>
+#include <source_location>
+#include <spdlog/spdlog.h>
 #include <string>
 #include <string_view>
 #include <sys/ioctl.h>
@@ -63,63 +65,96 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string {
 } // namespace udpsrc::net
 
 
-udp_source::udp_source() :
-  composite::component("udp_source"),
-  m_socket(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) {
+udp_source::udp_source() : composite::component("udp_source") {
     add_port(m_out_port.get());
-    add_property("interface", &m_interface);
-    add_property("ip_addr", &m_ip_addr);
-    add_property("port", &m_port);
-    add_property("recv_buf_size", &m_recv_buf_size);
-    add_property("msg_size", &m_msg_size);
-    add_property("num_msgs", &m_num_msgs);
+    using enum composite::config_type;
+    add_property("interface", &m_interface).configurability(RUNTIME).change_listener([this]() {
+        m_new_socket_required = true;
+        return true;
+    });
+    add_property("ip_addr", &m_ip_addr).configurability(RUNTIME).change_listener([this]() {
+        m_new_socket_required = true;
+        return true;
+    });
+    add_property("port", &m_port).configurability(RUNTIME).change_listener([this]() {
+        m_new_socket_required = true;
+        return true;
+    });
+    add_property("recv_buf_size", &m_recv_buf_size).units("bytes");
+    add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME).change_listener([this]() {
+        m_flush_queue = true;
+        return true;
+    });
+    add_property("num_msgs", &m_num_msgs).units("per recvmmsg call").configurability(RUNTIME).change_listener([this]() {
+        m_flush_queue = true;
+        return true;
+    });
 }
 
 udp_source::~udp_source() {
     close(m_socket);
 }
 
-auto udp_source::initialize() -> void {
-    // Setup poll
-    m_pfds.at(0).fd = m_socket;
-    m_pfds.at(0).events = POLLIN;
+auto udp_source::property_change_handler() -> void {
+    logger()->trace(std::source_location::current().function_name());
+    if (m_new_socket_required) {
+        logger()->trace("property changes indicate new socket is required; closing socket");
+        // Close socket
+        close(m_socket);
+        m_socket = -1;
+        // Open socket
+        logger()->trace("opening socket");
+        m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        // Setup poll
+        m_pfds.at(0).fd = m_socket;
+        m_pfds.at(0).events = POLLIN;
+        // Set non-blocking
+        logger()->trace("setting socket to non-blocking");
+        fcntl(m_socket, F_SETFL, O_NONBLOCK);
+        // Determine multicast from address
+        auto multi_addr_start = htonl(inet_addr("224.0.0.0"));
+        auto multi_addr_end = htonl(inet_addr("239.255.255.255"));
+        auto bind_addr = htonl(inet_addr(m_ip_addr.c_str()));
+        auto is_multicast = (bind_addr >= multi_addr_start) && (bind_addr <= multi_addr_end);
+        if (is_multicast) {
+            bind_addr = INADDR_ANY;
+        }
+        // Bind the socket
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = ntohl(bind_addr);
+        addr.sin_port = htons(m_port);
+        if (bind_addr == INADDR_ANY) {
+            logger()->trace("binding socket to 0.0.0.0:{}", m_port);
+        } else {
+            logger()->trace("binding socket to {}:{}", m_ip_addr, m_port);
+        }
+        bind(m_socket, (struct  sockaddr*)&addr, sizeof(addr));
+        if (is_multicast) {
+            // Multicast group
+            struct ip_mreq group{};
+            auto bind_address = udpsrc::net::get_interface_ip(m_socket, m_interface);
+            group.imr_interface.s_addr = inet_addr(bind_address.c_str());
+            group.imr_multiaddr.s_addr = inet_addr(m_ip_addr.c_str());
+            logger()->trace("subscribing to multicast group {} on interface {} ({})", m_ip_addr, m_interface, bind_address);
+            setsockopt(m_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&group, sizeof(group));
+        }
+    }
+    // Check if properties related to queue we adjusted
+    if (m_flush_queue) {
+        logger()->trace("property changes indicate queue flush is required; rebuilding queue");
+        m_queue.clear();
+        // Setup queue of mmsg headers with iovec buffers
+        m_queue_size = m_num_msgs / 2;
+        for (auto _ : std::views::iota(size_t{0}, m_queue_size)) {
+            m_queue.emplace_back(std::make_unique<udpsrc::net::mmsgs>(m_num_msgs, m_msg_size));
+        }
+    }
     // Set receive buffer size
     if (m_recv_buf_size > 0) {
+        logger()->trace("setting socket receive buffer size to {}", m_recv_buf_size);
         setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&m_recv_buf_size, sizeof(m_recv_buf_size));
-    }
-    // Set receive timeout
-    using timeval_t = struct timeval;
-    auto tv = timeval_t{.tv_sec = 1, .tv_usec = 0};
-    setsockopt(m_socket, SOL_SOCKET, SO_RCVTIMEO, (char*)&tv, sizeof(tv));
-    // Set non-blocking
-    fcntl(m_socket, F_SETFL, O_NONBLOCK);
-    // Setup queue of mmsg headers with iovec buffers
-    m_queue_size = m_num_msgs / 2;
-    for (auto _ : std::views::iota(size_t{0}, m_queue_size)) {
-        m_queue.emplace(std::make_unique<udpsrc::net::mmsgs>(m_num_msgs, m_msg_size));
-    }
-    // Determine multicast from address
-    auto multi_addr_start = htonl(inet_addr("224.0.0.0"));
-    auto multi_addr_end = htonl(inet_addr("239.255.255.255"));
-    auto bind_addr = htonl(inet_addr(m_ip_addr.c_str()));
-    auto is_multicast = (bind_addr >= multi_addr_start) && (bind_addr <= multi_addr_end);
-    if (is_multicast) {
-        bind_addr = INADDR_ANY;
-    }
-    // Bind the socket
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ntohl(bind_addr);
-    addr.sin_port = htons(m_port);
-    bind(m_socket, (struct  sockaddr*)&addr, sizeof(addr));
-    if (is_multicast) {
-        // Multicast group
-        struct ip_mreq group{};
-        auto bind_address = udpsrc::net::get_interface_ip(m_socket, m_interface);
-        group.imr_interface.s_addr = inet_addr(bind_address.c_str());
-        group.imr_multiaddr.s_addr = inet_addr(m_ip_addr.c_str());
-        setsockopt(m_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&group, sizeof(group));
     }
 }
 
@@ -145,7 +180,7 @@ auto udp_source::process() -> composite::retval {
             return NO_YIELD;
         }
         data = std::move(m_queue.front());
-        m_queue.pop();
+        m_queue.pop_front();
         m_cv.notify_one();
     }
     if (data == nullptr) {
@@ -153,7 +188,7 @@ auto udp_source::process() -> composite::retval {
     }
     using timespec_t = struct timespec;
     auto timeout = timespec_t{.tv_sec = 1, .tv_nsec = 0};
-    if (auto num_events = poll(m_pfds.data(), 1, 1000/*1s*/)) [[likely]] {
+    if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
         // check socket is ready to read
         if (m_pfds.at(0).revents & POLLIN) [[likely]] {
             if (auto recvd = recvmmsg(m_socket, data->msgs.data(), data->msgs.size(), 0, &timeout); recvd != -1) {
@@ -170,7 +205,7 @@ auto udp_source::keep_full(std::stop_token token) -> void {
         auto lk = std::unique_lock{m_mtx};
         m_cv.wait_for(lk, std::chrono::seconds(1), [this]{ return m_queue.size() < m_queue_size; });
         if (m_queue.size() < m_queue_size) {
-            m_queue.emplace(std::make_unique<udpsrc::net::mmsgs>(m_num_msgs, m_msg_size));
+            m_queue.emplace_back(std::make_unique<udpsrc::net::mmsgs>(m_num_msgs, m_msg_size));
         }
     }
 }

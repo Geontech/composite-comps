@@ -53,7 +53,7 @@ class udp_source : public composite::component {
 public:
     udp_source();
     ~udp_source() override;
-    auto initialize() -> void override;
+    auto property_change_handler() -> void override;
     auto start() -> void override;
     auto stop() -> void override;
     auto process() -> composite::retval override;
@@ -74,10 +74,12 @@ private:
     int m_socket{-1};
     std::array<struct pollfd, 1> m_pfds;
     size_t m_queue_size{m_num_msgs / 2};
-    std::queue<std::unique_ptr<udpsrc::net::mmsgs>> m_queue;
+    std::deque<std::unique_ptr<udpsrc::net::mmsgs>> m_queue;
     std::mutex m_mtx;
     std::condition_variable m_cv;
     std::jthread m_filler;
+    bool m_new_socket_required{true};
+    bool m_flush_queue{true};
 
     auto keep_full(std::stop_token token) -> void;
 

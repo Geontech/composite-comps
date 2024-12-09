@@ -48,6 +48,7 @@ target_include_directories(fft
 target_link_libraries(fft
     PRIVATE
     composite::composite
+    spdlog::spdlog_header_only
     fftw3f
     fftw3f_threads
     fftw3
