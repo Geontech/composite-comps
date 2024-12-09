@@ -32,7 +32,7 @@ public:
     aligned_mem_writer() : composite::component("aligned_mem_writer") {
         add_port(m_in_port.get());
         add_property("filename", &m_filename);
-        add_property("num_bytes", &m_num_bytes);
+        add_property("num_bytes", &m_num_bytes).units("bytes");
     }
 
     ~aligned_mem_writer() override {

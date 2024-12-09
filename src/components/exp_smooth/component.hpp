@@ -29,21 +29,22 @@ class exp_smooth : public composite::component {
     using input_t = aligned::aligned_mem<T>;
     using input_port_t = composite::input_port<std::unique_ptr<input_t>>;
     using output_port_t = composite::output_port<std::unique_ptr<input_t>>;
+    using enum composite::config_type;
 public:
     exp_smooth() : composite::component("exp_smooth") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        add_property("num_averages", &m_num_averages);
+        add_property("num_averages", &m_num_averages).configurability(RUNTIME).change_listener([this]() {
+            if (m_num_averages > 0) {
+                m_alpha = T{1} - std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
+            }
+            m_work = std::make_unique<work<T>>(m_alpha);
+            m_prev_psd.reset();
+            return true;
+        });
     }
 
     ~exp_smooth() override = default;
-
-    auto initialize() -> void override {
-        if (m_num_averages > 0) {
-            m_alpha -= std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
-        }
-        m_work = std::make_unique<work<T>>(m_alpha);
-    }
 
     auto process() -> composite::retval override {
         using enum composite::retval;

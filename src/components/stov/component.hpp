@@ -35,17 +35,28 @@ class stov : public composite::component {
     using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using output_t = aligned::aligned_mem<T>;
     using output_port_t = composite::output_port<std::unique_ptr<output_t>>;
+    using enum composite::config_type;
 public:
     stov() : composite::component("stov") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        add_property("output_size", &m_output_size);
-        add_property("transport", &m_transport);
-        add_property("byteswap", &m_byteswap);
-        add_property("msg_size", &m_msg_size);
+        add_property("output_size", &m_output_size).units("bytes").configurability(RUNTIME);
+        add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
+            if ((m_transport == "sdds") || (m_transport == "vita49")) {
+                return true;
+            }
+            return false;
+        });
+        add_property("byteswap", &m_byteswap).configurability(RUNTIME);
+        add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
     }
 
     ~stov() override = default;
+
+    auto property_change_handler() -> void override {
+        // flush input port
+        m_in_port->clear();
+    }
 
     auto process() -> composite::retval override {
         using enum composite::retval;
@@ -68,7 +79,7 @@ public:
                     continue;
                 }
                 if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
-                    spdlog::error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
+                    logger()->error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
                 }
                 m_pkt_count = header.packet_count();
                 if (auto int_ts = packet.integer_timestamp()) {

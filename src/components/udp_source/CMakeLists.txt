@@ -40,6 +40,7 @@ add_library(udp_source MODULE
 target_link_libraries(udp_source
     PRIVATE
     composite::composite
+    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS udp_source

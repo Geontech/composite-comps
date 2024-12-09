@@ -23,6 +23,7 @@
 #include "overlay.hpp"
 #include "windows.hpp"
 
+#include <bit>
 #include <composite/component.hpp>
 #include <complex>
 #include <fftw3.h>
@@ -36,26 +37,32 @@ class fft : public composite::component {
     using window_t = aligned::aligned_mem<T>;
     using input_port_t = composite::input_port<std::unique_ptr<fft_t>>;
     using output_port_t = composite::output_port<std::unique_ptr<fft_t>>;
+    using enum composite::config_type;
 public:
     fft() : composite::component("fft") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        add_property("window", &m_window_type);
-        add_property("fft_size", &m_fft_size);
+        add_property("window", &m_window_type).change_listener([this]() {
+            if ((m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING")) {
+                return true;
+            }
+            return false;
+        });
+        add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
+            return std::has_single_bit(m_fft_size);
+        });
         add_property("fftw_threads", &m_fftw_threads);
-        add_property("shift", &m_shift);
+        add_property("shift", &m_shift).configurability(RUNTIME);
     }
 
     ~fft() override = default;
 
-    auto initialize() -> void override {
-        // Init window
+    auto property_change_handler() -> void override {
         if (m_window_type == "BLACKMAN_HARRIS") {
             m_window = windows::blackman_harris<T>(m_fft_size);
         } else if (m_window_type == "HAMMING") {
             m_window = windows::hamming<T>(m_fft_size);
         }
-        // Init fftw
         m_fft_plan = std::make_unique<plan_t>(m_fft_size, m_fftw_threads, m_shift);
     }
 
