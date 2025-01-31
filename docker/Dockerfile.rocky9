@@ -15,24 +15,10 @@ RUN set -ex; \
     microdnf install -y git; \
     microdnf install -y vim; \
     microdnf install -y gdb; \
-    microdnf install -y fftw-devel;
-
-FROM build AS composite
-
-WORKDIR /opt
-
-RUN set -ex; \
-    . /opt/rh/gcc-toolset-13/enable; \
-    git clone --branch v0.2.0 https://github.com/geontech/composite.git; \
-    cd composite; \
-    cmake -B docker-build \
-        -DCMAKE_INSTALL_PREFIX=/usr/local \
-        -DCMAKE_BUILD_TYPE=Release; \
-    cmake --build  docker-build --target install --parallel 4
+    microdnf install -y fftw-devel; \
+    microdnf install -y openssl-devel;
 
 FROM build AS project
-
-COPY --link --from=composite /usr/local /usr/local
 
 COPY include /opt/composite-comps/include
 COPY src /opt/composite-comps/src
@@ -42,17 +28,17 @@ WORKDIR /opt/composite-comps
 RUN set -ex; \
     . /opt/rh/gcc-toolset-13/enable; \
     cmake -B docker-build \
-        -DCMAKE_INSTALL_PREFIX=/usr/local \
+        -DCOMPOSITE_USE_NATS=ON \
+        -DCOMPOSITE_INSTALL=ON \
+        -DCMAKE_INSTALL_PREFIX=/opt/usr/local \
         -DCMAKE_BUILD_TYPE=Release; \
     cmake --build docker-build --target install --parallel 4
 
 FROM base
 
-COPY --link --from=composite /usr/local/bin /usr/local/bin
-
 RUN microdnf install -y libstdc++ vim fftw
 
-COPY --link --from=project /usr/local/lib64 /usr/local/lib64
+COPY --link --from=project /opt/usr/local /usr/local
 
 COPY examples /usr/local/share/composite/examples
 RUN chmod a+r /usr/local/share/composite/examples/*.json

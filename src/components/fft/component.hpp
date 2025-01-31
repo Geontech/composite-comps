@@ -37,7 +37,7 @@ class fft : public composite::component {
     using window_t = aligned::aligned_mem<T>;
     using input_port_t = composite::input_port<std::unique_ptr<fft_t>>;
     using output_port_t = composite::output_port<std::unique_ptr<fft_t>>;
-    using enum composite::config_type;
+    using enum composite::properties::config_type;
 public:
     fft() : composite::component("fft") {
         add_port(m_in_port.get());

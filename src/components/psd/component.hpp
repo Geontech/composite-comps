@@ -38,7 +38,7 @@ public:
     psd() : composite::component("psd") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        using enum composite::config_type;
+        using enum composite::properties::config_type;
         add_property("window", &m_window_type).configurability(RUNTIME).change_listener([this]() {
             if ((m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING")) {
                 return true;

@@ -22,11 +22,13 @@ project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# composite dependency
-find_package(composite 0.2.0 REQUIRED)
-
-# Use FetchContent for other dependencies
+# Use FetchContent for dependencies
 include(FetchContent)
+# composite dependency
+FetchContent_Declare(composite
+    GIT_REPOSITORY https://github.com/geontech/composite.git
+    GIT_TAG v0.3.0
+)
 # vrtgen dependency
 FetchContent_Declare(vrtgen
     GIT_REPOSITORY https://github.com/geontech/vrtgen.git
@@ -38,6 +40,6 @@ FetchContent_Declare(spdlog
     GIT_TAG v1.14.1
 )
 # Make all deps available
-FetchContent_MakeAvailable(vrtgen spdlog)
+FetchContent_MakeAvailable(composite vrtgen spdlog)
 
 add_subdirectory(src)

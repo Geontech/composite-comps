@@ -29,7 +29,7 @@ class exp_smooth : public composite::component {
     using input_t = aligned::aligned_mem<T>;
     using input_port_t = composite::input_port<std::unique_ptr<input_t>>;
     using output_port_t = composite::output_port<std::unique_ptr<input_t>>;
-    using enum composite::config_type;
+    using enum composite::properties::config_type;
 public:
     exp_smooth() : composite::component("exp_smooth") {
         add_port(m_in_port.get());

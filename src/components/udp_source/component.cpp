@@ -67,7 +67,7 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string {
 
 udp_source::udp_source() : composite::component("udp_source") {
     add_port(m_out_port.get());
-    using enum composite::config_type;
+    using enum composite::properties::config_type;
     add_property("interface", &m_interface).configurability(RUNTIME).change_listener([this]() {
         m_new_socket_required = true;
         return true;

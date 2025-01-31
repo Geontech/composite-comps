@@ -35,7 +35,7 @@ class stov : public composite::component {
     using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using output_t = aligned::aligned_mem<T>;
     using output_port_t = composite::output_port<std::unique_ptr<output_t>>;
-    using enum composite::config_type;
+    using enum composite::properties::config_type;
 public:
     stov() : composite::component("stov") {
         add_port(m_in_port.get());
