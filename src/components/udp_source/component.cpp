@@ -162,7 +162,6 @@ auto udp_source::process() -> composite::retval {
         if (m_pfds.at(0).revents & POLLIN) [[likely]] {
             if (auto recvd = recvmmsg(m_socket, m_msgs.data(), m_msgs.size(), 0, &timeout); recvd > 0) {
                 for (auto i=0; i < recvd; ++i) {
-                    logger()->info("sending data");
                     m_out_port->send_data(std::move(m_buffers.at(i)), {});
                 }
             }
