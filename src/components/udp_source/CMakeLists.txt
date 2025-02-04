@@ -35,6 +35,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Library
 add_library(udp_source MODULE
     component.cpp
+    buffer_pool.cpp
 )
 # Link
 target_link_libraries(udp_source

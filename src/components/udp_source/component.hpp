@@ -17,31 +17,17 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
+#include "buffer_pool.hpp"
+
 #include <array>
 #include <composite/component.hpp>
-#include <mutex>
 #include <poll.h>
-#include <queue>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <sys/uio.h>
-#include <thread>
-#include <unistd.h>
 
 namespace udpsrc::net {
-
-class mmsgs {
-public:
-    using buffer_type = std::vector<uint8_t>;
-
-    mmsgs(size_t num_msgs, size_t msg_size);
-
-    std::vector<struct mmsghdr> msgs;
-    std::vector<struct iovec> iovecs;
-    std::unique_ptr<buffer_type> buffer;
-
-}; // class mmsgs
 
 auto get_interface_ip(int fd, std::string_view interface) -> std::string;
 
@@ -54,8 +40,6 @@ public:
     udp_source();
     ~udp_source() override;
     auto property_change_handler() -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
     auto process() -> composite::retval override;
 
 private:
@@ -73,14 +57,11 @@ private:
     // Members
     int m_socket{-1};
     std::array<struct pollfd, 1> m_pfds;
-    size_t m_queue_size{m_num_msgs / 2};
-    std::deque<std::unique_ptr<udpsrc::net::mmsgs>> m_queue;
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::jthread m_filler;
+    std::unique_ptr<udpsrc::buffer_pool> m_pool{nullptr};
+    std::vector<struct mmsghdr> m_msgs;
+    std::vector<struct iovec> m_iovecs;
+    std::vector<udpsrc::buffer_pool::value_type> m_buffers;
     bool m_new_socket_required{true};
     bool m_flush_queue{true};
-
-    auto keep_full(std::stop_token token) -> void;
 
 }; // class udp_source

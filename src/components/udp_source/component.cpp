@@ -23,34 +23,15 @@
 #include <array>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
 #include <netinet/in.h>
 #include <net/if.h>
-#include <mutex>
-#include <poll.h>
-#include <queue>
-#include <ranges>
 #include <source_location>
 #include <spdlog/spdlog.h>
-#include <string>
-#include <string_view>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <thread>
-#include <unistd.h>
 
 namespace udpsrc::net {
-
-mmsgs::mmsgs(size_t num_msgs, size_t msg_size) :
-  msgs(num_msgs),
-  iovecs(num_msgs),
-  buffer(std::make_unique<std::vector<uint8_t>>(num_msgs * msg_size, 0xFF)) {
-    for (auto i=0u; i<num_msgs; ++i) {
-        iovecs.at(i).iov_base = buffer->data() + (i * msg_size);
-        iovecs.at(i).iov_len = msg_size;
-        msgs.at(i).msg_hdr.msg_iov = &iovecs.at(i);
-        msgs.at(i).msg_hdr.msg_iovlen = 1;
-    }
-}
 
 auto get_interface_ip(int fd, std::string_view interface) -> std::string {
     struct ifreq ifr{};
@@ -141,15 +122,15 @@ auto udp_source::property_change_handler() -> void {
             setsockopt(m_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, (char*)&group, sizeof(group));
         }
     }
-    // Check if properties related to queue we adjusted
+    // Check if properties related to queue were adjusted
     if (m_flush_queue) {
-        logger()->trace("property changes indicate queue flush is required; rebuilding queue");
-        m_queue.clear();
-        // Setup queue of mmsg headers with iovec buffers
-        m_queue_size = m_num_msgs / 2;
-        for (auto _ : std::views::iota(size_t{0}, m_queue_size)) {
-            m_queue.emplace_back(std::make_unique<udpsrc::net::mmsgs>(m_num_msgs, m_msg_size));
-        }
+        logger()->trace("property changes indicate queue flush is required; rebuilding buffer pool");
+        m_pool.reset();
+        // Setup buffer pool
+        m_pool = std::make_unique<udpsrc::buffer_pool>(m_num_msgs * 32, m_msg_size);
+        m_msgs.resize(m_num_msgs);
+        m_iovecs.resize(m_num_msgs);
+        m_buffers.resize(m_num_msgs);
     }
     // Set receive buffer size
     if (m_recv_buf_size > 0) {
@@ -158,56 +139,37 @@ auto udp_source::property_change_handler() -> void {
     }
 }
 
-auto udp_source::start() -> void {
-    m_filler = std::jthread(&udp_source::keep_full, this);
-    composite::component::start();
-}
-
-auto udp_source::stop() -> void {
-    m_filler.request_stop();
-    if (m_filler.joinable()) {
-        m_filler.join();
-    }
-    composite::component::stop();
-}
-
 auto udp_source::process() -> composite::retval {
     using enum composite::retval;
-    auto data = std::unique_ptr<udpsrc::net::mmsgs>{nullptr};
-    {
-        auto lk = std::scoped_lock{m_mtx};
-        if (m_queue.empty()) {
-            return NO_YIELD;
-        }
-        data = std::move(m_queue.front());
-        m_queue.pop_front();
-        m_cv.notify_one();
+
+    // Populate iovecs with buffers from pool
+    for (auto i=size_t{}; i < m_msgs.size(); ++i) {
+        m_buffers.at(i) = m_pool->acquire();
+        m_iovecs.at(i).iov_base = m_buffers.at(i)->data();
+        m_iovecs.at(i).iov_len = m_buffers.at(i)->size();
+        m_msgs.at(i).msg_hdr.msg_iov = &m_iovecs.at(i);
+        m_msgs.at(i).msg_hdr.msg_iovlen = 1;
     }
-    if (data == nullptr) {
-        return NO_YIELD;
-    }
+
+    // Replenish if needed in async
+    auto fut = std::async(std::launch::async, [this]{ m_pool->replenish(); });
+
+    // Receive messages
     using timespec_t = struct timespec;
     auto timeout = timespec_t{.tv_sec = 1, .tv_nsec = 0};
     if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
         // check socket is ready to read
         if (m_pfds.at(0).revents & POLLIN) [[likely]] {
-            if (auto recvd = recvmmsg(m_socket, data->msgs.data(), data->msgs.size(), 0, &timeout); recvd != -1) {
-                data->buffer->resize(recvd * m_msg_size);
-                m_out_port->send_data(std::move(data->buffer), {});
+            if (auto recvd = recvmmsg(m_socket, m_msgs.data(), m_msgs.size(), 0, &timeout); recvd > 0) {
+                for (auto i=0; i < recvd; ++i) {
+                    logger()->info("sending data");
+                    m_out_port->send_data(std::move(m_buffers.at(i)), {});
+                }
             }
         }
     }
-    return NO_YIELD;
-}
 
-auto udp_source::keep_full(std::stop_token token) -> void {
-    while (!token.stop_requested()) {
-        auto lk = std::unique_lock{m_mtx};
-        m_cv.wait_for(lk, std::chrono::seconds(1), [this]{ return m_queue.size() < m_queue_size; });
-        if (m_queue.size() < m_queue_size) {
-            m_queue.emplace_back(std::make_unique<udpsrc::net::mmsgs>(m_num_msgs, m_msg_size));
-        }
-    }
+    return NO_YIELD;
 }
 
 extern "C" {
