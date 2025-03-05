@@ -41,14 +41,7 @@ public:
         add_port(m_in_port.get());
         add_port(m_out_port.get());
         add_property("output_size", &m_output_size).units("bytes").configurability(RUNTIME);
-        add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
-            if ((m_transport == "sdds") || (m_transport == "vita49")) {
-                return true;
-            }
-            return false;
-        });
         add_property("byteswap", &m_byteswap).configurability(RUNTIME);
-        add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
     }
 
     ~stov() override = default;
@@ -60,65 +53,37 @@ public:
 
     auto process() -> composite::retval override {
         using enum composite::retval;
-        auto [data, _] = m_in_port->get_data();
+        auto [data, ts] = m_in_port->get_data();
         if (data == nullptr) {
             return NORMAL;
         }
-        for (auto idx = size_t{}; idx < data->size(); idx += m_msg_size) {
-            auto payload = std::span<const std::complex<int16_t>>{};
-            auto ts = composite::timestamp{};
-            if (m_transport == "sdds") {
-                auto packet = overlay::sdds::overlay({data->data() + idx, m_msg_size});
-                // TODO - validations regarding parity and ttv
-                ts = composite::timestamp{packet.secs(), packet.psecs()};
-                payload = packet.payload<std::complex<int16_t>>();
-            } else if (m_transport == "vita49") {
-                auto packet = overlay::v49::overlay({data->data() + idx, m_msg_size});
-                auto& header = packet.header();
-                if (!overlay::v49::is_data(header)) {
-                    continue;
-                }
-                if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
-                    logger()->error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
-                }
-                m_pkt_count = header.packet_count();
-                if (auto int_ts = packet.integer_timestamp()) {
-                    ts.seconds = int_ts.value();
-                }
-                if (auto frac_ts = packet.fractional_timestamp()) {
-                    ts.picoseconds = frac_ts.value();
-                }
-                payload = packet.payload<std::complex<int16_t>>();
+        auto stride = size_t{4};
+        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
+            stride = 8;
+        }
+        for (auto i = 0u; i < data->size(); i += stride) {
+            if (m_output_buf == nullptr) {
+                m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
+                m_output_ts = ts;
             }
-            auto i=0u;
-            auto stride = size_t{4};
             if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
-                stride = 8;
+                convert(
+                    reinterpret_cast<const int16_t*>(data->data() + i),
+                    reinterpret_cast<float*>(m_output_buf->data() + m_output_idx),
+                    m_byteswap
+                );
+            } else { // double or std::complex<double>
+                convert(
+                    reinterpret_cast<const int16_t*>(data->data() + i),
+                    reinterpret_cast<double*>(m_output_buf->data() + m_output_idx),
+                    m_byteswap
+                );
             }
-            for (; i < payload.size(); i += stride) {
-                if (m_output_buf == nullptr) {
-                    m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
-                    m_output_ts = ts;
-                }
-                if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
-                    convert(
-                        reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<float*>(m_output_buf->data() + m_output_idx),
-                        m_byteswap
-                    );
-                } else { // double or std::complex<double>
-                    convert(
-                        reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<double*>(m_output_buf->data() + m_output_idx),
-                        m_byteswap
-                    );
-                }
-                m_output_idx += stride;
-                if (m_output_idx == m_output_size) {
-                    m_out_port->send_data(std::move(m_output_buf), m_output_ts);
-                    m_output_buf.reset();
-                    m_output_idx = 0;
-                }
+            m_output_idx += stride;
+            if (m_output_idx == m_output_size) {
+                m_out_port->send_data(std::move(m_output_buf), m_output_ts);
+                m_output_buf.reset();
+                m_output_idx = 0;
             }
         }
         return NO_YIELD;
@@ -131,9 +96,7 @@ private:
 
     // Properties
     uint32_t m_output_size{};
-    std::string m_transport;
     bool m_byteswap{true};
-    uint32_t m_msg_size{};
 
     // Members
     std::unique_ptr<output_t> m_output_buf;

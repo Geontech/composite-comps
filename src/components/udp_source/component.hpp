@@ -18,6 +18,7 @@
  */
 
 #include "buffer_pool.hpp"
+#include "processing_queue.hpp"
 
 #include <array>
 #include <composite/component.hpp>
@@ -34,7 +35,7 @@ auto get_interface_ip(int fd, std::string_view interface) -> std::string;
 } // namespace udpsrc::net
 
 class udp_source : public composite::component {
-    using output_t = std::vector<uint8_t>;
+    using output_t = std::vector<std::byte>;
     using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
 public:
     udp_source();
@@ -43,6 +44,8 @@ public:
     auto process() -> composite::retval override;
 
 private:
+    auto process_msgs(std::stop_token) -> void;
+
     // Ports
     std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
     
@@ -50,17 +53,19 @@ private:
     std::string m_interface;
     std::string m_ip_addr;
     uint32_t m_port{};
-    uint32_t m_recv_buf_size{};
-    uint32_t m_msg_size{};
+    std::string m_transport;
     uint32_t m_num_msgs{};
+    uint32_t m_msg_size{};
+    uint32_t m_recv_buf_size{};
 
     // Members
     int m_socket{-1};
     std::array<struct pollfd, 1> m_pfds;
     std::unique_ptr<udpsrc::buffer_pool> m_pool{nullptr};
-    std::vector<struct mmsghdr> m_msgs;
-    std::vector<struct iovec> m_iovecs;
-    std::vector<udpsrc::buffer_pool::value_type> m_buffers;
+    std::jthread m_processing_thread;
+    processing_queue<udpsrc::buffer_pool::value_type> m_queue;
+    std::mutex m_queue_mtx;
+    uint8_t m_pkt_count{};
     bool m_new_socket_required{true};
     bool m_flush_queue{true};
 

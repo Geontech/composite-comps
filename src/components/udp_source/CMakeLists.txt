@@ -37,6 +37,12 @@ add_library(udp_source MODULE
     component.cpp
     buffer_pool.cpp
 )
+# Includes
+target_include_directories(udp_source
+    PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../include
+    ${vrtgen_SOURCE_DIR}/include
+)
 # Link
 target_link_libraries(udp_source
     PRIVATE

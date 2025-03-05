@@ -23,11 +23,24 @@
 
 namespace udpsrc {
 
-buffer_pool::buffer_pool(size_type init_size, size_type buffer_size) :
-  m_buffer_size(buffer_size),
+mmsgs::mmsgs(size_t num_msgs, size_t msg_size) :
+  msgs(num_msgs),
+  iovecs(num_msgs),
+  buffer(std::make_unique<std::vector<uint8_t>>(num_msgs * msg_size, 0xFF)) {
+    for (auto i=0u; i<num_msgs; ++i) {
+        iovecs.at(i).iov_base = buffer->data() + (i * msg_size);
+        iovecs.at(i).iov_len = msg_size;
+        msgs.at(i).msg_hdr.msg_iov = &iovecs.at(i);
+        msgs.at(i).msg_hdr.msg_iovlen = 1;
+    }
+}
+
+buffer_pool::buffer_pool(size_type init_size, size_type num_msgs, size_type msg_size) :
+  m_num_msgs(num_msgs),
+  m_msg_size(msg_size),
   m_min_size(init_size / 2) {
     for (auto i=size_type{}; i < init_size; ++i) {
-        m_pool.emplace(new buffer_type(m_buffer_size));
+        m_pool.emplace(new buffer_type(m_num_msgs, m_msg_size));
     }
 }
 
@@ -47,7 +60,7 @@ auto buffer_pool::acquire() -> value_type {
         buf = m_pool.front();
         m_pool.pop();
     } else {
-        buf = new buffer_type(m_buffer_size);
+        buf = new buffer_type(m_num_msgs, m_msg_size);
     }
     return value_type(buf, [this](buffer_type* ptr) {
         this->release(ptr);
@@ -62,7 +75,7 @@ auto buffer_pool::release(buffer_type* buf) -> void {
 auto buffer_pool::replenish() -> void {
     auto lock = std::scoped_lock{m_mtx};
     while (m_pool.size() < m_min_size) {
-        m_pool.emplace(new buffer_type(m_buffer_size));
+        m_pool.emplace(new buffer_type(m_num_msgs, m_msg_size));
     }
 }
 

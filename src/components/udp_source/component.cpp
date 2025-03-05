@@ -18,9 +18,11 @@
  */
 
 #include "component.hpp"
+#include "overlay.hpp"
 
 #include <arpa/inet.h>
 #include <array>
+#include <complex>
 #include <cstring>
 #include <fcntl.h>
 #include <future>
@@ -60,6 +62,10 @@ udp_source::udp_source() : composite::component("udp_source") {
     add_property("port", &m_port).configurability(RUNTIME).change_listener([this]() {
         m_new_socket_required = true;
         return true;
+    });
+    add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
+        m_flush_queue = true;
+        return (m_transport == "sdds") || (m_transport == "vita49");
     });
     add_property("recv_buf_size", &m_recv_buf_size).units("bytes");
     add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME).change_listener([this]() {
@@ -124,13 +130,12 @@ auto udp_source::property_change_handler() -> void {
     }
     // Check if properties related to queue were adjusted
     if (m_flush_queue) {
-        logger()->trace("property changes indicate queue flush is required; rebuilding buffer pool");
+        logger()->trace("property changes indicate queue flush is required; rebuilding buffer pool and processing queue");
         m_pool.reset();
         // Setup buffer pool
-        m_pool = std::make_unique<udpsrc::buffer_pool>(m_num_msgs * 32, m_msg_size);
-        m_msgs.resize(m_num_msgs);
-        m_iovecs.resize(m_num_msgs);
-        m_buffers.resize(m_num_msgs);
+        m_pool = std::make_unique<udpsrc::buffer_pool>(m_num_msgs * 32, m_num_msgs, m_msg_size);
+        // Empty processing queue
+        m_queue.clear();
     }
     // Set receive buffer size
     if (m_recv_buf_size > 0) {
@@ -142,33 +147,77 @@ auto udp_source::property_change_handler() -> void {
 auto udp_source::process() -> composite::retval {
     using enum composite::retval;
 
-    // Populate iovecs with buffers from pool
-    for (auto i=size_t{}; i < m_msgs.size(); ++i) {
-        m_buffers.at(i) = m_pool->acquire();
-        m_iovecs.at(i).iov_base = m_buffers.at(i)->data();
-        m_iovecs.at(i).iov_len = m_buffers.at(i)->size();
-        m_msgs.at(i).msg_hdr.msg_iov = &m_iovecs.at(i);
-        m_msgs.at(i).msg_hdr.msg_iovlen = 1;
+    if (m_pool == nullptr) {
+        return NOOP;
     }
+
+    // Get data from pool
+    auto data = m_pool->acquire();
 
     // Replenish if needed in async
     auto fut = std::async(std::launch::async, [this]{ m_pool->replenish(); });
 
     // Receive messages
-    using timespec_t = struct timespec;
-    auto timeout = timespec_t{.tv_sec = 1, .tv_nsec = 0};
-    if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
-        // check socket is ready to read
-        if (m_pfds.at(0).revents & POLLIN) [[likely]] {
-            if (auto recvd = recvmmsg(m_socket, m_msgs.data(), m_msgs.size(), 0, &timeout); recvd > 0) {
-                for (auto i=0; i < recvd; ++i) {
-                    m_out_port->send_data(std::move(m_buffers.at(i)), {});
+    auto msgs_recvd = std::size_t{};
+    while (msgs_recvd < m_num_msgs * .75) { // TODO: look closer at this number
+        if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
+            // check socket is ready to read
+            if (m_pfds.at(0).revents & POLLIN) [[likely]] {
+                if (auto recvd = recvmmsg(m_socket, data->msgs.data() + msgs_recvd, data->msgs.size() - msgs_recvd, 0, nullptr); recvd > 0) {
+                    msgs_recvd += recvd;
                 }
             }
         }
     }
+    data->buffer->resize(msgs_recvd * m_msg_size);
 
+    // Move received messages to processing queue
+    m_queue.push(std::move(data));
+    
+    // Fast return
     return NO_YIELD;
+}
+
+auto udp_source::process_msgs(std::stop_token token) -> void {
+    while (!token.stop_requested()) {
+        auto msgs = m_queue.pop();
+        if (msgs == nullptr) {
+            continue;
+        }
+        // Iterate over data buffer
+        for (auto idx = std::size_t{}; idx < msgs->buffer->size(); idx += m_msg_size) {
+            auto payload = std::shared_ptr<std::vector<std::byte>>{nullptr};
+            auto ts = composite::timestamp{};
+            // Parse packets based on protocol
+            if (m_transport == "sdds") {
+                auto packet = overlay::sdds::overlay({msgs->buffer->data() + idx, m_msg_size});
+                // TODO - validations regarding parity and ttv
+                ts = composite::timestamp{packet.secs(), packet.psecs()};
+                auto span = packet.payload<std::byte>();
+                payload = std::make_shared<std::vector<std::byte>>(span.begin(), span.end());
+            } else if (m_transport == "vita49") {
+                auto packet = overlay::v49::overlay({msgs->buffer->data() + idx, m_msg_size});
+                auto& header = packet.header();
+                if (!overlay::v49::is_data(header)) {
+                    continue;
+                }
+                if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
+                    logger()->error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
+                }
+                m_pkt_count = header.packet_count();
+                if (auto int_ts = packet.integer_timestamp()) {
+                    ts.seconds = int_ts.value();
+                }
+                if (auto frac_ts = packet.fractional_timestamp()) {
+                    ts.picoseconds = frac_ts.value();
+                }
+                auto span = packet.payload<std::byte>();
+                payload = std::make_shared<std::vector<std::byte>>(span.begin(), span.end());
+            }
+            // Send data
+            m_out_port->send_data(std::move(payload), ts);
+        }
+    }
 }
 
 extern "C" {

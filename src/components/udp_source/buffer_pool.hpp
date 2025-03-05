@@ -24,18 +24,32 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <sys/socket.h>
+#include <sys/uio.h>
 #include <thread>
 #include <vector>
 
 namespace udpsrc {
 
+class mmsgs {
+public:
+    using buffer_type = std::vector<uint8_t>;
+
+    mmsgs(size_t num_msgs, size_t msg_size);
+
+    std::vector<struct mmsghdr> msgs;
+    std::vector<struct iovec> iovecs;
+    std::shared_ptr<buffer_type> buffer;
+
+}; // class mmsgs
+
 class buffer_pool {
 public:
     using size_type = std::size_t;
-    using buffer_type = std::vector<uint8_t>;
+    using buffer_type = mmsgs;
     using value_type = std::unique_ptr<buffer_type, std::function<void(buffer_type*)>>;
 
-    buffer_pool(size_type init_size, size_type buffer_size);
+    buffer_pool(size_type init_size, size_type num_msgs, size_type msg_size);
     ~buffer_pool();
 
     [[nodiscard]]
@@ -46,7 +60,8 @@ public:
 
 private:
     std::queue<buffer_type*> m_pool;
-    size_type m_buffer_size{};
+    size_type m_num_msgs{};
+    size_type m_msg_size{};
     size_type m_min_size{};
     std::mutex m_mtx;
 
