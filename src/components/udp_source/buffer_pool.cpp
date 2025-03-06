@@ -23,7 +23,7 @@
 
 namespace udpsrc {
 
-mmsgs::mmsgs(size_t num_msgs, size_t msg_size) :
+mmsgs::mmsgs(size_type num_msgs, size_type msg_size) :
   msgs(num_msgs),
   iovecs(num_msgs),
   buffer(std::make_unique<std::vector<uint8_t>>(num_msgs * msg_size, 0xFF)) {
@@ -69,6 +69,7 @@ auto buffer_pool::acquire() -> value_type {
 
 auto buffer_pool::release(buffer_type* buf) -> void {
     auto lock = std::scoped_lock{m_mtx};
+    buf->recvd = 0;
     m_pool.emplace(buf);
 }
 

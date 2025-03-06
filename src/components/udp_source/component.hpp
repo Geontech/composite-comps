@@ -25,6 +25,7 @@
 #include <poll.h>
 #include <string>
 #include <string_view>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 
@@ -41,6 +42,8 @@ public:
     udp_source();
     ~udp_source() override;
     auto property_change_handler() -> void override;
+    auto start() -> void override;
+    auto stop() -> void override;
     auto process() -> composite::retval override;
 
 private:
@@ -57,16 +60,22 @@ private:
     uint32_t m_num_msgs{};
     uint32_t m_msg_size{};
     uint32_t m_recv_buf_size{};
+    uint32_t m_pool_size{64};
 
     // Members
     int m_socket{-1};
     std::array<struct pollfd, 1> m_pfds;
+    int m_epoll_fd{-1};
+    struct epoll_event m_event;
+    std::array<struct epoll_event, 1> m_events;
     std::unique_ptr<udpsrc::buffer_pool> m_pool{nullptr};
     std::jthread m_processing_thread;
     processing_queue<udpsrc::buffer_pool::value_type> m_queue;
     std::mutex m_queue_mtx;
-    uint8_t m_pkt_count{};
+    uint16_t m_pkt_count{};
     bool m_new_socket_required{true};
     bool m_flush_queue{true};
+    uint64_t total_recvd{};
+    uint64_t num_calls{};
 
 }; // class udp_source

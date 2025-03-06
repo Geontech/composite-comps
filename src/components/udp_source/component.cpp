@@ -76,6 +76,10 @@ udp_source::udp_source() : composite::component("udp_source") {
         m_flush_queue = true;
         return true;
     });
+    add_property("buffer_pool_size", &m_pool_size).units("buffer pool depth").configurability(RUNTIME).change_listener([this]() {
+        m_flush_queue = true;
+        return true;
+    });
 }
 
 udp_source::~udp_source() {
@@ -92,12 +96,19 @@ auto udp_source::property_change_handler() -> void {
         // Open socket
         logger()->trace("opening socket");
         m_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        // Setup poll
-        m_pfds.at(0).fd = m_socket;
-        m_pfds.at(0).events = POLLIN;
-        // Set non-blocking
-        logger()->trace("setting socket to non-blocking");
-        fcntl(m_socket, F_SETFL, O_NONBLOCK);
+        int busy_poll = 50;  // 50µs
+        setsockopt(m_socket, SOL_SOCKET, SO_BUSY_POLL, &busy_poll, sizeof(busy_poll));
+        // Setup epoll
+        m_epoll_fd = epoll_create1(0);
+        m_event.data.fd = m_socket;
+        m_event.events = EPOLLIN;
+        epoll_ctl(m_epoll_fd, EPOLL_CTL_ADD, m_socket, &m_event);
+        // // Setup poll
+        // m_pfds.at(0).fd = m_socket;
+        // m_pfds.at(0).events = POLLIN;
+        // // Set non-blocking
+        // logger()->trace("setting socket to non-blocking");
+        // fcntl(m_socket, F_SETFL, O_NONBLOCK);
         // Determine multicast from address
         auto multi_addr_start = htonl(inet_addr("224.0.0.0"));
         auto multi_addr_end = htonl(inet_addr("239.255.255.255"));
@@ -133,7 +144,7 @@ auto udp_source::property_change_handler() -> void {
         logger()->trace("property changes indicate queue flush is required; rebuilding buffer pool and processing queue");
         m_pool.reset();
         // Setup buffer pool
-        m_pool = std::make_unique<udpsrc::buffer_pool>(m_num_msgs * 32, m_num_msgs, m_msg_size);
+        m_pool = std::make_unique<udpsrc::buffer_pool>(m_pool_size, m_num_msgs, m_msg_size);
         // Empty processing queue
         m_queue.clear();
     }
@@ -142,6 +153,20 @@ auto udp_source::property_change_handler() -> void {
         logger()->trace("setting socket receive buffer size to {}", m_recv_buf_size);
         setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&m_recv_buf_size, sizeof(m_recv_buf_size));
     }
+}
+
+auto udp_source::start() -> void {
+    m_processing_thread = std::jthread(&udp_source::process_msgs, this);
+    composite::component::start();
+}
+
+auto udp_source::stop() -> void {
+    m_processing_thread.request_stop();
+    if (m_processing_thread.joinable()) {
+        m_processing_thread.join();
+    }
+    composite::component::stop();
+    logger()->info("TOTAL RECVD: {} TOTAL CALLS: {} AVG/CALL: {}", total_recvd, num_calls, total_recvd / num_calls);
 }
 
 auto udp_source::process() -> composite::retval {
@@ -158,18 +183,35 @@ auto udp_source::process() -> composite::retval {
     auto fut = std::async(std::launch::async, [this]{ m_pool->replenish(); });
 
     // Receive messages
-    auto msgs_recvd = std::size_t{};
-    while (msgs_recvd < m_num_msgs * .75) { // TODO: look closer at this number
-        if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
+    // CURRENT NON-BLOCKING POLL SOLUTION
+    // data->recvd = 0;
+    // while (data->recvd < data->msgs.size()) {
+    //     if (auto num_events = poll(m_pfds.data(), 1, 100)) [[likely]] {
+    //         // check socket is ready to read
+    //         if (m_pfds.at(0).revents & POLLIN) [[likely]] {
+    //             auto recvd = recvmmsg(m_socket, data->msgs.data() + data->recvd, data->msgs.size() - data->recvd, 0, nullptr);
+    //             if (recvd > 0) {
+    //                 data->recvd += recvd;
+    //                 total_recvd += recvd;
+    //             }
+    //             ++num_calls;
+    //         }
+    //     }
+    // }
+    data->recvd = 0;
+    while (data->recvd < data->msgs.size()) {
+        if (auto num_ready = epoll_wait(m_epoll_fd, m_events.data(), 1, 1/*ms*/)) [[likely]] {
             // check socket is ready to read
-            if (m_pfds.at(0).revents & POLLIN) [[likely]] {
-                if (auto recvd = recvmmsg(m_socket, data->msgs.data() + msgs_recvd, data->msgs.size() - msgs_recvd, 0, nullptr); recvd > 0) {
-                    msgs_recvd += recvd;
+            if (m_events.at(0).events & EPOLLIN) [[likely]] {
+                auto recvd = recvmmsg(m_socket, data->msgs.data() + data->recvd, data->msgs.size() - data->recvd, 0, nullptr);
+                if (recvd > 0) {
+                    data->recvd += recvd;
+                    total_recvd += recvd;
                 }
+                ++num_calls;
             }
         }
     }
-    data->buffer->resize(msgs_recvd * m_msg_size);
 
     // Move received messages to processing queue
     m_queue.push(std::move(data));
@@ -182,16 +224,37 @@ auto udp_source::process_msgs(std::stop_token token) -> void {
     while (!token.stop_requested()) {
         auto msgs = m_queue.pop();
         if (msgs == nullptr) {
-            continue;
+            std::this_thread::yield();
         }
         // Iterate over data buffer
-        for (auto idx = std::size_t{}; idx < msgs->buffer->size(); idx += m_msg_size) {
+        for (auto i = std::size_t{}; i < msgs->recvd; ++i) {
+            auto idx = i * m_msg_size;
             auto payload = std::shared_ptr<std::vector<std::byte>>{nullptr};
             auto ts = composite::timestamp{};
             // Parse packets based on protocol
             if (m_transport == "sdds") {
                 auto packet = overlay::sdds::overlay({msgs->buffer->data() + idx, m_msg_size});
+                auto seq_num = packet.seq_num();
                 // TODO - validations regarding parity and ttv
+                if (packet.pp_id() && ((seq_num % 32) != 31)) {
+                    logger()->error("invalid SDDS packet received, pp_id=true, seq_num={}", seq_num);
+                } else if (!packet.pp_id() && ((seq_num % 32) == 31)) {
+                    logger()->error("invalid SDDS packet received pp_id=false, seq_num={}", seq_num);
+                }
+                auto expected_seq_num = static_cast<uint16_t>(m_pkt_count + 1);
+                if ((expected_seq_num % 32) == 31) {
+                    ++expected_seq_num;
+                }
+                if (seq_num != expected_seq_num) {
+                    logger()->warn("dropped pkt(s) expected={}, got={}", expected_seq_num, seq_num);
+                }
+                m_pkt_count = seq_num;
+                // if (!packet.ttv()) {
+                //     spdlog::info("invalid time tag, seq_num={}", seq_num);
+                // }
+                // if (packet.is_parity()) {
+                //     spdlog::info("parity packet received");
+                // }
                 ts = composite::timestamp{packet.secs(), packet.psecs()};
                 auto span = packet.payload<std::byte>();
                 payload = std::make_shared<std::vector<std::byte>>(span.begin(), span.end());
@@ -202,7 +265,7 @@ auto udp_source::process_msgs(std::stop_token token) -> void {
                     continue;
                 }
                 if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
-                    logger()->error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
+                    logger()->warn("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
                 }
                 m_pkt_count = header.packet_count();
                 if (auto int_ts = packet.integer_timestamp()) {
@@ -215,7 +278,9 @@ auto udp_source::process_msgs(std::stop_token token) -> void {
                 payload = std::make_shared<std::vector<std::byte>>(span.begin(), span.end());
             }
             // Send data
-            m_out_port->send_data(std::move(payload), ts);
+            if (payload != nullptr) {
+                m_out_port->send_data(std::move(payload), ts);
+            }
         }
     }
 }

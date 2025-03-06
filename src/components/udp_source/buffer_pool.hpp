@@ -33,13 +33,15 @@ namespace udpsrc {
 
 class mmsgs {
 public:
+    using size_type = std::size_t;
     using buffer_type = std::vector<uint8_t>;
 
-    mmsgs(size_t num_msgs, size_t msg_size);
+    mmsgs(size_type num_msgs, size_type msg_size);
 
     std::vector<struct mmsghdr> msgs;
     std::vector<struct iovec> iovecs;
-    std::shared_ptr<buffer_type> buffer;
+    std::unique_ptr<buffer_type> buffer;
+    size_type recvd{};
 
 }; // class mmsgs
 
