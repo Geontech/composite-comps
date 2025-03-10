@@ -37,6 +37,26 @@ public:
       m_data(data) {
     }
 
+    auto pp_id() const -> bool {
+        return m_data[0] & 0x20;
+    }
+
+    auto is_parity() const -> bool {
+        return pp_id() && ((seq_num() % 32) == 31);
+    }
+
+    auto bps() const -> uint8_t {
+        return m_data[1] & 0x1F;
+    }
+
+    auto seq_num() const -> uint16_t {
+        return vrtgen::swap::from_be(*reinterpret_cast<const uint16_t*>(m_data.data() + 2));
+    }
+
+    auto ttv() const -> bool {
+        return m_data[4] & 0x40;
+    }
+
     auto ttag() const -> uint64_t {
         return vrtgen::swap::from_be(*reinterpret_cast<const uint64_t*>(m_data.data() + 8));
     }

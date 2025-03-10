@@ -26,7 +26,7 @@ namespace udpsrc {
 mmsgs::mmsgs(size_type num_msgs, size_type msg_size) :
   msgs(num_msgs),
   iovecs(num_msgs),
-  buffer(std::make_unique<std::vector<uint8_t>>(num_msgs * msg_size, 0xFF)) {
+  buffer(aligned::make_aligned<uint8_t>(64, num_msgs * msg_size)) {
     for (auto i=0u; i<num_msgs; ++i) {
         iovecs.at(i).iov_base = buffer->data() + (i * msg_size);
         iovecs.at(i).iov_len = msg_size;

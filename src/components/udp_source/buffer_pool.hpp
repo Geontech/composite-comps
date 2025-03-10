@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include "aligned_mem.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -34,7 +36,7 @@ namespace udpsrc {
 class mmsgs {
 public:
     using size_type = std::size_t;
-    using buffer_type = std::vector<uint8_t>;
+    using buffer_type = aligned::aligned_mem<uint8_t>;
 
     mmsgs(size_type num_msgs, size_type msg_size);
 

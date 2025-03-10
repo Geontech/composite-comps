@@ -76,6 +76,8 @@ private:
     bool m_new_socket_required{true};
     bool m_flush_queue{true};
     uint64_t total_recvd{};
+    uint64_t not_data_recvd{};
+    uint64_t data_recvd{};
     uint64_t num_calls{};
 
 }; // class udp_source
