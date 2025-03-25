@@ -23,23 +23,6 @@
                     "value" : "9999"
                 }
             ]
-        },
-        {
-            "name" : "histogram",
-            "properties" : [
-                {
-                    "name" : "transport",
-                    "value" : "vita49" 
-                },
-                {
-                    "name" : "sample_rate",
-                    "value" : "32768"
-                },
-                {
-                    "name" : "adc_bits",
-                    "value" : "16"
-                }
-            ]
         }
     ],
     "connections" : [
@@ -49,9 +32,9 @@
                 "port" : "data_out"
             },
             "input" : {
-                "component" : "histogram",
+                "component" : "stov",
                 "port" : "data_in"
             }
-        }
+        },
     ]
 }

@@ -27,6 +27,7 @@
 #include <complex>
 #include <cstdint>
 #include <spdlog/spdlog.h>
+#include <variant>
 #include <vector>
 
 template <typename T>
@@ -42,18 +43,20 @@ public:
         add_port(m_out_port.get());
         add_property("output_size", &m_output_size).units("bytes").configurability(RUNTIME);
         add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
-            if ((m_transport == "sdds") || (m_transport == "vita49")) {
-                return true;
-            }
-            return false;
+            return (m_transport == "sdds") || (m_transport == "vita49");
         });
-        add_property("byteswap", &m_byteswap).configurability(RUNTIME);
+        add_property("byteswap", &m_byteswap);
         add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
     }
 
     ~stov() override = default;
 
     auto property_change_handler() -> void override {
+        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
+            m_converter = converter<int16_t, float>(m_byteswap);
+        } else {
+            m_converter = converter<int16_t, int16_t>(m_byteswap);
+        }
         // flush input port
         m_in_port->clear();
     }
@@ -91,26 +94,25 @@ public:
                 payload = packet.payload<std::complex<int16_t>>();
             }
             auto i=0u;
-            auto stride = size_t{4};
-            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
-                stride = 8;
+            auto bit_len = std::size_t{256};
+            if (__builtin_cpu_supports("avx512f")) {
+                bit_len = std::size_t{512};
             }
+            auto stride = size_t{bit_len / 8u / sizeof(T)};
             for (; i < payload.size(); i += stride) {
                 if (m_output_buf == nullptr) {
                     m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
                     m_output_ts = ts;
                 }
                 if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
-                    convert(
+                    std::get<0>(m_converter).process(
                         reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<float*>(m_output_buf->data() + m_output_idx),
-                        m_byteswap
+                        reinterpret_cast<float*>(m_output_buf->data() + m_output_idx)
                     );
-                } else { // double or std::complex<double>
-                    convert(
+                } else { // int16_t or std::complex<int16_t>
+                    std::get<1>(m_converter).process(
                         reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<double*>(m_output_buf->data() + m_output_idx),
-                        m_byteswap
+                        reinterpret_cast<int16_t*>(m_output_buf->data() + m_output_idx)
                     );
                 }
                 m_output_idx += stride;
@@ -136,6 +138,7 @@ private:
     uint32_t m_msg_size{};
 
     // Members
+    std::variant<converter<int16_t, float>, converter<int16_t, int16_t>> m_converter;
     std::unique_ptr<output_t> m_output_buf;
     uint32_t m_output_idx{};
     typename output_port_t::timestamp_type m_output_ts;

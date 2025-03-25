@@ -39,7 +39,7 @@ public:
 
     std::vector<struct mmsghdr> msgs;
     std::vector<struct iovec> iovecs;
-    std::unique_ptr<buffer_type> buffer;
+    std::shared_ptr<buffer_type> buffer;
 
 }; // class mmsgs
 
