@@ -19,6 +19,7 @@
 
 #include "component.hpp"
 
+#include <climits>
 #include <byteswap.h>
 
 histogram::histogram() : composite::component("histogram") {
@@ -34,9 +35,17 @@ histogram::histogram() : composite::component("histogram") {
 
 auto histogram::initialize() -> void {
     if (m_display_as_bits) {
-        m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2, 0);
+        m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2 + 1, 0);
     } else {
         m_histogram = std::make_unique<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
+    }
+
+    for (auto i = SHRT_MIN; i <= SHRT_MAX; ++i) {
+        if (i < 0) {
+            m_sample_bits.push_back(-1 * static_cast<int8_t>(std::min(static_cast<double>(m_adc_bits), std::floor(std::log2(std::abs(i))) + 1)));
+        } else {
+            m_sample_bits.push_back(static_cast<int8_t>(std::min(static_cast<double>(m_adc_bits), std::floor(std::log2(std::abs(i))) + 1)));
+        }
     }
 }
 
@@ -62,18 +71,11 @@ auto histogram::process() -> composite::retval {
         // Get sample values
         for (auto& sample : payload) {
             auto sample_val = static_cast<int16_t>(m_byteswap ? bswap_16(sample.real()) : sample.real());
-            auto histogram_val = int32_t{};
-            if (sample_val != 0) {
-                if (m_display_as_bits) {
-                    histogram_val = static_cast<int32_t>(std::floor(std::log2(std::abs(sample_val))) + 1);
-                    if (sample_val < 0) {
-                        histogram_val *= -1;
-                    }
-                } else {
-                    histogram_val = static_cast<int32_t>(sample_val);
-                }
+            auto histogram_val = static_cast<int32_t>(sample_val) + static_cast<int32_t>(std::numeric_limits<int16_t>::max() + 1);
+            if (m_display_as_bits) {
+                histogram_val = m_sample_bits[histogram_val] + m_histogram->size() / 2;
             }
-            histogram_val += static_cast<int32_t>(m_histogram->size() / 2);
+            
             if (histogram_val >= 0 && histogram_val < m_histogram->size()) {
                 m_histogram->at(histogram_val) += 1;
             } else if (histogram_val < 0) {
@@ -88,7 +90,7 @@ auto histogram::process() -> composite::retval {
     if (m_histogram_samples > static_cast<uint32_t>(m_sample_rate)) {
         m_out_port->send_data(std::move(m_histogram), ts);
         if (m_display_as_bits) {
-            m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2, 0);
+            m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2 + 1, 0);
         } else {
             m_histogram = std::make_unique<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
         }

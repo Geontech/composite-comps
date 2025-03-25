@@ -52,6 +52,7 @@ private:
 
     // Members
     std::unique_ptr<histogram_t> m_histogram;
+    std::vector<int8_t> m_sample_bits;
     uint32_t m_histogram_samples{};
 
 }; // class histogram

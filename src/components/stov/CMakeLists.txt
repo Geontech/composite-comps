@@ -32,7 +32,7 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Custom compile options
-add_compile_options(-march=cascadelake)
+add_compile_options(-march=x86-64-v2 -mtune=generic)
 
 # Library
 add_library(stov MODULE

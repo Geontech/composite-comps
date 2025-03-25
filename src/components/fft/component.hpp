@@ -18,15 +18,14 @@
  */
 
 #include "aligned_mem.hpp"
-#include "apply_window.hpp"
 #include "fft_plan.hpp"
-#include "overlay.hpp"
 #include "windows.hpp"
 
 #include <bit>
 #include <composite/component.hpp>
 #include <complex>
 #include <fftw3.h>
+#include <immintrin.h>
 #include <memory>
 #include <vector>
 
@@ -43,16 +42,19 @@ public:
         add_port(m_in_port.get());
         add_port(m_out_port.get());
         add_property("window", &m_window_type).change_listener([this]() {
-            if ((m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING")) {
-                return true;
-            }
-            return false;
+            return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
         });
         add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
             return std::has_single_bit(m_fft_size);
         });
         add_property("fftw_threads", &m_fftw_threads);
         add_property("shift", &m_shift).configurability(RUNTIME);
+        // Initialize the function pointer based on CPU features
+        if (__builtin_cpu_supports("avx512f")) {
+            apply_window_func = &fft::apply_window_avx512;
+        } else if (__builtin_cpu_supports("avx2")) {
+            apply_window_func = &fft::apply_window_avx2;
+        }
     }
 
     ~fft() override = default;
@@ -74,15 +76,7 @@ public:
         }
         // Apply window
         if (m_window) {
-            auto i=0u;
-            auto stride = 32u / sizeof(T);
-            for (; i < data->size(); i += stride) {
-                apply_window(
-                    reinterpret_cast<const typename fft_t::value_type::value_type*>(data->data() + i),
-                    m_window->data() + i * 2,
-                    reinterpret_cast<typename fft_t::value_type::value_type*>(data->data() + i)
-                );
-            }
+            (this->*apply_window_func)(data.get(), m_window.get());
         }
         // Execute the fft
         // In-place for complex
@@ -93,6 +87,62 @@ public:
     }
 
 private:
+    [[gnu::target("avx512f")]]
+    auto apply_window_avx512(fft_t* data, const window_t* window) -> void {
+        // Logic for both types:
+        // - load payload data
+        // - load window data
+        // - multiply payload by window
+        // - store payload data
+        auto stride = 512u / 8u / sizeof(double) / 2u/*complex*/;
+        if constexpr (std::is_same_v<T, float>) {
+            stride = 512u / 8u / sizeof(float) / 2u/*complex*/;
+        }
+        for (auto i=0u; i < data->size(); i += stride) {
+            if constexpr (std::is_same_v<T, float>) {
+                auto data_ptr = reinterpret_cast<float*>(data->data() + i);
+                auto payload = _mm512_load_ps(data_ptr);
+                auto window_ps = _mm512_load_ps(window->data() + i * 2);
+                payload = _mm512_mul_ps(payload, window_ps);
+                _mm512_store_ps(data_ptr, payload);
+            } else {
+                auto data_ptr = reinterpret_cast<double*>(data->data() + i);
+                auto payload = _mm512_load_pd(data_ptr);
+                auto window_pd = _mm512_load_pd(window->data() + i * 2);
+                payload = _mm512_mul_pd(payload, window_pd);
+                _mm512_store_pd(data_ptr, payload);
+            }
+        }
+    }
+
+    [[gnu::target("avx2")]]
+    auto apply_window_avx2(fft_t* data, const window_t* window) -> void {
+        // Logic for both types:
+        // - load payload data
+        // - load window data
+        // - multiply payload by window
+        // - store payload data
+        auto stride = 256u / 8u / sizeof(double) / 2u/*complex*/;
+        if constexpr (std::is_same_v<T, float>) {
+            stride = 256u / 8u / sizeof(float) / 2u/*complex*/;
+        }
+        for (auto i=0u; i < data->size(); i += stride) {
+            if constexpr (std::is_same_v<T, float>) {
+                auto data_ptr = reinterpret_cast<float*>(data->data() + i);
+                auto payload = _mm256_load_ps(data_ptr);
+                auto window_ps = _mm256_load_ps(window->data() + i * 2);
+                payload = _mm256_mul_ps(payload, window_ps);
+                _mm256_store_ps(data_ptr, payload);
+            } else {
+                auto data_ptr = reinterpret_cast<double*>(data->data() + i);
+                auto payload = _mm256_load_pd(data_ptr);
+                auto window_pd = _mm256_load_pd(window->data() + i * 2);
+                payload = _mm256_mul_pd(payload, window_pd);
+                _mm256_store_pd(data_ptr, payload);
+            }
+        }
+    }
+
     // Ports
     std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
     std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
@@ -104,6 +154,7 @@ private:
     bool m_shift{true};
 
     // Members
+    auto (fft::*apply_window_func)(fft_t*, const window_t*) -> void;
     std::unique_ptr<fft_plan<T, true>> m_fft_plan{nullptr};
     std::unique_ptr<window_t> m_window{nullptr};
 

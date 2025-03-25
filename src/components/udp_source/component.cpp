@@ -160,6 +160,7 @@ auto udp_source::property_change_handler() -> void {
 
 auto udp_source::start() -> void {
     m_filler = std::jthread(&udp_source::keep_full, this);
+    pthread_setname_np(m_filler.native_handle(), this->id().c_str());
     composite::component::start();
 }
 
@@ -186,17 +187,25 @@ auto udp_source::process() -> composite::retval {
     if (data == nullptr) {
         return NO_YIELD;
     }
-    using timespec_t = struct timespec;
-    auto timeout = timespec_t{.tv_sec = 1, .tv_nsec = 0};
-    if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
-        // check socket is ready to read
-        if (m_pfds.at(0).revents & POLLIN) [[likely]] {
-            if (auto recvd = recvmmsg(m_socket, data->msgs.data(), data->msgs.size(), 0, &timeout); recvd != -1) {
-                data->buffer->resize(recvd * m_msg_size);
-                m_out_port->send_data(std::move(data->buffer), {});
+
+    // Receive packets
+    auto msgs_recvd = std::size_t{};
+    while (msgs_recvd < m_num_msgs) {
+        if (auto num_events = poll(m_pfds.data(), 1, 100/*ms*/)) [[likely]] {
+            // check socket is ready to read
+            if (m_pfds.at(0).revents & POLLIN) [[likely]] {
+                if (auto recvd = recvmmsg(m_socket, data->msgs.data() + msgs_recvd, data->msgs.size() - msgs_recvd, 0, nullptr); recvd != -1) {
+                    msgs_recvd += recvd;
+                }
             }
         }
     }
+    data->buffer->resize(msgs_recvd * m_msg_size);
+
+    // Send data
+    m_out_port->send_data(std::move(data->buffer), {});
+    
+    // Fast return
     return NO_YIELD;
 }
 
