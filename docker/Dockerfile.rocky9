@@ -39,6 +39,7 @@ FROM base
 RUN microdnf install -y libstdc++ vim fftw
 
 COPY --link --from=project /opt/usr/local /usr/local
+RUN setcap cap_net_raw+eip /usr/local/bin/composite-cli 
 
 COPY examples /usr/local/share/composite/examples
 RUN chmod a+r /usr/local/share/composite/examples/*.json

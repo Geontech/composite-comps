@@ -17,12 +17,12 @@
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
-project(udp_source VERSION 0.1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(udp_source_new VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set compile flags
@@ -32,24 +32,35 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+add_compile_options(-march=x86-64-v2 -mtune=generic)
+
+# Fetch queue library
+FetchContent_Declare(
+    readerwriterqueue
+    GIT_REPOSITORY    https://github.com/cameron314/readerwriterqueue
+    GIT_TAG           master
+)
+FetchContent_MakeAvailable(readerwriterqueue)
+
 # Library
-add_library(udp_source MODULE
+add_library(udp_source_new MODULE
     component.cpp
-    buffer_pool.cpp
+    packet_mmap.cpp
+    helpers.cpp
 )
 # Includes
-target_include_directories(udp_source
-    PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
-    ${vrtgen_SOURCE_DIR}/include
-)
+# target_include_directories(udp_source
+#     PRIVATE
+#     ${vrtgen_SOURCE_DIR}/include
+# )
 # Link
-target_link_libraries(udp_source
+target_link_libraries(udp_source_new
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
+    readerwriterqueue
 )
 # Install
-install(TARGETS udp_source
+install(TARGETS udp_source_new
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
