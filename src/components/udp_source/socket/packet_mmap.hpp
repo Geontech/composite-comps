@@ -1,7 +1,9 @@
 #pragma once
 
-#include "aligned_alloc_resource.hpp"
+#include "interface.hpp"
+#include "pmr/aligned_alloc_resource.hpp"
 
+#include <atomic>
 #include <composite/timestamp.hpp>
 #include <cstdint>
 #include <readerwriterqueue.h>
@@ -10,30 +12,28 @@
 
 namespace udp {
 
-class packet_mmap {
+class packet_mmap : public interface {
+    using queue_t = moodycamel::ReaderWriterQueue<buffer_ptr_t>;
 public:
     packet_mmap(std::string_view interface, std::string_view addr, uint16_t port);
-    ~packet_mmap();
+    ~packet_mmap() final;
 
-    auto start() -> void;
-    auto stop() -> void;
-    auto get_data(std::shared_ptr<std::pmr::vector<uint8_t>>&) -> bool;
-    
+    auto start() -> void override;
+    auto stop() -> void override;
+    auto get_data(buffer_ptr_t&) -> bool override;
+    auto get_stats() -> statistics override;
+
 private:
     auto receive(std::stop_token token) -> void;
-    void log_stats();
-    void get_ethtool_stats(const std::string& iface);
 
     int m_socket{-1};
     int m_join_socket{-1};
     void* m_ring{nullptr};
     std::jthread m_recv_thread;
-    std::jthread m_stat_thread;
     aligned_alloc_resource m_upstream_alloc;
     std::pmr::synchronized_pool_resource m_pool_resource;
-    std::unique_ptr<moodycamel::ReaderWriterQueue<std::shared_ptr<std::pmr::vector<uint8_t>>>> m_queue;
-
-    uint16_t m_pkt_count{};
+    std::unique_ptr<queue_t> m_queue;
+    std::atomic<uint32_t> m_pkts_recvd{};
 
 }; // class packet_mmap
 

@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.20)
-project(udp_source_new VERSION 0.1.0 LANGUAGES CXX)
+project(udp_source VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -43,24 +43,24 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(readerwriterqueue)
 
 # Library
-add_library(udp_source_new MODULE
+add_library(udp_source MODULE
     component.cpp
-    packet_mmap.cpp
+    socket/packet_mmap.cpp
     helpers.cpp
 )
 # Includes
-# target_include_directories(udp_source
-#     PRIVATE
-#     ${vrtgen_SOURCE_DIR}/include
-# )
+target_include_directories(udp_source
+    PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
 # Link
-target_link_libraries(udp_source_new
+target_link_libraries(udp_source
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
     readerwriterqueue
 )
 # Install
-install(TARGETS udp_source_new
+install(TARGETS udp_source
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )

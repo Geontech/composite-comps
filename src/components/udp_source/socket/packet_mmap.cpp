@@ -35,7 +35,7 @@ namespace udp {
 packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, uint16_t port) :
   m_upstream_alloc(64),
   m_pool_resource({}, &m_upstream_alloc),
-  m_queue(std::make_unique<moodycamel::ReaderWriterQueue<std::shared_ptr<std::pmr::vector<uint8_t>>>>(32768)) {
+  m_queue(std::make_unique<queue_t>(32768)) {
     // Create socket
     m_socket = ::socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
     if (m_socket < 0) {
@@ -91,16 +91,10 @@ packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, u
     }
 
     // Set socket ring properties
-    // auto req3 = tpacket_req3{};
-    // req3.tp_block_size = BLOCK_SIZE;
-    // req3.tp_block_nr = BLOCK_NR;
-    // req3.tp_frame_size = FRAME_SIZE;
-    // req3.tp_frame_nr = (BLOCK_SIZE * BLOCK_NR) / FRAME_SIZE;
-    // req3.tp_retire_blk_tov = RETIRE_TOV;
     struct tpacket_req req = {};
-    req.tp_block_size = BLOCK_SIZE;   // e.g., 1 << 16 for 64KB blocks
-    req.tp_block_nr   = BLOCK_NR;     // total number of blocks in the ring
-    req.tp_frame_size = FRAME_SIZE;   // typically 2048 for MTU-sized frames
+    req.tp_block_size = BLOCK_SIZE;
+    req.tp_block_nr   = BLOCK_NR;
+    req.tp_frame_size = FRAME_SIZE;
     req.tp_frame_nr   = FRAME_NR;
 
     if (::setsockopt(m_socket, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) < 0) {
@@ -151,38 +145,36 @@ packet_mmap::~packet_mmap() {
 auto packet_mmap::start() -> void {
     m_recv_thread = std::jthread(&packet_mmap::receive, this);
     pthread_setname_np(m_recv_thread.native_handle(), "packet_mmap");
-    m_stat_thread = std::jthread([this](std::stop_token stoken) {
-        while (!stoken.stop_requested()) {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            log_stats();
-        }
-    });
 }
 
 auto packet_mmap::stop() -> void {
     m_recv_thread.request_stop();
-    m_stat_thread.request_stop();
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();
     }
-    if (m_stat_thread.joinable()) {
-        m_stat_thread.join();
-    }
 }
 
-auto packet_mmap::get_data(std::shared_ptr<std::pmr::vector<uint8_t>>& data) -> bool {
+auto packet_mmap::get_data(buffer_ptr_t& data) -> bool {
     return m_queue->try_dequeue(data);
 }
 
+auto packet_mmap::get_stats() -> statistics {
+    auto stats = statistics{};
+    auto tp_stats = tpacket_stats{};
+    socklen_t len = sizeof(tp_stats);
+    if (getsockopt(m_socket, SOL_PACKET, PACKET_STATISTICS, &tp_stats, &len) == 0) {
+        stats.pkts_recvd_kernel = tp_stats.tp_packets;
+        stats.pkts_dropped_kernel = tp_stats.tp_drops;
+    }
+    stats.pkts_recvd_user = m_pkts_recvd.exchange(0);
+    return stats;
+}
+
 auto packet_mmap::receive(std::stop_token token) -> void {
-    auto block_idx = uint64_t{};
     auto total_loops = uint64_t{};
-    auto poll_ready = uint64_t{};
     auto empty_blocks = uint64_t{};
     auto ready_blocks = uint64_t{};
     auto total_delay = uint64_t{};
-    uint32_t sleep_ns = 1;
-    constexpr uint32_t max_sleep_ns = 1000000;
     const size_t frame_count = BLOCK_NR * (BLOCK_SIZE / FRAME_SIZE);
     std::size_t frame_idx = 0;
 
@@ -194,7 +186,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
 
         // Work through all the ready frames
         if (hdr->tp_status & TP_STATUS_USER) [[likely]] {
-            ++ready_blocks;
+            m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
 
             // Validate protocol
             auto ip_hdr = (struct iphdr*)((uint8_t*)hdr + hdr->tp_mac);
@@ -205,7 +197,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
 
                 // Create a pmr vector and copy udp payload into it
-                auto vec = std::make_shared<std::pmr::vector<uint8_t>>(payload_len, 0, &m_pool_resource);
+                auto vec = std::make_shared<buffer_t>(payload_len, 0, &m_pool_resource);
                 std::memcpy(vec->data(), payload, payload_len);
 
                 // Place onto queue
@@ -220,29 +212,16 @@ auto packet_mmap::receive(std::stop_token token) -> void {
             hdr = (struct tpacket2_hdr*)((uint8_t*)m_ring + (frame_idx * FRAME_SIZE));
         } else {
             ++empty_blocks;
-            if (((float)ready_blocks / total_loops) > 0.5f) {
-                std::this_thread::yield();
-            } else {
-                struct timespec ts{.tv_sec=0, .tv_nsec=1};
-                nanosleep(&ts, nullptr);
-            }
+            struct timespec ts{.tv_sec=0, .tv_nsec=1};
+            nanosleep(&ts, nullptr);
+            // std::this_thread::yield();
         }
     }
 
-    std::cout << std::format(
-        "-----------------------\nTOTAL LOOPS: {}\nPOLL READY: {}\nREADY BLOCKS: {}\nEMPTY BLOCKS: {}\n-----------------------\n",
-        total_loops, poll_ready, ((float)ready_blocks/total_loops)*100, ((float)empty_blocks/total_loops)*100
-    );
-}
-
-void packet_mmap::log_stats() {
-    tpacket_stats stats{};
-    socklen_t len = sizeof(stats);
-    if (getsockopt(m_socket, SOL_PACKET, PACKET_STATISTICS, &stats, &len) == 0) {
-        std::cout << "[packet_stats] received=" << stats.tp_packets << " dropped=" << stats.tp_drops << "\n";
-    } else {
-        perror("getsockopt(PACKET_STATISTICS)");
-    }
+    // std::cout << std::format(
+    //     "-----------------------\nTOTAL LOOPS: {}\nPOLL READY: {}\nREADY BLOCKS: {}\nEMPTY BLOCKS: {}\n-----------------------\n",
+    //     total_loops, poll_ready, ((float)ready_blocks/total_loops)*100, ((float)empty_blocks/total_loops)*100
+    // );
 }
 
 } // namespace udp

@@ -17,8 +17,7 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include "packet_mmap.hpp"
-#include "processing_queue.hpp"
+#include "socket/packet_mmap.hpp"
 
 #include <array>
 #include <composite/component.hpp>
@@ -31,8 +30,8 @@
 #include <sys/uio.h>
 
 class udp_source : public composite::component {
-    using output_t = std::pmr::vector<uint8_t>;
-    using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
+    using output_t = std::shared_ptr<std::pmr::vector<uint8_t>>;
+    using output_port_t = composite::output_port<output_t>;
 public:
     udp_source();
     ~udp_source() override = default;
@@ -57,6 +56,7 @@ private:
 
     // Members
     std::unique_ptr<udp::packet_mmap> m_receiver;
+    std::jthread m_stat_thread;
     uint16_t m_pkt_count{};
     bool m_new_socket_required{true};
     bool m_flush_queue{true};

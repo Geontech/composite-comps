@@ -71,9 +71,23 @@ auto udp_source::property_change_handler() -> void {
 auto udp_source::start() -> void {
     component::start();
     m_receiver->start();
+    m_stat_thread = std::jthread([this](std::stop_token stoken) {
+        while (!stoken.stop_requested()) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            auto stats = m_receiver->get_stats();
+            logger()->trace(
+                "statistics: pkts_recvd_user={}, pkts_recvd_kernel={}, pkts_dropped_kernel={}",
+                stats.pkts_recvd_user, stats.pkts_recvd_kernel, stats.pkts_dropped_kernel
+            );
+        }
+    });
 }
 
 auto udp_source::stop() -> void {
+    m_stat_thread.request_stop();
+    if (m_stat_thread.joinable()) {
+        m_stat_thread.join();
+    }
     m_receiver->stop();
     component::stop();
 }
@@ -82,7 +96,7 @@ auto udp_source::process() -> composite::retval {
     using enum composite::retval;
 
     // Get data from intermediate queue
-    auto data = std::shared_ptr<std::pmr::vector<uint8_t>>{nullptr};
+    auto data = output_t{nullptr};
     if (!m_receiver->get_data(data)) {
         std::this_thread::sleep_for(std::chrono::microseconds(1));
         return NORMAL;
@@ -91,7 +105,6 @@ auto udp_source::process() -> composite::retval {
     }
 
     // Extract metadata
-    auto payload = std::shared_ptr<std::vector<std::byte>>{nullptr};
     auto ts = composite::timestamp{};
     // Parse packets based on protocol
     if (m_transport == "sdds") {
@@ -114,14 +127,14 @@ auto udp_source::process() -> composite::retval {
         data->erase(data->begin(), data->begin() + 56); // move metadata off
         data->resize(1024);
     } else if (m_transport == "vita49") {
-        auto packet = overlay::v49::overlay(*data);
-        auto& header = packet.header();
-        if (overlay::v49::is_data(header)) {
-            if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
-                logger()->warn("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
-            }
-            m_pkt_count = header.packet_count();
-        }
+        // auto packet = overlay::v49::overlay(*data);
+        // auto& header = packet.header();
+        // if (overlay::v49::is_data(header)) {
+        //     if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
+        //         logger()->warn("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
+        //     }
+        //     m_pkt_count = header.packet_count();
+        // }
     }
 
     // Send data
