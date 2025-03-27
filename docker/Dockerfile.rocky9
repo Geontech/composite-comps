@@ -28,7 +28,7 @@ WORKDIR /opt/composite-comps
 RUN set -ex; \
     . /opt/rh/gcc-toolset-13/enable; \
     cmake -B docker-build \
-        -DCOMPOSITE_USE_NATS=ON \
+        -DCOMPOSITE_USE_NATS=OFF \
         -DCOMPOSITE_INSTALL=ON \
         -DCMAKE_INSTALL_PREFIX=/opt/usr/local \
         -DCMAKE_BUILD_TYPE=Release; \

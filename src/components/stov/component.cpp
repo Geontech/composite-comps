@@ -26,12 +26,12 @@ extern "C" {
     auto create(std::string_view type) -> std::shared_ptr<composite::component> {
         if (type == "f32") {
             return std::make_shared<stov<float>>();
-        } else if (type == "f64") {
-            return std::make_shared<stov<double>>();
         } else if (type == "cf32") {
             return std::make_shared<stov<std::complex<float>>>();
-        } else if (type == "cf64") {
-            return std::make_shared<stov<std::complex<double>>>();
+        } else if (type == "i16") {
+            return std::make_shared<stov<int16_t>>();
+        } else if (type == "ci16") {
+            return std::make_shared<stov<std::complex<int16_t>>>();
         }
         return std::make_shared<stov<float>>();
     }
