@@ -1,6 +1,7 @@
 #pragma once
 
 #include "interface.hpp"
+#include "pmr/aligned_alloc_resource.hpp"
 
 #include <atomic>
 #include <composite/timestamp.hpp>
@@ -11,11 +12,11 @@
 
 namespace udp {
 
-class packet_mmap : public interface {
+class recvmmsg : public interface {
     using queue_t = moodycamel::ReaderWriterQueue<buffer_ptr_t>;
 public:
-    packet_mmap(const config& config);
-    ~packet_mmap() final;
+    recvmmsg(const config& config);
+    ~recvmmsg() final;
 
     auto start_recv() -> void override;
     auto stop_recv() -> void override;
@@ -26,8 +27,6 @@ private:
     auto receive(std::stop_token token) -> void;
 
     int m_socket{-1};
-    int m_join_socket{-1};
-    void* m_ring{nullptr};
     std::jthread m_recv_thread;
     std::unique_ptr<queue_t> m_queue;
     std::atomic<uint32_t> m_pkts_recvd{};

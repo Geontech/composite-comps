@@ -1,6 +1,5 @@
 #include "helpers.hpp"
 #include "packet_mmap.hpp"
-#include "overlay.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -32,10 +31,10 @@
 
 namespace udp {
 
-packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, uint16_t port) :
-  m_upstream_alloc(64),
-  m_pool_resource({}, &m_upstream_alloc),
+packet_mmap::packet_mmap(const config& config) :
   m_queue(std::make_unique<queue_t>(32768)) {
+    m_id = config.id;
+
     // Create socket
     m_socket = ::socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
     if (m_socket < 0) {
@@ -53,13 +52,13 @@ packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, u
     // Bind the socket
     auto sll = sockaddr_ll{};
     sll.sll_family = AF_PACKET;
-    sll.sll_ifindex = if_nametoindex(interface.data());
+    sll.sll_ifindex = if_nametoindex(config.interface.c_str());
     sll.sll_protocol = htons(ETH_P_IP);
     if (sll.sll_ifindex == 0) {
         ::close(m_socket);
         throw std::runtime_error(std::format(
             "failed to get ifindex for interface {}: {}",
-            interface.data(), std::string{strerror(errno)}
+            config.interface, std::string{strerror(errno)}
         ));
     }
     if (::bind(m_socket, reinterpret_cast<struct sockaddr*>(&sll), sizeof(sll)) < 0) {
@@ -67,9 +66,9 @@ packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, u
         throw std::runtime_error(std::format("failed to bind socket: {}", std::string{strerror(errno)}));
     }
 
-    if (net::is_ipv4_multicast(ip_addr)) {
+    if (net::is_ipv4_multicast(config.ip_addr)) {
         // Enable multicast mode on the interface
-        auto pkt_mreq = net::create_packet_mreq(interface, ip_addr);
+        auto pkt_mreq = net::create_packet_mreq(config.interface, config.ip_addr);
         if (::setsockopt(m_socket, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &pkt_mreq, sizeof(pkt_mreq)) < 0) {
             ::close(m_socket);
             throw std::runtime_error(std::format("failed to add multicast membership: {}", std::string{strerror(errno)}));
@@ -81,13 +80,12 @@ packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, u
         if (m_join_socket < 0) {
             throw std::runtime_error(std::format("failed to create join socket: {}", std::string{strerror(errno)}));
         }
-        auto ip_mreq = net::create_ip_mreq(m_join_socket, interface, ip_addr);
+        auto ip_mreq = net::create_ip_mreq(m_join_socket, config.interface, config.ip_addr);
         if (::setsockopt(m_join_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &ip_mreq, sizeof(ip_mreq)) < 0) {
             ::close(m_join_socket);
             ::close(m_socket);
             throw std::runtime_error(std::format("failed to join multicast group: {}", std::string{strerror(errno)}));
         }
-        std::cout << "MULTICAST JOINED\n";
     }
 
     // Set socket ring properties
@@ -113,15 +111,17 @@ packet_mmap::packet_mmap(std::string_view interface, std::string_view ip_addr, u
     int m_recv_buf_size = 256 * 1024 * 1024; // Example: 256 MB.  Adjust this!
 
     // Set receive buffer size
-    // if (m_recv_buf_size > 0) {
-        // logger()->trace("setting socket receive buffer size to {}", m_recv_buf_size);
-        setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&m_recv_buf_size, sizeof(m_recv_buf_size));
+    if (config.recv_buf_size > 0) {
+        if (::setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&config.recv_buf_size, sizeof(config.recv_buf_size)) < 0) {
+            ::close(m_socket);
+            throw std::runtime_error(std::format("failed to set receive buffer size: {}", std::string{strerror(errno)}));
+        }
         int optval;
         socklen_t optlen = sizeof(optval);
         if (getsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, &optval, &optlen) != -1) {
             std::cout << std::format("set socket receive buffer size to {}\n", optval);
         }
-    // }
+    }
 
     // Request Transparent Huge Pages
     ::madvise(m_ring, ring_size, MADV_HUGEPAGE);
@@ -142,12 +142,12 @@ packet_mmap::~packet_mmap() {
     ::munmap(m_ring, BLOCK_SIZE * BLOCK_NR);
 }
 
-auto packet_mmap::start() -> void {
+auto packet_mmap::start_recv() -> void {
     m_recv_thread = std::jthread(&packet_mmap::receive, this);
-    pthread_setname_np(m_recv_thread.native_handle(), "packet_mmap");
+    pthread_setname_np(m_recv_thread.native_handle(), std::format("{}:packet_mmap", m_id).c_str());
 }
 
-auto packet_mmap::stop() -> void {
+auto packet_mmap::stop_recv() -> void {
     m_recv_thread.request_stop();
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();

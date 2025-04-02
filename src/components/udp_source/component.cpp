@@ -64,13 +64,20 @@ auto udp_source::property_change_handler() -> void {
     if (m_new_socket_required) {
         logger()->trace("property changes indicate new socket is required; closing socket");
         m_receiver.reset();
-        m_receiver = std::make_unique<udp::packet_mmap>(m_interface, m_ip_addr, m_port);
+        auto config = udp::config{
+            .id = id(),
+            .interface = m_interface,
+            .ip_addr = m_ip_addr,
+            .port = m_port,
+            .recv_buf_size = m_recv_buf_size,
+        };
+        m_receiver = std::make_unique<udp::packet_mmap>(config);
     }
 }
 
 auto udp_source::start() -> void {
     component::start();
-    m_receiver->start();
+    m_receiver->start_recv();
     m_stat_thread = std::jthread([this](std::stop_token stoken) {
         while (!stoken.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -88,7 +95,7 @@ auto udp_source::stop() -> void {
     if (m_stat_thread.joinable()) {
         m_stat_thread.join();
     }
-    m_receiver->stop();
+    m_receiver->stop_recv();
     component::stop();
 }
 

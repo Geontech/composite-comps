@@ -46,6 +46,7 @@ FetchContent_MakeAvailable(readerwriterqueue)
 add_library(udp_source MODULE
     component.cpp
     socket/packet_mmap.cpp
+    socket/recvmmsg.cpp
     helpers.cpp
 )
 # Includes
