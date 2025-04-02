@@ -112,9 +112,10 @@ auto recvmmsg::receive(std::stop_token token) -> void {
     std::array<struct mmsghdr, 128> msgs;
     std::array<struct iovec, 128> iovecs;
     std::array<buffer_ptr_t, 128> buffers;
+    int recvd{128};
 
     while (!token.stop_requested()) {
-        for (auto i=0u; i<msgs.size(); ++i) {
+        for (auto i=0u; i<recvd; ++i) {
             // Create a pmr vector for the iovec
             buffers.at(i) = std::make_shared<buffer_t>(msg_size, 0, &m_pool_resource);
             iovecs.at(i).iov_base = buffers.at(i)->data();
@@ -125,21 +126,18 @@ auto recvmmsg::receive(std::stop_token token) -> void {
 
         // Call recvmmsg
         struct timespec ts{.tv_sec=0, .tv_nsec=1000};
-        auto recvd = ::recvmmsg(m_socket, msgs.data(), msgs.size(), 0, &ts);
-                    
-
-        // Place onto queue
-        for (auto& buffer : buffers) {
-            while (!m_queue->try_enqueue(std::move(buffer))) {
-                std::this_thread::yield();
+        recvd = ::recvmmsg(m_socket, msgs.data(), msgs.size(), 0, &ts);
+        if (recvd > 0) {        
+            // Place onto queue
+            for (auto i=0u; i<recvd; ++i) {
+                while (!m_queue->try_enqueue(std::move(buffers.at(i)))) {
+                    std::this_thread::yield();
+                }
             }
+        } else {
+            recvd = 0;
         }
     }
-
-    // std::cout << std::format(
-    //     "-----------------------\nTOTAL LOOPS: {}\nPOLL READY: {}\nREADY BLOCKS: {}\nEMPTY BLOCKS: {}\n-----------------------\n",
-    //     total_loops, poll_ready, ((float)ready_blocks/total_loops)*100, ((float)empty_blocks/total_loops)*100
-    // );
 }
 
 } // namespace udp
