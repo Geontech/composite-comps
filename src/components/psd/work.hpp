@@ -36,12 +36,12 @@ class work<float> {
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(float)};
     static constexpr auto STRIDE_512 = std::size_t{512u / 8u / sizeof(float)};
 public:
-    work(float window_sum, float sample_rate) {
+    explicit work(float normalization_const) {
         // Initialize the function pointer based on CPU features
         if (__builtin_cpu_supports("avx512f")) {
-            init_avx512(window_sum, sample_rate);
+            init_avx512(normalization_const);
         } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            init_avx2(window_sum, sample_rate);
+            init_avx2(normalization_const);
         }
     }
 
@@ -55,23 +55,21 @@ public:
 
 private:
     [[gnu::target("avx512f")]]
-    auto init_avx512(double window_sum, double sample_rate) -> void {
+    auto init_avx512(float normalization_const) -> void {
         process_func = &work::process_avx512;
         apply_multiplier_func = &work::apply_multiplier_avx512;
-        m_window_sum_512 = _mm512_set1_ps(window_sum);
-        m_fs_512 = _mm512_set1_ps(sample_rate);
-        m_log_const_512 = _mm512_set1_ps(float{1} / std::log2f(10));
+        m_norm_const_512 = _mm512_set1_ps(normalization_const);
+        m_log_const_512 = _mm512_set1_ps(float{10} / std::log2f(10));
         m_real_idx_512i = _mm512_set_epi32(30,28,26,24,22,20,18,16,14,12,10,8,6,4,2,0);
         m_imag_idx_512i = _mm512_set_epi32(31,29,27,25,23,21,19,17,15,13,11,9,7,5,3,1);
     }
 
     [[gnu::target("avx2,fma")]]
-    auto init_avx2(double window_sum, double sample_rate) -> void {
+    auto init_avx2(float normalization_const) -> void {
         process_func = &work::process_avx2;
         apply_multiplier_func = &work::apply_multiplier_avx2;
-        m_window_sum_256 = _mm256_set1_ps(window_sum);
-        m_fs_256 = _mm256_set1_ps(sample_rate);
-        m_log_const_256 = _mm256_set1_ps(float{1} / std::log2f(10));
+        m_norm_const_256 = _mm256_set1_ps(normalization_const);
+        m_log_const_256 = _mm256_set1_ps(float{10} / std::log2f(10));
         m_real_idx_256i = _mm256_set_epi32(14,12,10,8,6,4,2,0);
         m_imag_idx_256i = _mm256_set_epi32(15,13,11,9,7,5,3,1);
     }
@@ -88,10 +86,8 @@ private:
             real_m512 = _mm512_mul_ps(real_m512, real_m512);
             // Square imags and add to squared reals to get power
             real_m512 = _mm512_fmadd_ps(imag_m512, imag_m512, real_m512);
-            // Divide by Fs
-            real_m512 = _mm512_div_ps(real_m512, m_fs_512);
-            // Divide by window sum
-            real_m512 = _mm512_div_ps(real_m512, m_window_sum_512);
+            // Multiply by normalization contstant
+            real_m512 = _mm512_mul_ps(real_m512, m_norm_const_512);
             // Store result into psd
             _mm512_store_ps(psd->data() + i, real_m512);
         }
@@ -110,10 +106,8 @@ private:
             real = _mm256_mul_ps(real, real);
             // Square imags and add to squared reals to get power
             real = _mm256_fmadd_ps(imag, imag, real);
-            // Divide by Fs
-            real = _mm256_div_ps(real, m_fs_256);
-            // Divide by window sum
-            real = _mm256_div_ps(real, m_window_sum_256);
+            // Multiply by normalization constant
+            real = _mm256_mul_ps(real, m_norm_const_256);
             // Store result into psd
             _mm256_store_ps(psd->data() + i, real);
         }
@@ -146,10 +140,8 @@ private:
 
     auto (work::*process_func)(cplx_data_type*) -> std::unique_ptr<real_data_type>;
     auto (work::*apply_multiplier_func)(real_data_type*) const -> void;
-    __m256 m_window_sum_256;
-    __m512 m_window_sum_512;
-    __m256 m_fs_256;
-    __m512 m_fs_512;
+    __m256 m_norm_const_256;
+    __m512 m_norm_const_512;
     __m256 m_log_const_256;
     __m512 m_log_const_512;
     __m256i m_real_idx_256i;
@@ -166,12 +158,12 @@ class work<double> {
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(double)};
     static constexpr auto STRIDE_512 = std::size_t{512u / 8u / sizeof(double)};
 public:
-    work(double window_sum, double sample_rate) {
+    explicit work(double normalization_const) {
         // Initialize the function pointer based on CPU features
         if (__builtin_cpu_supports("avx512f")) {
-            init_avx512(window_sum, sample_rate);
+            init_avx512(normalization_const);
         } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-           init_avx2(window_sum, sample_rate);
+           init_avx2(normalization_const);
         }
     }
 
@@ -185,23 +177,21 @@ public:
 
 private:
     [[gnu::target("avx512f")]]
-    auto init_avx512(double window_sum, double sample_rate) -> void {
+    auto init_avx512(double normalization_const) -> void {
         process_func = &work::process_avx512;
         apply_multiplier_func = &work::apply_multiplier_avx512;
-        m_window_sum_512 = _mm512_set1_pd(window_sum);
-        m_fs_512 = _mm512_set1_pd(sample_rate);
-        m_log_const_512 = _mm512_set1_pd(double{1} / std::log2(10));
+        m_norm_const_512 = _mm512_set1_pd(normalization_const);
+        m_log_const_512 = _mm512_set1_pd(double{10} / std::log2(10));
         m_real_idx_512i = _mm512_set_epi64(14,12,10,8,6,4,2,0);
         m_imag_idx_512i = _mm512_set_epi64(15,13,11,9,7,5,3,1);
     }
 
     [[gnu::target("avx2,fma")]]
-    auto init_avx2(double window_sum, double sample_rate) -> void {
+    auto init_avx2(double normalization_const) -> void {
         process_func = &work::process_avx2;
         apply_multiplier_func = &work::apply_multiplier_avx2;
-        m_window_sum_256 = _mm256_set1_pd(window_sum);
-        m_fs_256 = _mm256_set1_pd(sample_rate);
-        m_log_const_256 = _mm256_set1_pd(double{1} / std::log2(10));
+        m_norm_const_256 = _mm256_set1_pd(normalization_const);
+        m_log_const_256 = _mm256_set1_pd(double{10} / std::log2(10));
         m_real_idx_256i = _mm256_set_epi64x(6,4,2,0);
         m_imag_idx_256i = _mm256_set_epi64x(7,5,3,1);
     }
@@ -218,10 +208,8 @@ private:
             real = _mm512_mul_pd(real, real);
             // Square imags and add to squared reals to get power
             real = _mm512_fmadd_pd(imag, imag, real);
-            // Divide by Fs
-            real = _mm512_div_pd(real, m_fs_512);
-            // Divide by window sum
-            real = _mm512_div_pd(real, m_window_sum_512);
+            // Multiply by normalization constant
+            real = _mm512_mul_pd(real, m_norm_const_512);
             // Store result into psd
             _mm512_store_pd(psd->data() + i, real);
         }
@@ -240,10 +228,8 @@ private:
             real = _mm256_mul_pd(real, real);
             // Square imags and add to squared reals to get power
             real = _mm256_fmadd_pd(imag, imag, real);
-            // Divide by Fs
-            real = _mm256_div_pd(real, m_fs_256);
-            // Divide by window sum
-            real = _mm256_div_pd(real, m_window_sum_256);
+            // Multiply by normalization constant
+            real = _mm256_mul_pd(real, m_norm_const_256);
             // Store result into psd
             _mm256_store_pd(psd->data() + i, real);
         }
@@ -276,10 +262,8 @@ private:
 
     auto (work::*process_func)(cplx_data_type*) -> std::unique_ptr<real_data_type>;
     auto (work::*apply_multiplier_func)(real_data_type*) const -> void;
-    __m256d m_window_sum_256;
-    __m512d m_window_sum_512;
-    __m256d m_fs_256;
-    __m512d m_fs_512;
+    __m256d m_norm_const_256;
+    __m512d m_norm_const_512;
     __m256d m_log_const_256;
     __m512d m_log_const_512;
     __m256i m_real_idx_256i;
