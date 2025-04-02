@@ -77,7 +77,7 @@ recvmmsg::~recvmmsg() {
 
 auto recvmmsg::start_recv() -> void {
     m_recv_thread = std::jthread(&recvmmsg::receive, this);
-    pthread_setname_np(m_recv_thread.native_handle(), std::format("{}:packet_mmap", m_id).c_str());
+    pthread_setname_np(m_recv_thread.native_handle(), std::format("{}:recvmmsg", m_id).c_str());
 }
 
 auto recvmmsg::stop_recv() -> void {
