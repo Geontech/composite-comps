@@ -48,10 +48,12 @@ add_library(udp_source MODULE
     socket/packet_mmap.cpp
     socket/recvmmsg.cpp
     helpers.cpp
+    overlay.cpp
 )
 # Includes
 target_include_directories(udp_source
     PRIVATE
+    ${vrtgen_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 # Link

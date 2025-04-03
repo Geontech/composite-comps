@@ -17,7 +17,7 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include "socket/packet_mmap.hpp"
+#include "socket/interface.hpp"
 
 #include <array>
 #include <composite/component.hpp>
@@ -30,6 +30,10 @@
 #include <sys/uio.h>
 
 class udp_source : public composite::component {
+    static constexpr std::string_view RECVMMSG = "recvmmsg";
+    static constexpr std::string_view PACKET_MMAP = "packet_mmap";
+    static constexpr std::string_view DPDK = "dpdk";
+
     using output_t = std::shared_ptr<std::pmr::vector<uint8_t>>;
     using output_port_t = composite::output_port<output_t>;
 public:
@@ -45,6 +49,7 @@ private:
     output_port_t m_out_port{"data_out"};
     
     // Properties
+    std::string m_socket_type{RECVMMSG};
     std::string m_interface;
     std::string m_ip_addr;
     uint32_t m_port{};
@@ -52,17 +57,11 @@ private:
     uint32_t m_num_msgs{};
     uint32_t m_msg_size{};
     uint32_t m_recv_buf_size{};
-    uint32_t m_pool_size{64};
 
     // Members
-    std::unique_ptr<udp::packet_mmap> m_receiver;
+    std::unique_ptr<udp::interface> m_receiver;
     std::jthread m_stat_thread;
     uint16_t m_pkt_count{};
     bool m_new_socket_required{true};
-    bool m_flush_queue{true};
-    uint64_t total_recvd{};
-    uint64_t not_data_recvd{};
-    uint64_t data_recvd{};
-    uint64_t num_calls{};
 
 }; // class udp_source

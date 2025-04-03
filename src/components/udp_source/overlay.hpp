@@ -17,9 +17,11 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include <bit>
+#include <cstdint>
 #include <map>
+#include <optional>
 #include <span>
+#include <vrtgen/vrtgen.hpp>
 
 namespace overlay {
 
@@ -33,51 +35,28 @@ class overlay {
     static constexpr std::size_t DATA_IDX = 56;
     static constexpr std::size_t DATA_LEN = 1024;
 public:
-    explicit overlay(std::span<const uint8_t> data) :
-      m_data(data) {
-    }
+    explicit overlay(std::span<const uint8_t> data);
 
-    auto pp_id() const -> bool {
-        return m_data[0] & 0x20;
-    }
+    auto pp_id() const -> bool;
 
-    auto is_parity() const -> bool {
-        return pp_id() && ((seq_num() % 32) == 31);
-    }
+    auto is_parity() const -> bool;
 
-    auto bps() const -> uint8_t {
-        return m_data[1] & 0x1F;
-    }
+    auto bps() const -> uint8_t;
 
-    auto seq_num() const -> uint16_t {
-        return std::byteswap(*reinterpret_cast<const uint16_t*>(m_data.data() + 2));
-    }
+    auto seq_num() const -> uint16_t;
 
-    auto ttv() const -> bool {
-        return m_data[4] & 0x40;
-    }
+    auto ttv() const -> bool;
 
-    auto ttag() const -> uint64_t {
-        return std::byteswap(*reinterpret_cast<const uint64_t*>(m_data.data() + 8));
-    }
+    auto ttag() const -> uint64_t;
 
-    auto ttage() const -> uint32_t {
-        return std::byteswap(*reinterpret_cast<const uint32_t*>(m_data.data() + 16));
-    }
+    auto ttage() const -> uint32_t;
 
-    auto secs() const -> uint32_t {
-        return static_cast<uint32_t>(ttag() / PS250_PER_SEC);
-    }
+    auto secs() const -> uint32_t;
 
-    auto psecs() const -> uint64_t {
-        return (ttag() * uint64_t{250u}) - (static_cast<uint64_t>(secs()) * uint64_t{1'000'000'000'000u});
-    }
+    auto psecs() const -> uint64_t;
 
     template<typename T>
-    auto payload() const -> std::span<const T> {
-        auto data = reinterpret_cast<const T*>(m_data.data() + DATA_IDX);
-        return std::span<const T>(data, DATA_LEN / sizeof(T));
-    }
+    auto payload() const -> std::span<const T>;
 
 private:
     std::span<const uint8_t> m_data;
@@ -86,115 +65,35 @@ private:
 
 } // namespace sdds
 
-// namespace v49 {
+namespace v49 {
 
-// auto is_data(uint32_t header) -> bool {
-//     auto packet_type = header >> 28;
-//     return packet_type == 0 || packet_type == 1;
-// }
+class overlay {
+public:
+    explicit overlay(std::span<const uint8_t> data);
 
-// auto is_context(const vrtgen::packing::Header& header) -> bool {
-//     auto packet_type = header >> 28;
-//     return packet_type == 4;
-// }
+    auto is_data() const -> bool;
+    auto is_context() const -> bool;
+    auto header() const -> const vrtgen::packing::Header&;
+    auto stream_id() const -> std::optional<uint32_t>;
+    auto class_id() const -> const std::optional<vrtgen::packing::ClassIdentifier>&;
+    auto integer_timestamp() const -> std::optional<uint32_t>;
+    auto fractional_timestamp() const -> std::optional<uint64_t>;
+    template<typename T>
+    auto payload() const -> std::span<const T>;
+    auto payload_size() const -> size_t;
+    auto payload_start() const -> size_t;
 
-// class overlay {
-// public:
-//     explicit overlay(std::span<const uint8_t> data) :
-//       m_data(data) {
-//         m_header.unpack_from(m_data.data());
-//         auto curr_idx = m_header.size();
-//         if (m_header.packet_type() != vrtgen::packing::PacketType::SIGNAL_DATA) {
-//             m_positions["stream_id"] = curr_idx;
-//             curr_idx += sizeof(uint32_t); // stream_id
-//         }
-//         if (m_header.class_id_enable()) {
-//             m_positions["class_id"] = curr_idx;
-//             curr_idx += 8; // bytes, class_id
-//         }
-//         if (m_header.tsi() != vrtgen::packing::TSI::NONE) {
-//             m_positions["integer_timestamp"] = curr_idx;
-//             curr_idx += sizeof(uint32_t); // integer_timestamp
-//         }
-//         if (m_header.tsf() != vrtgen::packing::TSF::NONE) {
-//             m_positions["fractional_timestamp"] = curr_idx;
-//             curr_idx += sizeof(uint64_t); // fractional_timestamp
-//         }
-//         if (is_data(m_header)) {
-//             m_positions["payload"] = curr_idx;
-//             auto data_header = vrtgen::packing::DataHeader{};
-//             data_header.unpack_from(m_data.data());
-//             if (data_header.trailer_included()) {
-//                 m_positions["trailer"] = (m_header.packet_size() - 1) * sizeof(uint32_t)/*word size*/;
-//             }
-//         }
-//     }
+private:
+    std::span<const uint8_t> m_data;
+    std::map<std::string, std::size_t> m_positions;
+    vrtgen::packing::Header m_header;
+    std::optional<uint32_t> m_stream_id;
+    std::optional<vrtgen::packing::ClassIdentifier> m_class_id;
+    std::optional<uint32_t> m_int_ts;
+    std::optional<uint64_t> m_frac_ts;
+    std::optional<vrtgen::packing::Trailer> m_trailer;
 
-//     auto header() const -> const vrtgen::packing::Header& {
-//         return m_header;
-//     }
+}; // class overlay
 
-//     auto stream_id() const -> std::optional<uint32_t> {
-//         if (!m_positions.contains("stream_id")) {
-//             return {};
-//         }
-//         auto pos = m_positions.at("stream_id");
-//         return vrtgen::swap::from_be(*reinterpret_cast<const uint32_t*>(m_data.data() + pos));
-//     }
-
-//     auto class_id() const -> std::optional<vrtgen::packing::ClassIdentifier> {
-//         if (!m_positions.contains("class_id")) {
-//             return {};
-//         }
-//         auto pos = m_positions.at("class_id");
-//         auto class_id = vrtgen::packing::ClassIdentifier{};
-//         class_id.unpack_from(m_data.data() + pos);
-//         return class_id;
-//     }
-
-//     auto integer_timestamp() const -> std::optional<uint32_t> {
-//         if (!m_positions.contains("integer_timestamp")) {
-//             return {};
-//         }
-//         auto pos = m_positions.at("integer_timestamp");
-//         return vrtgen::swap::from_be(*reinterpret_cast<const uint32_t*>(m_data.data() + pos));
-//     }
-
-//     auto fractional_timestamp() const -> std::optional<uint64_t> {
-//         if (!m_positions.contains("fractional_timestamp")) {
-//             return {};
-//         }
-//         auto pos = m_positions.at("fractional_timestamp");
-//         return vrtgen::swap::from_be(*reinterpret_cast<const uint64_t*>(m_data.data() + pos));
-//     }
-
-//     template<typename T>
-//     auto payload() const -> std::span<const T> {
-//         if (!m_positions.contains("payload")) {
-//             return {};
-//         }
-//         auto pos = m_positions.at("payload");
-//         auto data = reinterpret_cast<const T*>(m_data.data() + pos);
-//         return std::span<const T>(data, payload_size() / sizeof(T));
-//     }
-
-//     auto payload_size() const -> size_t {
-//         if (!m_positions.contains("payload")) {
-//             return {};
-//         }
-//         auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - m_positions.at("payload");
-//         if (m_positions.contains("trailer")) {
-//             size -= sizeof(uint32_t);
-//         }
-//         return size;
-//     }
-
-// private:
-//     std::span<const uint8_t> m_data;
-//     vrtgen::packing::Header m_header;
-//     std::map<std::string, std::size_t> m_positions;
-
-// }; // class overlay
-
-// } // namespace v49
+} // namespace v49
 } // namespace overlay

@@ -19,6 +19,8 @@
 
 #include "component.hpp"
 #include "overlay.hpp"
+#include "socket/packet_mmap.hpp"
+#include "socket/recvmmsg.hpp"
 
 #include <arpa/inet.h>
 #include <array>
@@ -36,42 +38,37 @@
 udp_source::udp_source() : composite::component("udp_source") {
     add_port(&m_out_port);
     using enum composite::properties::config_type;
-    add_property("interface", &m_interface).configurability(RUNTIME).change_listener([this]() {
-        m_new_socket_required = true;
-        return true;
+    add_property("socket_type", &m_socket_type).change_listener([this]() {
+        return m_socket_type == RECVMMSG
+            || m_socket_type == PACKET_MMAP
+            || m_socket_type == DPDK;
     });
-    add_property("ip_addr", &m_ip_addr).configurability(RUNTIME).change_listener([this]() {
-        m_new_socket_required = true;
-        return true;
-    });
-    add_property("port", &m_port).configurability(RUNTIME).change_listener([this]() {
-        m_new_socket_required = true;
-        return true;
-    });
+    add_property("interface", &m_interface).configurability(RUNTIME);
+    add_property("ip_addr", &m_ip_addr).configurability(RUNTIME);
+    add_property("port", &m_port).configurability(RUNTIME);
     add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
-        m_flush_queue = true;
         return (m_transport == "sdds") || (m_transport == "vita49");
     });
     add_property("recv_buf_size", &m_recv_buf_size).units("bytes");
-    add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME).change_listener([this]() {
-        m_flush_queue = true;
-        return true;
-    });
+    add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
 }
 
 auto udp_source::property_change_handler() -> void {
     logger()->trace(std::source_location::current().function_name());
-    if (m_new_socket_required) {
-        logger()->trace("property changes indicate new socket is required; closing socket");
-        m_receiver.reset();
-        auto config = udp::config{
-            .id = id(),
-            .interface = m_interface,
-            .ip_addr = m_ip_addr,
-            .port = m_port,
-            .recv_buf_size = m_recv_buf_size,
-        };
+    m_receiver.reset();
+    auto config = udp::config{
+        .id = id(),
+        .interface = m_interface,
+        .ip_addr = m_ip_addr,
+        .port = m_port,
+        .recv_buf_size = m_recv_buf_size,
+    };
+    if (m_socket_type == PACKET_MMAP) {
         m_receiver = std::make_unique<udp::packet_mmap>(config);
+    } else if (m_socket_type == DPDK) {
+        // TODO
+    } else { // recvmmsg
+        m_receiver = std::make_unique<udp::recvmmsg>(config);
     }
 }
 
@@ -134,14 +131,22 @@ auto udp_source::process() -> composite::retval {
         data->erase(data->begin(), data->begin() + 56); // move metadata off
         data->resize(1024);
     } else if (m_transport == "vita49") {
-        // auto packet = overlay::v49::overlay(*data);
-        // auto& header = packet.header();
-        // if (overlay::v49::is_data(header)) {
-        //     if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
-        //         logger()->warn("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
-        //     }
-        //     m_pkt_count = header.packet_count();
-        // }
+        auto packet = overlay::v49::overlay(*data);
+        if (packet.is_data()) [[likely]] {
+            auto& header = packet.header();
+            if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
+                logger()->warn("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
+            }
+            m_pkt_count = header.packet_count();
+            if (auto int_ts = packet.integer_timestamp()) {
+                ts.seconds = int_ts.value();
+            }
+            if (auto frac_ts = packet.fractional_timestamp()) {
+                ts.picoseconds = frac_ts.value();
+            }
+            data->erase(data->begin(), data->begin() + packet.payload_start()); // move metadata off
+            data->resize(packet.payload_size());
+        }
     }
 
     // Send data
