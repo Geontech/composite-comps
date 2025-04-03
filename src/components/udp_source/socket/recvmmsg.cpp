@@ -62,6 +62,16 @@ recvmmsg::recvmmsg(const config& config) :
             std::cout << std::format("set socket receive buffer size to {}\n", optval);
         }
     }
+
+    // Set batch size
+    if (config.batch_size > 0) {
+        m_batch_size = config.batch_size;
+    }
+
+    // Set msg size
+    if (config.msg_size > 0) {
+        m_msg_size = config.msg_size;
+    }
 }
 
 recvmmsg::~recvmmsg() {
@@ -104,38 +114,34 @@ auto recvmmsg::get_stats() -> statistics {
 }
 
 auto recvmmsg::receive(std::stop_token token) -> void {
-    auto empty_blocks = uint64_t{};
-    auto ready_blocks = uint64_t{};
-    auto total_delay = uint64_t{};
-    std::size_t frame_idx = 0;
-    auto msg_size = 1080;
-    std::array<struct mmsghdr, 128> msgs;
-    std::array<struct iovec, 128> iovecs;
-    std::array<buffer_ptr_t, 128> buffers;
-    int recvd{128};
+    struct mmsghdr msgs[m_batch_size];
+    struct iovec iovecs[m_batch_size];
+    buffer_ptr_t buffers[m_batch_size];
 
     while (!token.stop_requested()) {
-        for (auto i=0u; i<recvd; ++i) {
+        for (auto i=0u; i<m_batch_size; ++i) {
             // Create a pmr vector for the iovec
-            buffers.at(i) = std::make_shared<buffer_t>(msg_size, 0, &m_pool_resource);
-            iovecs.at(i).iov_base = buffers.at(i)->data();
-            iovecs.at(i).iov_len = msg_size;
-            msgs.at(i).msg_hdr.msg_iov = &iovecs.at(i);
-            msgs.at(i).msg_hdr.msg_iovlen = 1;
+            buffers[i] = std::make_shared<buffer_t>(m_msg_size, 0, &m_pool_resource);
+            iovecs[i].iov_base = buffers[i]->data();
+            iovecs[i].iov_len = m_msg_size;
+            msgs[i].msg_hdr.msg_iov = &iovecs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
         }
 
         // Call recvmmsg
-        struct timespec ts{.tv_sec=0, .tv_nsec=1000};
-        recvd = ::recvmmsg(m_socket, msgs.data(), msgs.size(), 0, &ts);
-        if (recvd > 0) {        
-            // Place onto queue
-            for (auto i=0u; i<recvd; ++i) {
-                while (!m_queue->try_enqueue(std::move(buffers.at(i)))) {
-                    std::this_thread::yield();
-                }
+        struct timespec ts{.tv_sec=0, .tv_nsec=100000}; // 100 us
+        auto msgs_recvd = std::size_t{};
+        while (msgs_recvd < m_batch_size) {
+            if (auto recvd = ::recvmmsg(m_socket, &msgs[0] + msgs_recvd, m_batch_size - msgs_recvd, 0, &ts); recvd > 0) {        
+                msgs_recvd += recvd;
             }
-        } else {
-            recvd = 0;
+        }
+
+        // Place onto queue
+        for (auto i=0u; i<msgs_recvd; ++i) {
+            while (!m_queue->try_enqueue(std::move(buffers[i]))) {
+                std::this_thread::yield();
+            }
         }
     }
 }

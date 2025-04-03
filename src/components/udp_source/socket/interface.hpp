@@ -16,6 +16,8 @@ std::string interface;
 std::string ip_addr;
 uint16_t port{};
 std::size_t recv_buf_size{};
+std::size_t batch_size{};
+std::size_t msg_size{};
 
 }; // struct config
 

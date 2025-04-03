@@ -29,6 +29,8 @@ private:
     int m_socket{-1};
     std::jthread m_recv_thread;
     std::unique_ptr<queue_t> m_queue;
+    std::size_t m_batch_size{128};
+    std::size_t m_msg_size{};
     std::atomic<uint32_t> m_pkts_recvd{};
 
 }; // class packet_mmap

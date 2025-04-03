@@ -56,12 +56,17 @@ udp_source::udp_source() : composite::component("udp_source") {
 auto udp_source::property_change_handler() -> void {
     logger()->trace(std::source_location::current().function_name());
     m_receiver.reset();
+    if (m_transport == "sdds") {
+        m_msg_size = 1080; // fixed length protocol
+    }
     auto config = udp::config{
         .id = id(),
         .interface = m_interface,
         .ip_addr = m_ip_addr,
         .port = m_port,
         .recv_buf_size = m_recv_buf_size,
+        .batch_size = m_num_msgs,
+        .msg_size = m_msg_size,
     };
     if (m_socket_type == PACKET_MMAP) {
         m_receiver = std::make_unique<udp::packet_mmap>(config);
