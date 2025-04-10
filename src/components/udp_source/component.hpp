@@ -17,42 +17,28 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
+#include "socket/interface.hpp"
+
 #include <array>
 #include <composite/component.hpp>
-#include <mutex>
+#include <memory>
 #include <poll.h>
-#include <queue>
 #include <string>
 #include <string_view>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
-#include <thread>
-#include <unistd.h>
-
-namespace udpsrc::net {
-
-class mmsgs {
-public:
-    using buffer_type = std::vector<uint8_t>;
-
-    mmsgs(size_t num_msgs, size_t msg_size);
-
-    std::vector<struct mmsghdr> msgs;
-    std::vector<struct iovec> iovecs;
-    std::shared_ptr<buffer_type> buffer;
-
-}; // class mmsgs
-
-auto get_interface_ip(int fd, std::string_view interface) -> std::string;
-
-} // namespace udpsrc::net
 
 class udp_source : public composite::component {
-    using output_t = std::vector<uint8_t>;
-    using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
+    static constexpr std::string_view RECVMMSG = "recvmmsg";
+    static constexpr std::string_view PACKET_MMAP = "packet_mmap";
+    static constexpr std::string_view DPDK = "dpdk";
+
+    using output_t = std::shared_ptr<std::pmr::vector<uint8_t>>;
+    using output_port_t = composite::output_port<output_t>;
 public:
     udp_source();
-    ~udp_source() override;
+    ~udp_source() override = default;
     auto property_change_handler() -> void override;
     auto start() -> void override;
     auto stop() -> void override;
@@ -60,27 +46,24 @@ public:
 
 private:
     // Ports
-    std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
+    output_port_t m_out_port{"data_out"};
     
     // Properties
+    std::string m_socket_type{RECVMMSG};
     std::string m_interface;
     std::string m_ip_addr;
     uint32_t m_port{};
-    uint32_t m_recv_buf_size{};
-    uint32_t m_msg_size{};
+    std::string m_transport;
     uint32_t m_num_msgs{};
+    uint32_t m_msg_size{};
+    uint32_t m_frame_count{32768};
+    uint32_t m_recv_buf_size{};
 
     // Members
-    int m_socket{-1};
-    std::array<struct pollfd, 1> m_pfds;
-    size_t m_queue_size{m_num_msgs / 2};
-    std::deque<std::unique_ptr<udpsrc::net::mmsgs>> m_queue;
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::jthread m_filler;
+    std::unique_ptr<udp::interface> m_receiver;
+    std::jthread m_stat_thread;
+    uint16_t m_pkt_count{};
     bool m_new_socket_required{true};
-    bool m_flush_queue{true};
-
-    auto keep_full(std::stop_token token) -> void;
+    std::atomic<uint32_t> m_pkts_processed{};
 
 }; // class udp_source

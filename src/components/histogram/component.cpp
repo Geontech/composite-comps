@@ -19,17 +19,23 @@
 
 #include "component.hpp"
 
+#include <bit>
 #include <climits>
-#include <byteswap.h>
+#include <complex>
+#include <cmath>
+#include <span>
 
 histogram::histogram() : composite::component("histogram") {
-    add_port(m_in_port.get());
-    add_port(m_out_port.get());
+    add_port(&m_in_port);
+    add_port(&m_out_port);
     add_property("transport", &m_transport);
     add_property("msg_size", &m_msg_size).units("bytes");
     add_property("byteswap", &m_byteswap);
     add_property("adc_bits", &m_adc_bits).units("bits");
     add_property("sample_rate", &m_sample_rate).units("sps");
+    add_property("percent_sampled", &m_percent_sampled).change_listener([this]() {
+        return (m_percent_sampled > 0.0) && (m_percent_sampled <= 1.0);
+    });
     add_property("display_as_bits", &m_display_as_bits);
 }
 
@@ -51,26 +57,19 @@ auto histogram::initialize() -> void {
 
 auto histogram::process() -> composite::retval {
     using enum composite::retval;
-    auto [data, ts] = m_in_port->get_data();
+    auto [data, ts] = m_in_port.get_data();
     if (data == nullptr) {
         return NOOP;
     }
-    // Histogram
-    for (auto idx = size_t{}; idx < data->size(); idx += m_msg_size) {
-        auto payload = std::span<const std::complex<uint16_t>>{};
-        if (m_transport == "sdds") {
-            auto packet = overlay::sdds::overlay({data->data() + idx, m_msg_size});
-            payload = packet.payload<std::complex<uint16_t>>();
-        } else if (m_transport == "vita49") {
-            auto packet = overlay::v49::overlay({data->data() + idx, m_msg_size});
-            if (auto& header = packet.header(); !overlay::v49::is_data(header)) {
-                continue;
-            }
-            payload = packet.payload<std::complex<uint16_t>>();
-        }
-        // Get sample values
-        for (auto& sample : payload) {
-            auto sample_val = static_cast<int16_t>(m_byteswap ? bswap_16(sample.real()) : sample.real());
+    // Process frames based on
+    if ((m_skip_counter++ % static_cast<uint32_t>((float{1} / m_percent_sampled))) == 0) {
+        // Histogram
+        auto payload = std::span<const std::complex<int16_t>>{
+            reinterpret_cast<const std::complex<int16_t>*>(data->data()),
+            data->size() / sizeof(std::complex<int16_t>)
+        };
+        for (const auto& sample : payload) {
+            auto sample_val = static_cast<int16_t>(m_byteswap ? std::byteswap(sample.real()) : sample.real());
             auto histogram_val = static_cast<int32_t>(sample_val) + static_cast<int32_t>(std::numeric_limits<int16_t>::max() + 1);
             if (m_display_as_bits) {
                 histogram_val = m_sample_bits[histogram_val] + m_histogram->size() / 2;
@@ -85,16 +84,16 @@ auto histogram::process() -> composite::retval {
             }
             ++m_histogram_samples;
         }
-    }
-    // Send histogram data
-    if (m_histogram_samples > static_cast<uint32_t>(m_sample_rate)) {
-        m_out_port->send_data(std::move(m_histogram), ts);
-        if (m_display_as_bits) {
-            m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2 + 1, 0);
-        } else {
-            m_histogram = std::make_unique<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
+        // Send histogram data
+        if (m_histogram_samples > static_cast<uint32_t>(m_sample_rate)) {
+            m_out_port.send_data(std::move(m_histogram), ts);
+            if (m_display_as_bits) {
+                m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2 + 1, 0);
+            } else {
+                m_histogram = std::make_unique<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
+            }
+            m_histogram_samples = 0;
         }
-        m_histogram_samples = 0;
     }
     return NORMAL;
 }

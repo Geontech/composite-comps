@@ -17,17 +17,14 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include <overlay.hpp>
-
-#include <byteswap.h>
 #include <composite/component.hpp>
 #include <complex>
 #include <cstdint>
-#include <limits>
+#include <memory_resource>
 #include <vector>
 
 class histogram : public composite::component {
-    using input_t = std::vector<uint8_t>;
+    using input_t = std::pmr::vector<uint8_t>;
     using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using histogram_t = std::vector<uint64_t>;
     using output_port_t = composite::output_port<std::unique_ptr<histogram_t>>;
@@ -39,8 +36,8 @@ public:
 
 private:
     // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
-    std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
+    input_port_t m_in_port{"data_in"};
+    output_port_t m_out_port{"data_out"};
 
     // Properties
     std::string m_transport;
@@ -48,11 +45,13 @@ private:
     bool m_byteswap{true};
     uint32_t m_adc_bits{};
     float m_sample_rate{};
+    float m_percent_sampled{1};
     bool m_display_as_bits{};
 
     // Members
     std::unique_ptr<histogram_t> m_histogram;
     std::vector<int8_t> m_sample_bits;
     uint32_t m_histogram_samples{};
+    uint32_t m_skip_counter{};
 
 }; // class histogram

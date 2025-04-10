@@ -55,8 +55,8 @@ public:
     }
 
     ~fft_plan() {
-        fftwf_cleanup_threads();
         fftwf_destroy_plan(m_plan);
+        fftwf_cleanup_threads();
     }
 
     auto plan() -> fftwf_plan {
@@ -98,8 +98,8 @@ public:
     }
 
     ~fft_plan() {
-        fftwf_cleanup_threads();
         fftwf_destroy_plan(m_plan);
+        fftwf_cleanup_threads();
     }
 
     auto plan() -> fftwf_plan {
@@ -142,8 +142,8 @@ public:
     }
 
     ~fft_plan() {
-        fftw_cleanup_threads();
         fftw_destroy_plan(m_plan);
+        fftw_cleanup_threads();
     }
 
     auto plan() -> fftw_plan {
@@ -185,8 +185,8 @@ public:
     }
 
     ~fft_plan() {
-        fftw_cleanup_threads();
         fftw_destroy_plan(m_plan);
+        fftw_cleanup_threads();
     }
 
     auto plan() -> fftw_plan {

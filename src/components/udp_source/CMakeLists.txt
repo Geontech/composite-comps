@@ -17,12 +17,12 @@
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.20)
 project(udp_source VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set compile flags
@@ -32,9 +32,22 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+add_compile_options(-march=x86-64-v2 -mtune=generic)
+
 # Library
 add_library(udp_source MODULE
     component.cpp
+    socket/packet_mmap.cpp
+    socket/recvmmsg.cpp
+    helpers.cpp
+    overlay.cpp
+    pmr/ring_resource.cpp
+)
+# Includes
+target_include_directories(udp_source
+    PRIVATE
+    ${vrtgen_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 # Link
 target_link_libraries(udp_source

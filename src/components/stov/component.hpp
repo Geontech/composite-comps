@@ -20,19 +20,19 @@
 #include "convert.hpp"
 
 #include <aligned_mem.hpp>
-#include <overlay.hpp>
 
 #include <algorithm>
 #include <composite/component.hpp>
 #include <complex>
 #include <cstdint>
+#include <memory_resource>
 #include <spdlog/spdlog.h>
 #include <variant>
 #include <vector>
 
 template <typename T>
 class stov : public composite::component {
-    using input_t = std::vector<uint8_t>;
+    using input_t = std::pmr::vector<uint8_t>;
     using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using output_t = aligned::aligned_mem<T>;
     using output_port_t = composite::output_port<std::unique_ptr<output_t>>;
@@ -41,12 +41,8 @@ public:
     stov() : composite::component("stov") {
         add_port(m_in_port.get());
         add_port(m_out_port.get());
-        add_property("output_size", &m_output_size).units("bytes").configurability(RUNTIME);
-        add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
-            return (m_transport == "sdds") || (m_transport == "vita49");
-        });
-        add_property("byteswap", &m_byteswap);
-        add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
+        add_property("output_size", &m_output_size).configurability(RUNTIME);
+        add_property("byteswap", &m_byteswap).configurability(RUNTIME);
     }
 
     ~stov() override = default;
@@ -63,67 +59,41 @@ public:
 
     auto process() -> composite::retval override {
         using enum composite::retval;
-        auto [data, _] = m_in_port->get_data();
+        auto [data, ts] = m_in_port->get_data();
         if (data == nullptr) {
             return NORMAL;
         }
-        for (auto idx = size_t{}; idx < data->size(); idx += m_msg_size) {
-            auto payload = std::span<const std::complex<int16_t>>{};
-            auto ts = composite::timestamp{};
-            if (m_transport == "sdds") {
-                auto packet = overlay::sdds::overlay({data->data() + idx, m_msg_size});
-                // TODO - validations regarding parity and ttv
-                ts = composite::timestamp{packet.secs(), packet.psecs()};
-                payload = packet.payload<std::complex<int16_t>>();
-            } else if (m_transport == "vita49") {
-                auto packet = overlay::v49::overlay({data->data() + idx, m_msg_size});
-                auto& header = packet.header();
-                if (!overlay::v49::is_data(header)) {
-                    continue;
-                }
-                if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
-                    logger()->error("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());   
-                }
-                m_pkt_count = header.packet_count();
-                if (auto int_ts = packet.integer_timestamp()) {
-                    ts.seconds = int_ts.value();
-                }
-                if (auto frac_ts = packet.fractional_timestamp()) {
-                    ts.picoseconds = frac_ts.value();
-                }
-                payload = packet.payload<std::complex<int16_t>>();
+        auto bit_len = std::size_t{256};
+        if (__builtin_cpu_supports("avx512f")) {
+            bit_len = std::size_t{512};
+        }
+        auto stride = size_t{bit_len / 8u / sizeof(T)};
+        auto data_ci16 = reinterpret_cast<std::complex<int16_t>*>(data->data());
+        auto data_ci16_len = data->size() / sizeof(std::complex<int16_t>);
+        for (auto i=0u; i < data_ci16_len; i += stride) {
+            if (m_output_buf == nullptr) {
+                m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
+                m_output_ts = ts;
             }
-            auto i=0u;
-            auto bit_len = std::size_t{256};
-            if (__builtin_cpu_supports("avx512f")) {
-                bit_len = std::size_t{512};
+            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
+                std::get<0>(m_converter).process(
+                    reinterpret_cast<const int16_t*>(data_ci16 + i),
+                    reinterpret_cast<float*>(m_output_buf->data() + m_output_idx)
+                );
+            } else { // int16_t or std::complex<int16_t>
+                std::get<1>(m_converter).process(
+                    reinterpret_cast<const int16_t*>(data_ci16 + i),
+                    reinterpret_cast<int16_t*>(m_output_buf->data() + m_output_idx)
+                );
             }
-            auto stride = size_t{bit_len / 8u / sizeof(T)};
-            for (; i < payload.size(); i += stride) {
-                if (m_output_buf == nullptr) {
-                    m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
-                    m_output_ts = ts;
-                }
-                if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
-                    std::get<0>(m_converter).process(
-                        reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<float*>(m_output_buf->data() + m_output_idx)
-                    );
-                } else { // int16_t or std::complex<int16_t>
-                    std::get<1>(m_converter).process(
-                        reinterpret_cast<const int16_t*>(payload.data() + i),
-                        reinterpret_cast<int16_t*>(m_output_buf->data() + m_output_idx)
-                    );
-                }
-                m_output_idx += stride;
-                if (m_output_idx == m_output_size) {
-                    m_out_port->send_data(std::move(m_output_buf), m_output_ts);
-                    m_output_buf.reset();
-                    m_output_idx = 0;
-                }
+            m_output_idx += stride;
+            if (m_output_idx == m_output_size) {
+                m_out_port->send_data(std::move(m_output_buf), m_output_ts);
+                m_output_buf.reset();
+                m_output_idx = 0;
             }
         }
-        return NO_YIELD;
+        return NORMAL;
     }
 
 private:
@@ -133,15 +103,13 @@ private:
 
     // Properties
     uint32_t m_output_size{};
-    std::string m_transport;
     bool m_byteswap{true};
-    uint32_t m_msg_size{};
 
     // Members
     std::variant<converter<int16_t, float>, converter<int16_t, int16_t>> m_converter;
     std::unique_ptr<output_t> m_output_buf;
     uint32_t m_output_idx{};
-    typename output_port_t::timestamp_type m_output_ts;
+    composite::timestamp m_output_ts;
     uint8_t m_pkt_count{};
 
 }; // class stov
