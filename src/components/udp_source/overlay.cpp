@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -20,6 +20,7 @@
 #include "overlay.hpp"
 
 #include <bit>
+#include <immintrin.h>
 
 namespace overlay {
 
@@ -73,39 +74,101 @@ auto overlay::payload() const -> std::span<const T> {
 
 namespace v49 {
 
-overlay::overlay(std::span<const uint8_t> data) : m_data(data) {
-    m_header.unpack_from(m_data.data());
-    auto curr_idx = m_header.size();
+overlay::overlay(std::span<uint8_t> data) : m_data(data) {
+    auto curr_idx = std::size_t{};
+    auto v49_header_pos = curr_idx;
+    // Check for VRL frame
+    auto first_word = *reinterpret_cast<const uint32_t*>(m_data.data());
+    constexpr auto VRLP = uint32_t{0x56524C50};
+    if (first_word == VRLP) {
+        m_is_vrl = true;
+        m_little_endian = true;
+        curr_idx += sizeof(VRLP);
+        // TODO: parse frame word
+        curr_idx += sizeof(uint32_t); // frame word
+    } else if (first_word == std::byteswap(VRLP)) {
+        m_is_vrl = true;
+        curr_idx += sizeof(VRLP);
+        // TODO: parse frame word
+        curr_idx += sizeof(uint32_t); // frame word
+    }
+    // Parse VITA49 header
+    v49_header_pos = curr_idx;
+    if (m_little_endian) {
+        auto header_word = std::byteswap(*reinterpret_cast<const uint32_t*>(m_data.data() + curr_idx));
+        m_header.unpack_from(reinterpret_cast<uint8_t*>(&header_word));
+    } else {
+        m_header.unpack_from(m_data.data() + curr_idx);
+    }
+    curr_idx += m_header.size();
+    // Check for stream id
     if (m_header.packet_type() != vrtgen::packing::PacketType::SIGNAL_DATA) {
         auto stream_id = *reinterpret_cast<const uint32_t*>(m_data.data() + curr_idx);
-        m_stream_id = std::byteswap(stream_id);
+        if (m_little_endian) {
+            m_stream_id = stream_id;
+        } else {
+            m_stream_id = std::byteswap(stream_id);
+        }
         curr_idx += sizeof(stream_id);
     }
+    // Check for class id
     if (m_header.class_id_enable()) {
         m_class_id = vrtgen::packing::ClassIdentifier{};
-        m_class_id->unpack_from(m_data.data() + curr_idx);
+        if (m_little_endian) {
+            auto class_id_words = std::byteswap(*reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx));
+            m_class_id->unpack_from(reinterpret_cast<uint8_t*>(&class_id_words));
+        } else {
+            m_class_id->unpack_from(m_data.data() + curr_idx);
+        }
         curr_idx += m_class_id->size();
     }
+    // Check and get integer timestamp
     if (m_header.tsi() != vrtgen::packing::TSI::NONE) {
         auto ts = *reinterpret_cast<const uint32_t*>(m_data.data() + curr_idx);
-        m_int_ts = std::byteswap(ts);
+        if (m_little_endian) {
+            m_int_ts = ts;
+        } else {
+            m_int_ts = std::byteswap(ts);
+        }
         curr_idx += sizeof(ts);
     }
+    // Check and get fractional timestamp
     if (m_header.tsf() != vrtgen::packing::TSF::NONE) {
         auto ts = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
-        m_int_ts = std::byteswap(ts);
+        if (m_little_endian) {
+            m_frac_ts = ts;
+        } else {
+            m_frac_ts = std::byteswap(ts);
+        }
         curr_idx += sizeof(ts);
     }
     if (is_data()) {
         m_positions["payload"] = curr_idx;
         auto data_header = vrtgen::packing::DataHeader{};
-        data_header.unpack_from(m_data.data());
+        data_header.unpack_from(m_data.data() + v49_header_pos);
         if (data_header.trailer_included()) {
             m_trailer = vrtgen::packing::Trailer{};
             auto pos = (m_header.packet_size() - 1) * sizeof(uint32_t)/*word size*/;
-            m_trailer->unpack_from(m_data.data() + pos);
+            if (m_is_vrl) {
+                pos += sizeof(VRLP) + sizeof(uint32_t)/*frame word*/;
+            }
+            if (m_little_endian) {
+                auto trailer_word = std::byteswap(*reinterpret_cast<const uint32_t*>(m_data.data() + pos));
+                m_trailer->unpack_from(reinterpret_cast<uint8_t*>(&trailer_word));
+            } else {
+                m_trailer->unpack_from(m_data.data() + pos);
+            }
         }
+        
+        // Check for needed q/i to i/q swap
+        auto pos = m_positions.at("payload");
+        auto len = payload_size();
+        swap_iq({m_data.data() + pos, len});
     }
+}
+
+auto overlay::is_vrl() const -> bool {
+    return m_is_vrl;
 }
 
 auto overlay::is_data() const -> bool {
@@ -139,7 +202,7 @@ auto overlay::fractional_timestamp() const -> std::optional<uint64_t> {
 }
 
 template<typename T>
-auto overlay::payload() const -> std::span<const T> {
+auto overlay::payload() -> std::span<const T> {
     if (!m_positions.contains("payload")) {
         return {};
     }
@@ -153,7 +216,7 @@ auto overlay::payload_size() const -> size_t {
         return {};
     }
     auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - m_positions.at("payload");
-    if (m_positions.contains("trailer")) {
+    if (m_trailer.has_value()) {
         size -= sizeof(uint32_t);
     }
     return size;
@@ -164,6 +227,65 @@ auto overlay::payload_start() const -> size_t {
         return {};
     }
     return m_positions.at("payload");
+}
+
+auto overlay::swap_iq(std::span<uint8_t> data) -> void {
+    if (m_is_vrl && m_little_endian) {
+        if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")) {
+            swap_iq_avx512(data);
+        } else if (__builtin_cpu_supports("avx2")) {
+            swap_iq_avx2(data);
+        } else {
+            swap_iq_scalar(data);
+        }
+    }
+}
+
+auto overlay::swap_iq_scalar(std::span<uint8_t> data) -> void {
+    for (size_t i = 0; i + 3 < data.size(); i += 4) {
+        std::swap(data[i], data[i + 2]);
+        std::swap(data[i + 1], data[i + 3]);
+    }
+}
+
+[[gnu::target("avx2")]]
+auto overlay::swap_iq_avx2(std::span<uint8_t> data) -> void {
+    const size_t stride = 32;
+    auto shuffle_mask = _mm256_set_epi8(
+        13,12,15,14,9,8,11,10,5,4,7,6,1,0,3,2,
+        13,12,15,14,9,8,11,10,5,4,7,6,1,0,3,2
+    );
+    size_t i = 0;
+    for (; i + stride <= data.size(); i += stride) {
+        auto data_256 = _mm256_loadu_si256(reinterpret_cast<__m256i*>(data.data() + i));
+        data_256 = _mm256_shuffle_epi8(data_256, shuffle_mask);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(data.data() + i), data_256);
+    }
+    for (; i + 3 < data.size(); i += 4) {
+        std::swap(data[i], data[i + 2]);
+        std::swap(data[i + 1], data[i + 3]);
+    }
+}
+
+[[gnu::target("avx512f,avx512bw")]]
+auto overlay::swap_iq_avx512(std::span<uint8_t> data) -> void {
+    const size_t stride = 64;
+    auto shuffle_mask = _mm512_set_epi8(
+        13,12,15,14,9,8,11,10,5,4,7,6,1,0,3,2,
+        13,12,15,14,9,8,11,10,5,4,7,6,1,0,3,2,
+        13,12,15,14,9,8,11,10,5,4,7,6,1,0,3,2,
+        13,12,15,14,9,8,11,10,5,4,7,6,1,0,3,2
+    );
+    size_t i = 0;
+    for (; i + stride <= data.size(); i += stride) {
+        auto data_512 = _mm512_loadu_si512(data.data() + i);
+        data_512 = _mm512_shuffle_epi8(data_512, shuffle_mask);
+        _mm512_storeu_si512(data.data() + i, data_512);
+    }
+    for (; i + 3 < data.size(); i += 4) {
+        std::swap(data[i], data[i + 2]);
+        std::swap(data[i + 1], data[i + 3]);
+    }
 }
 
 } // namespace v49

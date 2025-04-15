@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -69,8 +69,9 @@ namespace v49 {
 
 class overlay {
 public:
-    explicit overlay(std::span<const uint8_t> data);
+    explicit overlay(std::span<uint8_t> data);
 
+    auto is_vrl() const -> bool;
     auto is_data() const -> bool;
     auto is_context() const -> bool;
     auto header() const -> const vrtgen::packing::Header&;
@@ -79,13 +80,20 @@ public:
     auto integer_timestamp() const -> std::optional<uint32_t>;
     auto fractional_timestamp() const -> std::optional<uint64_t>;
     template<typename T>
-    auto payload() const -> std::span<const T>;
+    auto payload() -> std::span<const T>;
+    auto swap_iq(std::span<uint8_t>) -> void;
     auto payload_size() const -> size_t;
     auto payload_start() const -> size_t;
 
 private:
-    std::span<const uint8_t> m_data;
+    auto swap_iq_scalar(std::span<uint8_t>) -> void;
+    auto swap_iq_avx2(std::span<uint8_t>) -> void;
+    auto swap_iq_avx512(std::span<uint8_t>) -> void;
+
+    std::span<uint8_t> m_data;
     std::map<std::string, std::size_t> m_positions;
+    bool m_is_vrl{false};
+    bool m_little_endian{false};
     vrtgen::packing::Header m_header;
     std::optional<uint32_t> m_stream_id;
     std::optional<vrtgen::packing::ClassIdentifier> m_class_id;

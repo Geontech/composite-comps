@@ -25,6 +25,13 @@ include(GNUInstallDirs)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# DPDK
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DPDK REQUIRED libdpdk)
+set(DPDK_ROOT_DIR "/opt/dpdk")
+include_directories(${DPDK_ROOT_DIR}/include)
+link_directories(${DPDK_ROOT_DIR}/lib)
+
 # Set compile flags
 set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
@@ -42,18 +49,21 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(readerwriterqueue)
 
+
 # Library
 add_library(udp_source MODULE
     component.cpp
+    socket/dpdk.cpp
     socket/packet_mmap.cpp
     socket/recvmmsg.cpp
     helpers.cpp
     overlay.cpp
+    pmr/ring_resource.cpp
 )
 # Includes
 target_include_directories(udp_source
     PRIVATE
-    ${vrtgen_INCLUDE_DIR}
+    ${vrtgen_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 # Link
@@ -62,6 +72,7 @@ target_link_libraries(udp_source
     composite::composite
     spdlog::spdlog_header_only
     readerwriterqueue
+    ${DPDK_LIBRARIES}
 )
 # Install
 install(TARGETS udp_source

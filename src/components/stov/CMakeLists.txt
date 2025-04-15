@@ -42,7 +42,6 @@ add_library(stov MODULE
 target_include_directories(stov
     PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../include
-    ${vrtgen_SOURCE_DIR}/include
 )
 # Link
 target_link_libraries(stov

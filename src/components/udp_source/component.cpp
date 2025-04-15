@@ -19,6 +19,7 @@
 
 #include "component.hpp"
 #include "overlay.hpp"
+#include "socket/dpdk.hpp"
 #include "socket/packet_mmap.hpp"
 #include "socket/recvmmsg.hpp"
 
@@ -35,6 +36,8 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
+#include <stdexcept>
+
 udp_source::udp_source() : composite::component("udp_source") {
     add_port(&m_out_port);
     using enum composite::properties::config_type;
@@ -50,7 +53,9 @@ udp_source::udp_source() : composite::component("udp_source") {
         return (m_transport == "sdds") || (m_transport == "vita49");
     });
     add_property("recv_buf_size", &m_recv_buf_size).units("bytes");
+    add_property("num_msgs", &m_num_msgs).configurability(RUNTIME);
     add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
+    add_property("frame_count", &m_frame_count).configurability(RUNTIME);
 }
 
 auto udp_source::property_change_handler() -> void {
@@ -60,18 +65,23 @@ auto udp_source::property_change_handler() -> void {
         m_msg_size = 1080; // fixed length protocol
     }
     auto config = udp::config{
-        .id = id(),
+        .logger = logger(),
         .interface = m_interface,
         .ip_addr = m_ip_addr,
         .port = m_port,
         .recv_buf_size = m_recv_buf_size,
         .batch_size = m_num_msgs,
         .msg_size = m_msg_size,
+        .frame_count = m_frame_count
     };
     if (m_socket_type == PACKET_MMAP) {
         m_receiver = std::make_unique<udp::packet_mmap>(config);
     } else if (m_socket_type == DPDK) {
-        // TODO
+        try {
+            m_receiver = std::make_unique<udp::dpdk_udp>(config);
+        } catch (const std::exception& e) {
+            throw std::runtime_error("Failed to initialize dpdk source");
+        }
     } else { // recvmmsg
         m_receiver = std::make_unique<udp::recvmmsg>(config);
     }
@@ -80,16 +90,22 @@ auto udp_source::property_change_handler() -> void {
 auto udp_source::start() -> void {
     component::start();
     m_receiver->start_recv();
-    m_stat_thread = std::jthread([this](std::stop_token stoken) {
-        while (!stoken.stop_requested()) {
+    m_stat_thread = std::jthread([this](std::stop_token token) {
+        while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
             auto stats = m_receiver->get_stats();
-            logger()->trace(
-                "statistics: pkts_recvd_user={}, pkts_recvd_kernel={}, pkts_dropped_kernel={}",
-                stats.pkts_recvd_user, stats.pkts_recvd_kernel, stats.pkts_dropped_kernel
-            );
+            if (m_socket_type == DPDK) {
+                logger()->trace("Statistics: pkts_recvd_user={}, pkts_rcvd_nic={}, pkts_dropped_nic={}, rx_nombuf={}, cycles_per_packet={}, pkts_per_burst={}, iterations={}, total_nb_rx={}, no_queue={}",
+                                stats.pkts_recvd_user, stats.pkts_recvd_nic, stats.pkts_dropped_nic, stats.rx_nombuf, stats.cycles_per_packet, stats.avg_pkts_per_burst, stats.iterations, stats.total_nb_rx, stats.no_queue);
+            } else {
+                stats.pkts_processed = m_pkts_processed.exchange(0);
+                logger()->trace(
+                    "statistics: pkts_recvd_user={}, pkts_recvd_kernel={}, pkts_dropped_kernel={}",
+                    stats.pkts_recvd_user, stats.pkts_recvd_kernel, stats.pkts_dropped_kernel);
+            }
         }
     });
+    pthread_setname_np(m_stat_thread.native_handle(), "udp_stats");
 }
 
 auto udp_source::stop() -> void {
@@ -113,9 +129,8 @@ auto udp_source::process() -> composite::retval {
         return NORMAL;
     }
 
-    // Extract metadata
-    auto ts = composite::timestamp{};
     // Parse packets based on protocol
+    auto ts = composite::timestamp{};
     if (m_transport == "sdds") {
         auto packet = overlay::sdds::overlay(*data);
         auto seq_num = packet.seq_num();
@@ -153,12 +168,12 @@ auto udp_source::process() -> composite::retval {
             data->resize(packet.payload_size());
         }
     }
+    m_pkts_processed.fetch_add(1, std::memory_order_relaxed);
 
     // Send data
     m_out_port.send_data(std::move(data), ts);
     
-    // Fast return
-    return NO_YIELD;
+    return NORMAL;
 }
 
 extern "C" {

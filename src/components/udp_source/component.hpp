@@ -56,6 +56,7 @@ private:
     std::string m_transport;
     uint32_t m_num_msgs{};
     uint32_t m_msg_size{};
+    uint32_t m_frame_count{32768};
     uint32_t m_recv_buf_size{};
 
     // Members
@@ -63,5 +64,6 @@ private:
     std::jthread m_stat_thread;
     uint16_t m_pkt_count{};
     bool m_new_socket_required{true};
+    std::atomic<uint32_t> m_pkts_processed{};
 
 }; // class udp_source

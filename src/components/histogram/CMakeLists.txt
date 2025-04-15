@@ -17,12 +17,12 @@
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.20)
 project(histogram VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set compile flags
@@ -34,12 +34,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Library
 add_library(histogram MODULE
     component.cpp
-)
-# Includes
-target_include_directories(histogram
-    PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
-    ${vrtgen_SOURCE_DIR}/include
 )
 # Link
 target_link_libraries(histogram

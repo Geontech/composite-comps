@@ -1,0 +1,46 @@
+#pragma once
+
+#include "interface.hpp"
+#include "pmr/aligned_alloc_resource.hpp"
+#include "pmr/ring_resource.hpp"
+#include "processing_queue.hpp"
+
+#include <atomic>
+#include <composite/timestamp.hpp>
+#include <cstdint>
+#include <string_view>
+#include <thread>
+
+namespace udp {
+
+class dpdk_udp : public interface {
+    // using queue_t = moodycamel::ReaderWriterQueue<std::shared_ptr<buffer_t>>;
+    using queue_t = processing_queue<buffer_ptr_t>;
+public:
+    dpdk_udp(const config& config);
+    ~dpdk_udp() final;
+
+    auto start_recv() -> void override;
+    auto stop_recv() -> void override;
+    auto get_data(std::shared_ptr<buffer_t>&) -> bool override;
+    auto get_stats() -> statistics override;
+    
+private:
+    auto receive(std::stop_token token) -> void;
+
+    int m_socket{-1};
+    int m_join_socket{-1};
+    void* m_ring{nullptr};
+    std::jthread m_recv_thread;
+    aligned_alloc_resource m_upstream_alloc;
+    std::pmr::synchronized_pool_resource m_pool_resource;
+    queue_t m_queue;
+    std::atomic<uint32_t> m_pkts_recvd{};
+    std::atomic<uint64_t> m_cycles{};
+    std::atomic<uint32_t> m_iterations{};
+    std::atomic<uint32_t> m_pkts_in_burst{};
+    std::atomic<uint32_t> m_no_queue{};
+
+}; // class dpdk_udp
+
+} //namespace udp

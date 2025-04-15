@@ -51,6 +51,7 @@ public:
         add_property("sample_rate", &m_sample_rate).units("sps").configurability(RUNTIME).change_listener([this]() {
             return m_sample_rate > T{};
         });
+        add_property("power_based_normalization", &m_power_based_normalization).configurability(RUNTIME);
     }
 
     ~psd() override = default;
@@ -62,17 +63,31 @@ public:
         } else if (m_window_type == "HAMMING") {
             m_window = windows::hamming<T>(m_fft_size, false);
         }
-        std::transform(
-            m_window->data(),
-            m_window->data() + m_window->size(),
-            m_window->data(),
-            [](float val) {
-                return val * val;
+        // Calculate window normalization constant
+        auto window_norm_const = T{1};
+        if (m_window) {
+            // Square all values in the window vector
+            std::transform(
+                m_window->data(),
+                m_window->data() + m_window->size(),
+                m_window->data(),
+                [](float val) {
+                    return val * val;
+                }
+            );
+            // Calculate the sum of the squared window
+            auto window_sum = std::accumulate(m_window->data(), m_window->data() + m_window->size(), T{});
+            // Window normalization constant
+            window_norm_const = window_sum;
+            if (m_power_based_normalization) {
+                window_norm_const = window_norm_const / m_window->size();
             }
-        );
+            logger()->trace("using window norm constant of: {}", window_norm_const);
+        }
+        // Calculate normalization constant
+        auto norm_const = T{1} / (m_sample_rate * window_norm_const);
         // Create work class
-        auto window_sum = std::accumulate(m_window->data(), m_window->data() + m_window->size(), T{});
-        m_work = std::make_unique<work<T>>(window_sum, m_sample_rate);
+        m_work = std::make_unique<work<T>>(norm_const);
     }
 
     auto process() -> composite::retval override {
@@ -84,7 +99,7 @@ public:
         // Perform PSD
         auto psd = m_work->process(data.get());
         std::transform(psd->data(), psd->data() + psd->size(), psd->data(), [](T val) {
-            if (val > T{0}) {
+            if (val > T{0}) [[likely]] {
                 if constexpr (std::is_same_v<T, float>) {
                     return std::log2f(val);
                 }
@@ -109,6 +124,7 @@ private:
     std::string m_window_type;
     uint32_t m_fft_size{1024};
     T m_sample_rate{1};
+    bool m_power_based_normalization{true};
 
     // Members
     std::unique_ptr<window_t> m_window;

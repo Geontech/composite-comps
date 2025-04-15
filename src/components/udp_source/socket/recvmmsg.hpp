@@ -1,26 +1,49 @@
+/*
+ * Copyright (C) 2025 Geon Technologies, LLC
+ *
+ * This file is part of composite-comps.
+ *
+ * composite-comps is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * composite-comps is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see http://www.gnu.org/licenses/.
+ */
+
 #pragma once
 
 #include "interface.hpp"
-#include "pmr/aligned_alloc_resource.hpp"
+#include "pmr/ring_resource.hpp"
+#include "processing_queue.hpp"
 
 #include <atomic>
 #include <composite/timestamp.hpp>
 #include <cstdint>
-#include <readerwriterqueue.h>
 #include <string_view>
 #include <thread>
 
 namespace udp {
 
 class recvmmsg : public interface {
-    using queue_t = moodycamel::ReaderWriterQueue<buffer_ptr_t>;
+    using queue_t = processing_queue<buffer_ptr_t>;
 public:
-    recvmmsg(const config& config);
+    explicit recvmmsg(const config& config);
     ~recvmmsg() final;
+    recvmmsg(const recvmmsg&) = delete;
+    recvmmsg(recvmmsg&&) = delete;
+    recvmmsg& operator=(const recvmmsg&) = delete;
+    recvmmsg& operator=(recvmmsg&&) = delete;
 
     auto start_recv() -> void override;
     auto stop_recv() -> void override;
-    auto get_data(buffer_ptr_t&) -> bool override;
+    auto get_data(std::shared_ptr<buffer_t>&) -> bool override;
     auto get_stats() -> statistics override;
 
 private:
@@ -28,11 +51,12 @@ private:
 
     int m_socket{-1};
     std::jthread m_recv_thread;
-    std::unique_ptr<queue_t> m_queue;
+    queue_t m_queue;
+    std::size_t m_frame_size{};
+    ring_resource m_resource;
     std::size_t m_batch_size{128};
-    std::size_t m_msg_size{};
     std::atomic<uint32_t> m_pkts_recvd{};
 
-}; // class packet_mmap
+}; // class recvmmsg
 
 } // namespace udp
