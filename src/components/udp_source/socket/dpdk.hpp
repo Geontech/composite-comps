@@ -14,7 +14,6 @@
 namespace udp {
 
 class dpdk_udp : public interface {
-    // using queue_t = moodycamel::ReaderWriterQueue<std::shared_ptr<buffer_t>>;
     using queue_t = processing_queue<buffer_ptr_t>;
 public:
     dpdk_udp(const config& config);
@@ -35,6 +34,9 @@ private:
     aligned_alloc_resource m_upstream_alloc;
     std::pmr::synchronized_pool_resource m_pool_resource;
     queue_t m_queue;
+    uint32_t m_frame_size{};
+    uint32_t m_frame_count{};
+    ring_resource m_resource;
     std::atomic<uint32_t> m_pkts_recvd{};
     std::atomic<uint64_t> m_cycles{};
     std::atomic<uint32_t> m_iterations{};

@@ -41,15 +41,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-march=x86-64-v2 -mtune=generic)
 
-# Fetch queue library
-FetchContent_Declare(
-    readerwriterqueue
-    GIT_REPOSITORY    https://github.com/cameron314/readerwriterqueue
-    GIT_TAG           master
-)
-FetchContent_MakeAvailable(readerwriterqueue)
-
-
 # Library
 add_library(udp_source MODULE
     component.cpp
@@ -71,7 +62,6 @@ target_link_libraries(udp_source
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
-    readerwriterqueue
     ${DPDK_LIBRARIES}
 )
 # Install

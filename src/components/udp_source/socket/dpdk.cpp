@@ -1,6 +1,7 @@
 #include "helpers.hpp"
 #include "dpdk.hpp"
 #include "overlay.hpp"
+#include "pmr/ring_resource.hpp"
 
 #include <arpa/inet.h>
 #include <array>
@@ -82,10 +83,9 @@ namespace udp {
 
 dpdk_udp::dpdk_udp(const config& config) :
   interface(config.logger),
-    // m_frame_size(std::bit_ceil(config.msg_size)),
-    // m_frame_count(config.frame_count),
-    // m_resource({.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64})
-    {
+  m_frame_size(std::bit_ceil(config.msg_size)),
+  m_frame_count(config.frame_count),
+  m_resource({.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}) {
     const char* pci_env = std::getenv("PCIDEVICE_INTEL_COM_INTEL_SRIOV_VFIO");
     if (!pci_env) {
         throw std::runtime_error("Environment variable PCIDEVICE_INTEL_COM_INTEL_SRIOV_VFIO is not set!");
@@ -413,7 +413,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     uint16_t offset{};
     uint16_t pkt_len{};
     uint16_t payload_len{};
-    // auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
+    auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
 
 
     while (!token.stop_requested()) {
