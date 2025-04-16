@@ -56,14 +56,6 @@ extern "C" {
 #include <rte_lcore.h>
 }
 
-static constexpr uint8_t  NUM_RX_QUEUES = 1; //Need to update receive_loop() if changing
-static constexpr uint8_t NUM_TX_QUEUES = 0;
-static constexpr uint16_t RX_RING_SIZE = 4096; //2048 drops some at startup
-static constexpr uint16_t NUM_MBUFS    = (32768 * NUM_RX_QUEUES);
-static constexpr uint16_t MBUF_CACHE_SIZE = 512; 
-static constexpr uint16_t BURST_SIZE  = 64;
-#define JUMBO_FRAME_SIZE 9000
-
 namespace udp {
 
 dpdk_udp::dpdk_udp(const config& config) :
@@ -71,7 +63,13 @@ dpdk_udp::dpdk_udp(const config& config) :
   m_frame_size(std::bit_ceil(config.msg_size)),
   m_frame_count(config.frame_count),
   m_resource({.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}) {
-    m_config = config;
+    // set defaults if not provided 
+    m_rx_ring_size = config.rx_ring_size.value_or(4096);
+    m_num_mbufs = config.num_mbufs.value_or(32768);
+    m_mbuf_cache_size = config.mbuf_cache_size.value_or(512);
+    m_burst_size  = config.burst_size.value_or(64);
+    m_interface = config.interface;
+    m_ip_addr = config.ip_addr;
 }
 
 dpdk_udp::~dpdk_udp() {
@@ -253,8 +251,8 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     if (m_mbuf_pool == nullptr){
         m_mbuf_pool = rte_pktmbuf_pool_create(
             "MBUF_POOL",
-            NUM_MBUFS,
-            MBUF_CACHE_SIZE,
+            m_num_mbufs,
+            m_mbuf_cache_size,
             0,
             9000,
             rte_socket_id()
@@ -267,10 +265,11 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     if (!m_eth_dev_configured){
         std::memset(&m_port_conf, 0, sizeof(m_port_conf));
         m_port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
-        m_port_conf.rxmode.mtu = JUMBO_FRAME_SIZE;
+        m_port_conf.rxmode.mtu = 9000;
 
     }
-    ret = rte_eth_dev_configure(m_selected_port, NUM_RX_QUEUES, NUM_TX_QUEUES, &m_port_conf);
+    static constexpr uint8_t  NUM_RX_QUEUES = 1;
+    ret = rte_eth_dev_configure(m_selected_port, NUM_RX_QUEUES, 0, &m_port_conf);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "rte_eth_dev_configure: err=%d, port=%u\n", ret, m_selected_port);
     }
@@ -278,7 +277,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
     // Setup RX queue
     for (uint16_t q = 0; q < NUM_RX_QUEUES; q++){
-        ret = rte_eth_rx_queue_setup(m_selected_port, q, RX_RING_SIZE, 
+        ret = rte_eth_rx_queue_setup(m_selected_port, q, m_rx_ring_size, 
                                     rte_socket_id(), nullptr, m_mbuf_pool);
         if (ret < 0) {
             rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup: err=%d, port=%u\n", ret, m_selected_port);
@@ -294,7 +293,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
     // START ENABLE MULTICAST FILTER
     in_addr ipv4_addr{};
-    auto ip_addr = m_config.ip_addr;
+    auto ip_addr = m_ip_addr;
     if (inet_pton(AF_INET, std::string(ip_addr).c_str(), &ipv4_addr) != 1) {
         m_logger->error("Not a valid IP");
 
@@ -343,10 +342,10 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     ip_mreqn mreq{};
     mreq.imr_multiaddr.s_addr = inet_addr(std::string(ip_addr).c_str());
     mreq.imr_address.s_addr = INADDR_ANY;
-    mreq.imr_ifindex = if_nametoindex(m_config.interface.c_str());
+    mreq.imr_ifindex = if_nametoindex(m_interface.c_str());
     if (mreq.imr_ifindex == 0) {
         ::close(m_socket);
-        throw std::runtime_error(std::format("failed to get ifindex for interface {}: {}", m_config.interface, std::string{strerror(errno)}));
+        throw std::runtime_error(std::format("failed to get ifindex for interface {}: {}", m_interface, std::string{strerror(errno)}));
     }
 
     if (setsockopt(m_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
@@ -354,11 +353,11 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
         throw std::runtime_error(std::format("failed to join multicast group: {}", std::string{strerror(errno)}));
     }
 
-    m_logger->trace("Joined multicast group {} on interface {}", ip_addr, m_config.interface);
+    m_logger->trace("Joined multicast group {} on interface {}", ip_addr, m_interface);
 
     uint8_t queue_id = 0;
-    rte_mbuf* pkts[BURST_SIZE];
-    rte_mbuf* valid_pkts[BURST_SIZE];
+    rte_mbuf* pkts[m_burst_size];
+    rte_mbuf* valid_pkts[m_burst_size];
     uint16_t nb_rx{};
     uint16_t offset{};
     uint16_t pkt_len{};
@@ -368,7 +367,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
     while (!token.stop_requested()) {
         uint64_t tsc_start = rte_get_tsc_cycles();
-        nb_rx = rte_eth_rx_burst(m_selected_port, queue_id, pkts, BURST_SIZE);
+        nb_rx = rte_eth_rx_burst(m_selected_port, queue_id, pkts, m_burst_size);
         if (nb_rx > 0){
             for (uint16_t i = 0; i < nb_rx; i++) {
                 m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);

@@ -45,7 +45,13 @@ private:
     struct rte_mempool* m_mbuf_pool;
     struct rte_eth_conf m_port_conf;
     uint16_t m_selected_port;
-    struct udp::config m_config;
+    // struct udp::config m_config;
+    std::string m_interface;
+    std::string m_ip_addr;
+    size_t m_rx_ring_size{};
+    size_t m_num_mbufs{};
+    size_t m_mbuf_cache_size{};
+    size_t m_burst_size{};
 
 }; // class dpdk_udp
 
