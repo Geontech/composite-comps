@@ -1,7 +1,6 @@
 #pragma once
 
 #include "interface.hpp"
-#include "pmr/aligned_alloc_resource.hpp"
 #include "pmr/ring_resource.hpp"
 #include "processing_queue.hpp"
 
@@ -10,6 +9,7 @@
 #include <cstdint>
 #include <string_view>
 #include <thread>
+#include <rte_ethdev.h>
 
 namespace udp {
 
@@ -31,8 +31,6 @@ private:
     int m_join_socket{-1};
     void* m_ring{nullptr};
     std::jthread m_recv_thread;
-    aligned_alloc_resource m_upstream_alloc;
-    std::pmr::synchronized_pool_resource m_pool_resource;
     queue_t m_queue;
     uint32_t m_frame_size{};
     uint32_t m_frame_count{};
@@ -42,6 +40,12 @@ private:
     std::atomic<uint32_t> m_iterations{};
     std::atomic<uint32_t> m_pkts_in_burst{};
     std::atomic<uint32_t> m_no_queue{};
+    struct rte_eth_stats m_dpdk_stats;
+    bool m_eth_dev_configured{false};
+    struct rte_mempool* m_mbuf_pool;
+    struct rte_eth_conf m_port_conf;
+    uint16_t m_selected_port;
+    struct udp::config m_config;
 
 }; // class dpdk_udp
 

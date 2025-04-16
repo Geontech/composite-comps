@@ -35,7 +35,6 @@
 #include <spdlog/spdlog.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
-
 #include <stdexcept>
 
 udp_source::udp_source() : composite::component("udp_source") {
@@ -164,7 +163,8 @@ auto udp_source::process() -> composite::retval {
             if (auto frac_ts = packet.fractional_timestamp()) {
                 ts.picoseconds = frac_ts.value();
             }
-            data->erase(data->begin(), data->begin() + packet.payload_start()); // move metadata off
+            // data->erase(data->begin(), data->begin() + packet.payload_start()); // move metadata off
+            std::copy(data->begin() + packet.payload_start(), data->end(), data->begin());
             data->resize(packet.payload_size());
         }
     }

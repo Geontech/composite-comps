@@ -20,11 +20,18 @@ RUN set -ex; \
     microdnf install -y libatomic; \
     microdnf install -y openssl-devel;
 
-FROM rockylinux:9 AS dpdk-build
+FROM build as dpdk-build
+# FROM rockylinux:9 AS dpdk-build
+
+RUN microdnf install -y dnf && \
+    dnf install -y 'dnf-command(config-manager)' && \
+    dnf config-manager --set-enabled crb && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf
+
 RUN dnf install -y dnf-plugins-core
 RUN dnf config-manager --set-enabled crb 
 RUN dnf update -y && dnf install -y  --allowerasing \ 
-    git \
     meson \
     ninja-build \
     clang \
@@ -35,7 +42,6 @@ RUN dnf update -y && dnf install -y  --allowerasing \
     python3-pip \
     wget \
     curl \
-    numactl-devel \
     cmake3 
 
 RUN git clone --branch v25.03 https://github.com/DPDK/dpdk.git /dpdk
@@ -74,7 +80,7 @@ RUN set -ex; \
 
 FROM base
 
-RUN microdnf install -y libstdc++ vim fftw numactl-devel libatomic numactl
+RUN microdnf install -y libstdc++ vim fftw libatomic numactl
 
 COPY --link --from=project /opt/usr/local /usr/local
 COPY --link --from=project /opt/usr/local/bin/composite-cli /usr/local/bin/composite-cli-priv
@@ -93,6 +99,5 @@ ENV LD_LIBRARY_PATH="/opt/dpdk/lib:$LD_LIBRARY_PATH"
 
 # USER composite-dev
 WORKDIR /home/composite-dev
-COPY --chown=composite-dev:composite-dev configs/* /home/composite-dev
 
 CMD /usr/local/bin/composite-cli ${BIN_ARGS}

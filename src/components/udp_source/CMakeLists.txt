@@ -25,13 +25,6 @@ include(GNUInstallDirs)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# DPDK
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(DPDK REQUIRED libdpdk)
-set(DPDK_ROOT_DIR "/opt/dpdk")
-include_directories(${DPDK_ROOT_DIR}/include)
-link_directories(${DPDK_ROOT_DIR}/lib)
-
 # Set compile flags
 set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
@@ -40,6 +33,10 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-march=x86-64-v2 -mtune=generic)
+
+# DPDK
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DPDK REQUIRED libdpdk)
 
 # Library
 add_library(udp_source MODULE
@@ -56,7 +53,10 @@ target_include_directories(udp_source
     PRIVATE
     ${vrtgen_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${DPDK_INCLUDE_DIRS}
 )
+target_link_directories(udp_source PRIVATE ${DPDK_LIBRARY_DIRS})
+target_compile_options(udp_source PRIVATE ${DPDK_CFLAGS_OTHER})
 # Link
 target_link_libraries(udp_source
     PRIVATE
