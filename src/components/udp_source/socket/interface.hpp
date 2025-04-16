@@ -97,6 +97,11 @@ struct config {
      */
     std::optional<std::size_t> burst_size{};
 
+    /**
+     * @brief How much memory dpdk will allocate on the socket. --socket-mem=
+     */
+    std::optional<std::string> socket_mem{};
+
 }; // struct config
 
 /**

@@ -68,6 +68,7 @@ dpdk_udp::dpdk_udp(const config& config) :
     m_num_mbufs = config.num_mbufs.value_or(32768);
     m_mbuf_cache_size = config.mbuf_cache_size.value_or(512);
     m_burst_size  = config.burst_size.value_or(64);
+    m_socket_mem = config.socket_mem.value_or("4096");
     m_interface = config.interface;
     m_ip_addr = config.ip_addr;
 }
@@ -182,7 +183,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     std::ostringstream socket_mem;
     for (int i = 0; i <= max_node; ++i) {
         if (i == dev_numa) {
-            socket_mem << "4096";
+            socket_mem << m_socket_mem;
         } else {
             socket_mem << "0";
         }

@@ -52,6 +52,7 @@ private:
     size_t m_num_mbufs{};
     size_t m_mbuf_cache_size{};
     size_t m_burst_size{};
+    std::string m_socket_mem{};
 
 }; // class dpdk_udp
 
