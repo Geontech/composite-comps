@@ -71,7 +71,12 @@ auto udp_source::property_change_handler() -> void {
         .recv_buf_size = m_recv_buf_size,
         .batch_size = m_num_msgs,
         .msg_size = m_msg_size,
-        .frame_count = m_frame_count
+        .frame_count = m_frame_count,
+        .rx_ring_size = m_rx_ring_size,
+        .num_mbufs = m_num_mbufs,
+        .mbuf_cache_size = m_mbuf_cache_size,
+        .burst_size = m_burst_size,
+        .socket_mem = m_socket_mem,
     };
     if (m_socket_type == PACKET_MMAP) {
         m_receiver = std::make_unique<udp::packet_mmap>(config);
