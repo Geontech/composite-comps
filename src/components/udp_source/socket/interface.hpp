@@ -80,27 +80,27 @@ struct config {
     /**
      * @brief Size of the RX ring (receive queue) for a given port.
      */
-    std::optional<std::size_t> rx_ring_size{};
+    uint16_t rx_ring_size{};
 
     /**
      * @brief Total number of memory buffers (mbufs) to allocate in the mempool.
      */
-    std::optional<std::size_t> num_mbufs{};
+    uint32_t num_mbufs{};
 
     /**
      * @brief Size of the per-core object cache in the mempool.
      */
-    std::optional<std::size_t> mbuf_cache_size{};
+    uint16_t mbuf_cache_size{};
 
     /**
      * @brief Number of packets to retrieve or send in a single burst.
      */
-    std::optional<std::size_t> burst_size{};
+    uint32_t burst_size{};
 
     /**
      * @brief How much memory dpdk will allocate on the socket. --socket-mem=
      */
-    std::optional<std::string> socket_mem{};
+    std::string socket_mem{};
 
 }; // struct config
 

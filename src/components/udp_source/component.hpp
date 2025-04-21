@@ -58,6 +58,12 @@ private:
     uint32_t m_msg_size{};
     uint32_t m_frame_count{32768};
     uint32_t m_recv_buf_size{};
+    uint16_t m_rx_ring_size{4096};
+    uint32_t m_num_mbufs{32768};
+    uint16_t m_mbuf_cache_size{512};
+    uint32_t m_burst_size{64};
+    std::string m_socket_mem{"4096"};
+    
 
     // Members
     std::unique_ptr<udp::interface> m_receiver;
