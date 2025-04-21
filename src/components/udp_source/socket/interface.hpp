@@ -86,20 +86,24 @@ struct config {
      * @brief Total number of memory buffers (mbufs) to allocate in the mempool.
      */
     uint32_t num_mbufs{};
+    uint32_t num_mbufs{};
 
     /**
      * @brief Size of the per-core object cache in the mempool.
      */
+    uint16_t mbuf_cache_size{};
     uint16_t mbuf_cache_size{};
 
     /**
      * @brief Number of packets to retrieve or send in a single burst.
      */
     uint32_t burst_size{};
+    uint32_t burst_size{};
 
     /**
      * @brief How much memory dpdk will allocate on the socket. --socket-mem=
      */
+    std::string socket_mem{};
     std::string socket_mem{};
 
 }; // struct config

@@ -69,8 +69,16 @@ dpdk_udp::dpdk_udp(const config& config) :
     m_mbuf_cache_size = config.mbuf_cache_size;
     m_burst_size  = config.burst_size;
     m_socket_mem = config.socket_mem;
+    m_rx_ring_size = config.rx_ring_size;
+    m_num_mbufs = config.num_mbufs;
+    m_mbuf_cache_size = config.mbuf_cache_size;
+    m_burst_size  = config.burst_size;
+    m_socket_mem = config.socket_mem;
     m_interface = config.interface;
     m_ip_addr = config.ip_addr;
+
+    m_logger->trace("m_rx_ring_size={}, m_num_mbufs={}, m_mbuf_cache_size={}, m_burst_size={}, m_socket_mem={}",
+                    m_rx_ring_size, m_num_mbufs, m_mbuf_cache_size, m_burst_size, m_socket_mem);
 
     m_logger->trace("m_rx_ring_size={}, m_num_mbufs={}, m_mbuf_cache_size={}, m_burst_size={}, m_socket_mem={}",
                     m_rx_ring_size, m_num_mbufs, m_mbuf_cache_size, m_burst_size, m_socket_mem);
@@ -247,6 +255,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     if (numa_node == -1) {
         rte_eal_cleanup();
         m_logger->error("Failed to determine NUMA node for NICs!");
+        m_logger->error("Failed to determine NUMA node for NICs!");
         rte_exit(EXIT_FAILURE, "Failed to determine NUMA node for NICs!\n");
     }
 
@@ -266,9 +275,11 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
         );
         if (m_mbuf_pool == nullptr) {
             m_logger->error("Cannot create mbuf pool: {}", rte_strerror(rte_errno));
+            m_logger->error("Cannot create mbuf pool: {}", rte_strerror(rte_errno));
             rte_exit(EXIT_FAILURE, "Cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
         }
     }
+    m_logger->trace("Memory pool configured");
     m_logger->trace("Memory pool configured");
     // Configure device
     if (!m_eth_dev_configured){
@@ -277,6 +288,9 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
         m_port_conf.rxmode.mtu = 9000;
 
     }
+    m_logger->trace("Device configured");
+    m_port_conf.intr_conf.rxq = 0;
+
     m_logger->trace("Device configured");
     m_port_conf.intr_conf.rxq = 0;
 
@@ -364,6 +378,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     // Start the port
     ret = rte_eth_dev_start(m_selected_port);
     if (ret < 0) {
+        m_logger->error("rte_eth_dev_start: err={}, port={}", ret, m_selected_port);
         m_logger->error("rte_eth_dev_start: err={}, port={}", ret, m_selected_port);
         rte_exit(EXIT_FAILURE, "rte_eth_dev_start: err=%d, port=%u\n", ret, m_selected_port);
     }
