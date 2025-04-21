@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <memory>
+#include <numbers>
 
 namespace windows {
 
@@ -45,9 +46,9 @@ auto blackman_harris(const std::size_t length, bool complex=true) {
     for (auto n=0; n<length; ++n) {
         const auto tn = static_cast<T>(n);
         auto val = a0
-            - a1*cos(2. * M_PI * tn / N)
-            + a2*cos(4. * M_PI * tn / N)
-            - a3*cos(6. * M_PI * tn / N);
+            - a1*cos(2. * std::numbers::pi * tn / N)
+            + a2*cos(4. * std::numbers::pi * tn / N)
+            - a3*cos(6. * std::numbers::pi * tn / N);
         if (complex) {
             window->at(n * 2) = val;
             window->at(n * 2 + 1) = val;
@@ -72,7 +73,7 @@ auto hamming(const std::size_t length, bool complex=true) {
     const T N = length - 1;
     for (auto n=0; n<length; ++n) {
         const auto tn = static_cast<T>(n);
-        auto val = a0 - a1*cos(2. * M_PI * tn / N);
+        auto val = a0 - a1*cos(2. * std::numbers::pi * tn / N);
         if (complex) {
             window->at(n * 2) = val;
             window->at(n * 2 + 1) = val;
