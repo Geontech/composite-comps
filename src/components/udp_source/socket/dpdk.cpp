@@ -64,13 +64,16 @@ dpdk_udp::dpdk_udp(const config& config) :
   m_frame_count(config.frame_count),
   m_resource({.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}) {
     // set defaults if not provided 
-    m_rx_ring_size = config.rx_ring_size.value_or(4096);
-    m_num_mbufs = config.num_mbufs.value_or(32768);
-    m_mbuf_cache_size = config.mbuf_cache_size.value_or(512);
-    m_burst_size  = config.burst_size.value_or(64);
-    m_socket_mem = config.socket_mem.value_or("4096");
+    m_rx_ring_size = config.rx_ring_size;
+    m_num_mbufs = config.num_mbufs;
+    m_mbuf_cache_size = config.mbuf_cache_size;
+    m_burst_size  = config.burst_size;
+    m_socket_mem = config.socket_mem;
     m_interface = config.interface;
     m_ip_addr = config.ip_addr;
+
+    m_logger->trace("m_rx_ring_size={}, m_num_mbufs={}, m_mbuf_cache_size={}, m_burst_size={}, m_socket_mem={}",
+                    m_rx_ring_size, m_num_mbufs, m_mbuf_cache_size, m_burst_size, m_socket_mem);
 }
 
 dpdk_udp::~dpdk_udp() {
@@ -105,6 +108,7 @@ auto dpdk_udp::stop_recv() -> void {
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();
     }
+    
     m_queue.clear();
 }
 
@@ -133,6 +137,8 @@ auto dpdk_udp::get_stats() -> statistics {
         stats.avg_pkts_per_burst = stats.total_nb_rx/stats.iterations;
     }
     stats.no_queue = m_no_queue.exchange(0);
+    uint32_t free_count = rte_mempool_avail_count(m_mbuf_pool);
+    m_logger->trace("MBUF_POOL free mbufs: {}", free_count);
 
     rte_eth_stats_reset(m_selected_port);
 
@@ -141,6 +147,7 @@ auto dpdk_udp::get_stats() -> statistics {
 
 auto dpdk_udp::receive(std::stop_token token) -> void {
     const char* pci_env = std::getenv("PCIDEVICE_INTEL_COM_INTEL_SRIOV_VFIO");
+    const char* hostname = std::getenv("HOSTNAME");
     if (!pci_env) {
         throw std::runtime_error("Environment variable PCIDEVICE_INTEL_COM_INTEL_SRIOV_VFIO is not set!");
     }
@@ -191,12 +198,13 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     }
 
     std::string socket_mem_arg = "--socket-mem=" + socket_mem.str();
-    
+    std::string file_prefix_arg = "--file-prefix=" + std::string(hostname);
     uint16_t nb_ports;
     // Init EAL
     std::vector<std::string> arg_strings = {
         "udp_dpdk_src",
         socket_mem_arg,
+        file_prefix_arg,
         "--huge-dir=/mnt/huge_1GB/",
         "--legacy-mem",
         "--log-level=1"
@@ -241,27 +249,64 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
     if (numa_node == -1) {
         rte_eal_cleanup();
+        m_logger->error("Failed to determine NUMA node for NICs!");
         rte_exit(EXIT_FAILURE, "Failed to determine NUMA node for NICs!\n");
     }
 
     m_logger->trace("Selected Port: {} on NUMA node: {}", m_selected_port, numa_node);
+    bool port_valid = rte_eth_dev_is_valid_port(m_selected_port);
+    m_logger->trace("Port {} is valid: {}", m_selected_port, port_valid);
+    if (!port_valid) {
+        m_logger->error("Selected port {} is not valid!", m_selected_port);
+        std::abort();
+    }
 
     // END DETECT DPDK CONFIG
 
     // Create mempool
-    if (m_mbuf_pool == nullptr){
-        m_mbuf_pool = rte_pktmbuf_pool_create(
-            "MBUF_POOL",
-            m_num_mbufs,
-            m_mbuf_cache_size,
-            0,
-            9000,
-            rte_socket_id()
+    // Unique mempool name
+    std::string full_hostname(hostname);
+
+    std::string suffix = full_hostname.length() > 10
+        ? full_hostname.substr(full_hostname.length() - 10)
+        : full_hostname;
+
+    std::string pool_name = "MBUF_" + suffix;
+
+    if (pool_name.length() >= 31)
+        pool_name = pool_name.substr(0, 30);
+    m_logger->info("Creating mbuf pool: name=\"{}\" (len={}), num_mbufs={}, cache={}, priv=0, data_room=9000, socket={}",
+        pool_name,
+        pool_name.length(),
+        m_num_mbufs,
+        m_mbuf_cache_size,
+        rte_socket_id()
+    );
+
+    rte_errno = 0;
+    struct rte_mempool* new_pool = rte_pktmbuf_pool_create(
+        pool_name.c_str(),
+        m_num_mbufs,
+        m_mbuf_cache_size,
+        0,
+        9000,
+        rte_socket_id()
+    );
+
+    int saved_errno = rte_errno;
+
+    if (new_pool == nullptr) {
+        m_logger->error(
+            "rte_pktmbuf_pool_create() returned NULL, rte_errno={} ({})",
+            saved_errno,
+            rte_strerror(saved_errno)
         );
-        if (m_mbuf_pool == nullptr) {
-            rte_exit(EXIT_FAILURE, "Cannot create mbuf pool: %s\n", rte_strerror(rte_errno));
-        }
+        rte_exit(EXIT_FAILURE, "Cannot create mbuf pool: %s\n", rte_strerror(saved_errno));
     }
+
+    m_mbuf_pool = new_pool;
+
+    m_logger->trace("Memory pool configured");
     // Configure device
     if (!m_eth_dev_configured){
         std::memset(&m_port_conf, 0, sizeof(m_port_conf));
@@ -269,25 +314,88 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
         m_port_conf.rxmode.mtu = 9000;
 
     }
+    m_logger->trace("Device configured");
+    m_port_conf.intr_conf.rxq = 0;
+
     static constexpr uint8_t  NUM_RX_QUEUES = 1;
     ret = rte_eth_dev_configure(m_selected_port, NUM_RX_QUEUES, 0, &m_port_conf);
     if (ret < 0) {
+        m_logger->error("rte_eth_dev_configure: err={}, port={}", rte_strerror(rte_errno), m_selected_port);
         rte_exit(EXIT_FAILURE, "rte_eth_dev_configure: err=%d, port=%u\n", ret, m_selected_port);
     }
     m_eth_dev_configured = true;
+    m_logger->trace("Device configured");
+    m_logger->trace("m_selected_port={}, m_rx_ring_size={}, rte_socket_id={}",
+                    m_selected_port, m_rx_ring_size, rte_socket_id());
 
-    // Setup RX queue
-    for (uint16_t q = 0; q < NUM_RX_QUEUES; q++){
-        ret = rte_eth_rx_queue_setup(m_selected_port, q, m_rx_ring_size, 
-                                    rte_socket_id(), nullptr, m_mbuf_pool);
-        if (ret < 0) {
-            rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup: err=%d, port=%u\n", ret, m_selected_port);
-        }
+
+    rte_eth_dev_info dev_info;
+    rte_eth_dev_info_get(m_selected_port, &dev_info);
+
+    if (1 >= dev_info.max_rx_queues) {
+        m_logger->error("Queue index {} exceeds max_rx_queues {}", 1, dev_info.max_rx_queues);
+        std::abort();
     }
+
+    if (m_rx_ring_size % dev_info.rx_desc_lim.nb_align != 0) {
+        m_logger->error("RX ring size {} is not aligned to {}", m_rx_ring_size, dev_info.rx_desc_lim.nb_align);
+        std::abort();
+    }
+
+    if (m_rx_ring_size < dev_info.rx_desc_lim.nb_min || m_rx_ring_size > dev_info.rx_desc_lim.nb_max) {
+        m_logger->error("RX ring size {} is out of valid range [{} - {}]",
+                        m_rx_ring_size, dev_info.rx_desc_lim.nb_min, dev_info.rx_desc_lim.nb_max);
+        std::abort();
+    }
+
+    if (m_mbuf_pool == nullptr) {
+        m_logger->error("m_mbuf_pool is null before queue setup");
+        std::abort();
+    }
+
+    uint32_t avail_mbufs = rte_mempool_avail_count(m_mbuf_pool);
+    if (avail_mbufs == 0) {
+        m_logger->error("mbuf pool has no available buffers");
+        std::abort();
+    }
+
+    m_logger->trace("Mbuf pool name={}, size={}, available={}",
+                    m_mbuf_pool->name,
+                    m_mbuf_pool->size,
+                    avail_mbufs);
+
+
+
+    // Setup RX queue with retry on ENOSPC and ENOENT
+    for (uint16_t q = 0; q < NUM_RX_QUEUES; q++) {
+        constexpr int max_attempts = 3;
+        int attempt = 0;
+        do {
+            ret = rte_eth_rx_queue_setup(m_selected_port, q, m_rx_ring_size,
+                                        rte_socket_id(), nullptr, m_mbuf_pool);
+            if (ret == 0) break;
+
+            if ((rte_errno == ENOSPC || rte_errno == ENOENT) && attempt < max_attempts - 1) {
+                m_logger->warn("rte_eth_rx_queue_setup: transient failure (errno={}, msg={}), retrying {}/{}",
+                            rte_errno, rte_strerror(rte_errno), attempt + 1, max_attempts);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            } else {
+                m_logger->error("rte_eth_rx_queue_setup: ret={}, errno={}, msg={}, port={}",
+                                ret, rte_errno, rte_strerror(rte_errno), m_selected_port);
+                rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup: err=%d, port=%u\n", ret, m_selected_port);
+            }
+
+            ++attempt;
+        } while (attempt < max_attempts);
+    }
+    m_logger->trace("Queue configured");
+
+
 
     // Start the port
     ret = rte_eth_dev_start(m_selected_port);
     if (ret < 0) {
+        m_logger->error("rte_eth_dev_start: err={}, port={}", ret, m_selected_port);
         rte_exit(EXIT_FAILURE, "rte_eth_dev_start: err=%d, port=%u\n", ret, m_selected_port);
     }
     m_logger->trace("Port {} started", m_selected_port);
@@ -358,17 +466,17 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
     uint8_t queue_id = 0;
     rte_mbuf* pkts[m_burst_size];
-    rte_mbuf* valid_pkts[m_burst_size];
     uint16_t nb_rx{};
     uint16_t offset{};
     uint16_t pkt_len{};
     uint16_t payload_len{};
     auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
-
+    static float avg_fill = m_burst_size;
 
     while (!token.stop_requested()) {
         uint64_t tsc_start = rte_get_tsc_cycles();
         nb_rx = rte_eth_rx_burst(m_selected_port, queue_id, pkts, m_burst_size);
+        avg_fill = 0.9 * avg_fill + 0.1 * nb_rx;
         if (nb_rx > 0){
             for (uint16_t i = 0; i < nb_rx; i++) {
                 m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
@@ -417,7 +525,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
                 auto payload = pkt_data + offset;
                 auto vec = std::make_unique<buffer_t>(allocator);
                 vec->resize(payload_len);
-                std::memcpy(vec->data(), payload, payload_len);
+                rte_memcpy(vec->data(), payload, payload_len);
 
                 m_queue.push(std::move(vec));
             }
@@ -428,8 +536,8 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
             m_iterations.fetch_add(1, std::memory_order_relaxed);
         } 
         else {
-            struct timespec ts{.tv_sec=0, .tv_nsec=1};
-            nanosleep(&ts, nullptr);
+            int sleep_us = std::min(100 + (int)((1.0 - (avg_fill / m_burst_size)) * 400), 500);
+            rte_delay_us_block(sleep_us);
         }
     }
 }

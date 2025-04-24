@@ -55,6 +55,11 @@ udp_source::udp_source() : composite::component("udp_source") {
     add_property("num_msgs", &m_num_msgs).configurability(RUNTIME);
     add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
     add_property("frame_count", &m_frame_count).configurability(RUNTIME);
+    add_property("socket_mem", &m_socket_mem).configurability(RUNTIME);
+    add_property("rx_ring_size", &m_rx_ring_size).configurability(RUNTIME);
+    add_property("num_mbufs", &m_num_mbufs).configurability(RUNTIME);
+    add_property("mbuf_cache_size", &m_mbuf_cache_size).configurability(RUNTIME);
+    add_property("burst_size", &m_burst_size).configurability(RUNTIME);
 }
 
 auto udp_source::property_change_handler() -> void {
@@ -71,7 +76,12 @@ auto udp_source::property_change_handler() -> void {
         .recv_buf_size = m_recv_buf_size,
         .batch_size = m_num_msgs,
         .msg_size = m_msg_size,
-        .frame_count = m_frame_count
+        .frame_count = m_frame_count,
+        .rx_ring_size = m_rx_ring_size,
+        .num_mbufs = m_num_mbufs,
+        .mbuf_cache_size = m_mbuf_cache_size,
+        .burst_size = m_burst_size,
+        .socket_mem = m_socket_mem,
     };
     if (m_socket_type == PACKET_MMAP) {
         m_receiver = std::make_unique<udp::packet_mmap>(config);
