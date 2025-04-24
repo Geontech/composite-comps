@@ -101,6 +101,7 @@ auto udp_source::start() -> void {
     m_receiver->start_recv();
     m_stat_thread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
+            
             std::this_thread::sleep_for(std::chrono::seconds(5));
             auto stats = m_receiver->get_stats();
             if (m_socket_type == DPDK) {

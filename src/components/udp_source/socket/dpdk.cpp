@@ -225,6 +225,8 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
             throw std::runtime_error("Failed to initialize dpdk.cpp");
         }
     }
+    rte_delay_us_sleep(500000);
+
 
     // Get available DPDK ports
     nb_ports = rte_eth_dev_count_avail();
@@ -321,6 +323,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     ret = rte_eth_dev_configure(m_selected_port, NUM_RX_QUEUES, 0, &m_port_conf);
     if (ret < 0) {
         m_logger->error("rte_eth_dev_configure: err={}, port={}", rte_strerror(rte_errno), m_selected_port);
+        m_logger->error("rte_eth_dev_configure: err={}, port={}", rte_strerror(rte_errno), m_selected_port);
         rte_exit(EXIT_FAILURE, "rte_eth_dev_configure: err=%d, port=%u\n", ret, m_selected_port);
     }
     m_eth_dev_configured = true;
@@ -387,7 +390,31 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
             ++attempt;
         } while (attempt < max_attempts);
+    // Setup RX queue with retry on ENOSPC and ENOENT
+    for (uint16_t q = 0; q < NUM_RX_QUEUES; q++) {
+        constexpr int max_attempts = 3;
+        int attempt = 0;
+        do {
+            ret = rte_eth_rx_queue_setup(m_selected_port, q, m_rx_ring_size,
+                                        rte_socket_id(), nullptr, m_mbuf_pool);
+            if (ret == 0) break;
+
+            if ((rte_errno == ENOSPC || rte_errno == ENOENT) && attempt < max_attempts - 1) {
+                m_logger->warn("rte_eth_rx_queue_setup: transient failure (errno={}, msg={}), retrying {}/{}",
+                            rte_errno, rte_strerror(rte_errno), attempt + 1, max_attempts);
+                std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+            } else {
+                m_logger->error("rte_eth_rx_queue_setup: ret={}, errno={}, msg={}, port={}",
+                                ret, rte_errno, rte_strerror(rte_errno), m_selected_port);
+                rte_exit(EXIT_FAILURE, "rte_eth_rx_queue_setup: err=%d, port=%u\n", ret, m_selected_port);
+            }
+
+            ++attempt;
+        } while (attempt < max_attempts);
     }
+    m_logger->trace("Queue configured");
+
+
     m_logger->trace("Queue configured");
 
 
