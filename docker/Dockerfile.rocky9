@@ -47,7 +47,7 @@ RUN dnf update -y && dnf install -y  --allowerasing \
 RUN git clone --branch v25.03 https://github.com/DPDK/dpdk.git /dpdk
 WORKDIR /dpdk
 RUN pip3 install pyelftools
-RUN meson setup build --prefix=/opt/dpdk --libdir=lib -Dlibnuma=disabled -Duse_hpet=false -DRTE_LIBRTE_MEMPOOL_STATS=1
+RUN meson setup build --prefix=/opt/dpdk --libdir=lib -Duse_hpet=false
 RUN ninja -C build
 RUN ninja -C build install
 
