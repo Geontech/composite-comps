@@ -81,7 +81,6 @@ struct config {
      * @brief Size of the RX ring (receive queue) for a given port.
      */
     uint16_t rx_ring_size{};
-    uint16_t rx_ring_size{};
 
     /**
      * @brief Total number of memory buffers (mbufs) to allocate in the mempool.

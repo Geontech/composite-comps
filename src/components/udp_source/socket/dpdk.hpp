@@ -1,3 +1,22 @@
+/*
+ * Copyright (C) 2025 Geon Technologies, LLC
+ *
+ * This file is part of composite-comps.
+ *
+ * composite-comps is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU Lesser General Public License as published by the
+ * Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * composite-comps is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public
+ * License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with this program.  If not, see http://www.gnu.org/licenses/.
+ */
+
 #pragma once
 
 #include "interface.hpp"
@@ -7,9 +26,9 @@
 #include <atomic>
 #include <composite/timestamp.hpp>
 #include <cstdint>
+#include <rte_ethdev.h>
 #include <string_view>
 #include <thread>
-#include <rte_ethdev.h>
 
 namespace udp {
 
@@ -27,9 +46,7 @@ public:
 private:
     auto receive(std::stop_token token) -> void;
 
-    int m_socket{-1};
     int m_join_socket{-1};
-    void* m_ring{nullptr};
     std::jthread m_recv_thread;
     queue_t m_queue;
     uint32_t m_frame_size{};
@@ -42,7 +59,7 @@ private:
     std::atomic<uint32_t> m_no_queue{};
     struct rte_eth_stats m_dpdk_stats;
     bool m_eth_dev_configured{false};
-    struct rte_mempool* m_mbuf_pool;
+    struct rte_mempool* m_mbuf_pool = nullptr;
     struct rte_eth_conf m_port_conf;
     uint16_t m_selected_port;
     std::string m_interface;

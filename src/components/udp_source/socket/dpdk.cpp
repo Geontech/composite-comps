@@ -3,46 +3,8 @@
 #include "overlay.hpp"
 #include "pmr/ring_resource.hpp"
 
-#include <arpa/inet.h>
-#include <array>
-#include <cstring>
-#include <fcntl.h>
-#include <linux/if_ether.h>
-#include <netinet/in.h>
-#include <net/if.h>
-#include <mutex>
-#include <poll.h>
-#include <queue>
-#include <ranges>
-#include <source_location>
-#include <string>
-#include <string_view>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <thread>
-#include <unistd.h>
-
-#include <stdexcept>
-
 #include <filesystem>
 #include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <cstdlib>
-
-
-#include <iostream>
-#include <cstdint>
-#include <signal.h>
-#include <atomic>
-#include <csignal>
-#include <pthread.h>
-#include <vector>
-#include <complex>
-#include <future>
-#include <sys/time.h>
-
-extern "C" {
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -54,7 +16,7 @@ extern "C" {
 #include <rte_malloc.h>
 #include <rte_thread.h>
 #include <rte_lcore.h>
-}
+#include <stdexcept>
 
 namespace udp {
 
@@ -84,9 +46,6 @@ dpdk_udp::~dpdk_udp() {
     m_queue.clear();
     if (m_join_socket != -1) {
         ::close(m_join_socket); 
-    }
-    if (m_socket != -1) {
-        ::close(m_socket); 
     }
     m_logger->trace("Cleaning up DPDK...");
     rte_eth_dev_stop(m_selected_port);
@@ -155,19 +114,13 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     m_logger->trace("Using PCI device: {}", pci_addr);
 
     // Detect NUMA node of the device
-    std::string node_path = "/sys/bus/pci/devices/" + pci_addr + "/numa_node";
-    std::ifstream node_file(node_path);
-    int dev_numa = -1;
-    if (node_file.is_open()) {
-        node_file >> dev_numa;
-        node_file.close();
+    auto dev_numa = std::size_t{};
+    if (auto detect_numa = net::detect_numa_node(pci_addr)) {
+        dev_numa = detect_numa.value();
+        m_logger->trace("device is on NUMA node: {}", dev_numa);
+    } else {
+        m_logger->trace("failed to detect numa node, falling back to NUMA node 0");
     }
-
-    if (dev_numa < 0) {
-        m_logger->warn("Could not determine NUMA node for device. Falling back to single-node config.");
-        dev_numa = 0;
-    }
-    m_logger->trace("Device is on NUMA node: {}",dev_numa);
 
     // Discover all NUMA nodes
     std::vector<int> nodes;
@@ -390,6 +343,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
             ++attempt;
         } while (attempt < max_attempts);
+    }
     // Setup RX queue with retry on ENOSPC and ENOENT
     for (uint16_t q = 0; q < NUM_RX_QUEUES; q++) {
         constexpr int max_attempts = 3;
@@ -414,82 +368,39 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     }
     m_logger->trace("Queue configured");
 
-
-    m_logger->trace("Queue configured");
-
-
-
     // Start the port
-    ret = rte_eth_dev_start(m_selected_port);
-    if (ret < 0) {
+    if (auto ret = rte_eth_dev_start(m_selected_port); ret < 0) {
         m_logger->error("rte_eth_dev_start: err={}, port={}", ret, m_selected_port);
         rte_exit(EXIT_FAILURE, "rte_eth_dev_start: err=%d, port=%u\n", ret, m_selected_port);
     }
     m_logger->trace("Port {} started", m_selected_port);
 
-    // START ENABLE MULTICAST FILTER
-    in_addr ipv4_addr{};
-    auto ip_addr = m_ip_addr;
-    if (inet_pton(AF_INET, std::string(ip_addr).c_str(), &ipv4_addr) != 1) {
-        m_logger->error("Not a valid IP");
+    // IGMP JOIN
+    if (net::is_ipv4_multicast(m_ip_addr)) {
+        // Enable multicast mode on the interface
+        auto mc_mac = net::create_rte_ether_addr(m_ip_addr);
+        if (rte_eth_dev_set_mc_addr_list(m_selected_port, &mc_mac, 1) < 0) {
+            throw std::runtime_error(std::format("failed to set multicast address filter: {}", std::string{strerror(errno)}));
+        }
+        auto ptypes = std::vector<uint32_t>{RTE_PTYPE_L2_ETHER, RTE_PTYPE_L3_IPV4, RTE_PTYPE_L4_UDP};
+        rte_eth_dev_set_ptypes(m_selected_port, RTE_PTYPE_UNKNOWN, ptypes.data(), ptypes.size());
 
+        // Create join socket
+        m_join_socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (m_join_socket < 0) {
+            throw std::runtime_error(std::format("failed to create join socket: {}", std::string{strerror(errno)}));
+        }
+        // Join multicast group
+        auto ip_mreq = net::create_ip_mreq(m_join_socket, m_interface, m_ip_addr);
+        if (::setsockopt(m_join_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &ip_mreq, sizeof(ip_mreq)) < 0) {
+            ::close(m_join_socket);
+            throw std::runtime_error(std::format("failed to join multicast group: {}", std::string{strerror(errno)}));
+        }
+        m_logger->trace("Joined multicast group {} on interface {}", m_ip_addr, m_interface);
     }
 
-    uint32_t ip = ntohl(ipv4_addr.s_addr);  // convert to host byte order
-
-    rte_ether_addr mc_mac{};
-    mc_mac.addr_bytes[0] = 0x01;
-    mc_mac.addr_bytes[1] = 0x00;
-    mc_mac.addr_bytes[2] = 0x5e;
-    mc_mac.addr_bytes[3] = static_cast<uint8_t>((ip >> 16) & 0x7F);  // only lower 7 bits
-    mc_mac.addr_bytes[4] = static_cast<uint8_t>((ip >> 8) & 0xFF);
-    mc_mac.addr_bytes[5] = static_cast<uint8_t>(ip & 0xFF);
-
-    ret = rte_eth_dev_set_mc_addr_list(m_selected_port, &mc_mac, 1);
-    std::vector<uint32_t> ptypes = {RTE_PTYPE_L2_ETHER, RTE_PTYPE_L3_IPV4, RTE_PTYPE_L4_UDP};
-    rte_eth_dev_set_ptypes(m_selected_port, RTE_PTYPE_UNKNOWN, ptypes.data(), ptypes.size());
-    // END ENABLE MULTICAST FILTER
-
+    // Receive logic
     m_logger->trace("Starting Rx loop...");
-
-    // IGMP JOIN 
-    // Create a normal UDP socket
-    m_socket = ::socket(AF_INET, SOCK_DGRAM, 0);
-    if (m_socket < 0) {
-        throw std::runtime_error(std::format("failed to create socket: {}", std::string{strerror(errno)}));
-    }
-
-    int reuse = 1;
-    if (setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        ::close(m_socket);
-        throw std::runtime_error(std::format("failed to set SO_REUSEADDR: {}", std::string{strerror(errno)}));
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(12345);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(m_socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        ::close(m_socket);
-        throw std::runtime_error(std::format("failed to bind socket: {}", std::string{strerror(errno)}));
-    }
-
-    // Join the multicast group
-    ip_mreqn mreq{};
-    mreq.imr_multiaddr.s_addr = inet_addr(std::string(ip_addr).c_str());
-    mreq.imr_address.s_addr = INADDR_ANY;
-    mreq.imr_ifindex = if_nametoindex(m_interface.c_str());
-    if (mreq.imr_ifindex == 0) {
-        ::close(m_socket);
-        throw std::runtime_error(std::format("failed to get ifindex for interface {}: {}", m_interface, std::string{strerror(errno)}));
-    }
-
-    if (setsockopt(m_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        ::close(m_socket);
-        throw std::runtime_error(std::format("failed to join multicast group: {}", std::string{strerror(errno)}));
-    }
-
-    m_logger->trace("Joined multicast group {} on interface {}", ip_addr, m_interface);
 
     uint8_t queue_id = 0;
     rte_mbuf* pkts[m_burst_size];
