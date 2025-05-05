@@ -109,4 +109,61 @@ auto process(const std::vector<float>& h, const window_buffer<std::complex<float
     return result;
 }
 
+/**
+ * @brief AVX-512 dot product for 8 complex floats
+ */
+[[gnu::target("avx512f")]]
+inline 
+auto process(const std::vector<float>& h, const window_buffer<std::complex<float>>& x) -> std::complex<float> {
+    // Init coefficients reshuffle index
+    auto reshuffle_h = _mm512_set_epi32(15, 14, 7, 6, 13, 12, 5, 4, 11, 10, 3, 2, 9, 8, 1, 0);
+
+    // Init accumulation registers
+    auto acc_re = _mm512_setzero_ps();
+    auto acc_im = _mm512_setzero_ps();
+
+    // AVX loop
+    auto i = std::size_t{};
+    auto x_ptr = reinterpret_cast<const float*>(x.data());
+    auto h_ptr = h.data();
+    for (; i + 16 <= h.size(); i += 16) {
+        // Calculate the float pointer offset for x[i]
+        size_t x_offset = 2 * i;
+
+        // Load 16 complex numbers = 32 floats from x, starting at index i
+        auto a = _mm512_loadu_ps(x_ptr + x_offset);      // [r0, i0, r1, i1, r2, i2, r3, i3, r4, i4, r5, i5, r6, i6, r7, i7]
+        auto b = _mm512_loadu_ps(x_ptr + x_offset + 16); // [r8, i8, r9, i9, r10, i10, r11, i11, r12, i12, r13, i13, r14, i14, r15, i15]
+
+       // Shuffle to split real/imag
+        auto real = _mm512_shuffle_ps(a, b, 0x88); // real: [r0, r1, r8, r9, r2, r3, r10, r11, r4, r5, r12, r13, r6, r7, r14, r15]
+        auto imag = _mm512_shuffle_ps(a, b, 0xDD); // imag: [i0, i1, i8, i9, i2, i3, i10, i11, i4, i5, i12, i13, i6, i7, i14, i15]
+
+        // Load coefficients and reshuffle to align with split real/imag indices
+        auto coeffs = _mm512_loadu_ps(h_ptr + i);
+        coeffs = _mm512_permutexvar_ps(reshuffle_h, coeffs); // [h0, h1, h8, h9, h2, h3, h10, h11, h4, h5, h12, h13, h6, h7, h14, h15]
+
+        // Multiply-accumulate
+        acc_re = _mm512_fmadd_ps(coeffs, real, acc_re);
+        acc_im = _mm512_fmadd_ps(coeffs, imag, acc_im);
+    }
+
+    // Reduce
+    auto yr = _mm512_reduce_add_ps(acc_re);
+    auto yi = _mm512_reduce_add_ps(acc_im);
+    auto result = std::complex<float>{yr, yi};
+
+    // Handle tail: process remaining taps using scalar method
+    for (; i + 4 <= h.size(); i += 4) {
+        result += h[i] * x[i];
+        result += h[i+1] * x[i + 1];
+        result += h[i+2] * x[i + 2];
+        result += h[i+3] * x[i + 3];
+    }
+    for (; i < h.size(); ++i) {
+        result += h[i] * x[i];
+    }
+
+    return result;
+}
+
 } // namespace dotprod

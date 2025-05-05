@@ -25,10 +25,9 @@
 #include <composite/component.hpp>
 #include <complex>
 #include <cstdint>
-#include <latch>
 #include <memory>
 #include <memory_resource>
-#include <span>
+#include <semaphore>
 #include <thread>
 #include <variant>
 #include <vector>
@@ -39,27 +38,17 @@ class halfrate : public composite::component {
     using input_port_t = composite::input_port<input_ptr_t>;
     using output_port_t = composite::output_port<input_ptr_t>;
     using enum composite::properties::config_type;
-
-    struct worker_context {
-        window_buffer<std::complex<float>> w0;
-        window_buffer<std::complex<float>> w1;
-        std::span<std::complex<float>> input; 
-        std::span<std::complex<float>> output;
-        std::mutex mtx;
-        std::condition_variable cv;
-        bool data_ready = false;
-        std::latch* done_latch = nullptr;
-    }; // struct worker_context
-
 public:
     halfrate();
-    ~halfrate() override;
+    ~halfrate() override = default;
 
     auto property_change_handler() -> void override;
+    // auto start() -> void override;
+    // auto stop() -> void override;
     auto process() -> composite::retval override;
 
 private:
-    auto worker_thread_func(std::stop_token, std::unique_ptr<worker_context>&) -> void;
+    // auto process_block(std::stop_token token);
     auto generate_coeffs() -> void;
 
     // Ports
@@ -67,14 +56,13 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Properties
-    uint32_t m_num_threads{1};
     uint32_t m_filter_semi_length{3};
     std::string m_window_type{};
 
     // Members
-    std::vector<std::unique_ptr<worker_context>> m_workers;
-    std::vector<std::jthread> m_threads;
     std::vector<float> m_coeffs;
     float m_center_tap{};
+    window_buffer<std::complex<float>> m_w0, m_w2;
+    window_buffer<std::complex<float>> m_w1, m_w3;
 
 }; // class halfrate

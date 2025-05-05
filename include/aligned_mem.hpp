@@ -204,6 +204,21 @@ public:
     }
 
     /**
+     * @brief Resizes the number of elements count down
+     * @param count The new number of elements stored
+     */
+    auto resize(std::size_t count) noexcept -> void {
+        if (count > m_count) {
+            auto err = std::format(
+                "aligned_mem invalid argument: count (which is {}) > this->size() (which is {})",
+                count, m_count
+            );
+            throw std::invalid_argument(err);
+        }
+        m_count = count;
+    }
+
+    /**
      * @brief Returns the number of elements stored
      * @return The number of elements
      */

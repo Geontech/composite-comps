@@ -36,7 +36,8 @@ add_compile_options(-march=x86-64-v2 -mtune=generic)
 
 # Library
 add_library(halfrate MODULE
-    component.cpp
+    component.par.cpp
+    # component.cpp
 )
 # Includes
 target_include_directories(halfrate
