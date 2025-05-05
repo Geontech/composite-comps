@@ -365,7 +365,6 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
             ++attempt;
         } while (attempt < max_attempts);
-        }
     }
     m_logger->trace("Queue configured");
 
