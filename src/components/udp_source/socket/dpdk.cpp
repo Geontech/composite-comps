@@ -178,18 +178,17 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
             throw std::runtime_error("Failed to initialize dpdk.cpp");
         }
     }
-    rte_delay_us_sleep(500000);
-
-
     // Get available DPDK ports
     nb_ports = rte_eth_dev_count_avail();
     if (nb_ports == 0) {
-        rte_eal_cleanup();
+        // rte_eal_cleanup();
+        m_logger->error("Zero ports detected");
+        // throw std::runtime_error("Failed to detect ports");
     }
 
     // Find NUMA node for the first available port
     m_logger->trace("Detected {} DPDK ports", nb_ports);
-    int numa_node = -1;
+    int numa_node = 0;
     m_selected_port = 0;
 
     for (uint16_t port_id = 0; port_id < nb_ports; port_id++) {
@@ -275,7 +274,6 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     static constexpr uint8_t  NUM_RX_QUEUES = 1;
     ret = rte_eth_dev_configure(m_selected_port, NUM_RX_QUEUES, 0, &m_port_conf);
     if (ret < 0) {
-        m_logger->error("rte_eth_dev_configure: err={}, port={}", rte_strerror(rte_errno), m_selected_port);
         m_logger->error("rte_eth_dev_configure: err={}, port={}", rte_strerror(rte_errno), m_selected_port);
         rte_exit(EXIT_FAILURE, "rte_eth_dev_configure: err=%d, port=%u\n", ret, m_selected_port);
     }

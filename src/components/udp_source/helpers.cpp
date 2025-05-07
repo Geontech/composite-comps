@@ -93,7 +93,7 @@ auto create_rte_ether_addr(std::string_view ip_addr) -> rte_ether_addr {
     mac_addr.addr_bytes[2] = 0x5e;
     mac_addr.addr_bytes[3] = static_cast<uint8_t>((ip >> 16) & 0x7F);  // only lower 7 bits
     mac_addr.addr_bytes[4] = static_cast<uint8_t>((ip >> 8) & 0xFF);
-    mac_addr.addr_bytes[4] =static_cast<uint8_t>(ip & 0xFF);
+    mac_addr.addr_bytes[5] =static_cast<uint8_t>(ip & 0xFF);
     return mac_addr;
 }
 
