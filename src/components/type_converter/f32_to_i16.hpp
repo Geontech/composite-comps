@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -32,9 +33,7 @@ auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex
     auto len = is_complex ? src.size() * 2 : src.size();
     for (auto i = std::size_t{}; i < len; ++i) {
         auto val = std::round(src[i]);
-        if (val > max_val) { val = max_val; }
-        if (val < min_val) { val = min_val; }
-        dst[i] = static_cast<int16_t>(val);
+        dst[i] = static_cast<int16_t>(std::clamp(val, min_val, max_val));
     }
 }
 
@@ -63,18 +62,15 @@ auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex
         // Store the 256-bit result (16 shorts)
         _mm256_store_si256((__m256i*)(&dst[i]), vi16);
     }
+    const auto min_val = (float)SHRT_MIN;
+    const auto max_val = (float)SHRT_MAX;
     for (; i < len; ++i) {
-        auto val = std::round(src[i]);
-        if (val > 32767.0f) { val = 32767.0f; }
-        if (val < -32768.0f) { val = -32768.0f; }
-        dst[i] = static_cast<int16_t>(val);
+        dst[i] = static_cast<int16_t>(std::clamp(std::round(src[i]), min_val, max_val));
     }
 }
 
 [[gnu::target("avx512f")]]
 auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex=false) -> void {
-    const auto min_val = (float)SHRT_MIN;
-    const auto max_val = (float)SHRT_MAX;
     auto len = is_complex ? src.size() * 2 : src.size();
     auto i = std::size_t{};
     for (; i + 16 <= len; i += 16) {
@@ -83,10 +79,9 @@ auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex
         auto vi16 = _mm512_cvtsepi32_epi16(vi32);
         _mm256_store_si256((__m256i*)(&dst[i]), vi16);
     }
+    const auto min_val = (float)SHRT_MIN;
+    const auto max_val = (float)SHRT_MAX;
     for (; i < len; ++i) {
-        auto val = std::round(src[i]);
-        if (val > max_val) { val = max_val; }
-        if (val < min_val) { val = min_val; }
-        dst[i] = static_cast<int16_t>(val);
+        dst[i] = static_cast<int16_t>(std::clamp(std::round(src[i]), min_val, max_val));
     }
 }
