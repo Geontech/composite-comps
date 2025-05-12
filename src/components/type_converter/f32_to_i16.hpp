@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <immintrin.h>
@@ -26,8 +27,43 @@
 
 [[gnu::target("default")]]
 auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex=false) -> void {
+    const auto min_val = (float)SHRT_MIN;
+    const auto max_val = (float)SHRT_MAX;
     auto len = is_complex ? src.size() * 2 : src.size();
     for (auto i = std::size_t{}; i < len; ++i) {
+        auto val = std::round(src[i]);
+        if (val > max_val) { val = max_val; }
+        if (val < min_val) { val = min_val; }
+        dst[i] = static_cast<int16_t>(val);
+    }
+}
+
+[[gnu::target("avx2")]]
+auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex=false) -> void {
+    auto len = is_complex ? src.size() * 2 : src.size();
+    auto i = std::size_t{};
+    // Requires: float -> int32 -> pack int32 -> int16
+    const auto permute_mask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0); // For packing result
+    for (; i + 16 <= len; i += 16) {
+        // Load 16 floats (two 256-bit vectors)
+        auto vf_1 = _mm256_loadu_ps(&src[i]);
+        auto vf_2 = _mm256_loadu_ps(&src[i + 8]);
+
+        // Convert float -> int32 (rounding towards zero - truncation)
+        auto vi32_1 = _mm256_cvtps_epi32(vf_1); // 8x int32
+        auto vi32_2 = _mm256_cvtps_epi32(vf_2); // 8x int32
+
+        // Pack int32 -> int16 with saturation
+        // Result layout is [a0..a3 | b0..b3 | a4..a7 | b4..b7] (16-bit elements)
+        auto vi16 = _mm256_packs_epi32(vi32_1, vi32_2);
+
+        // Permute to get the order [a0..a7 | b0..b7]
+        vi16 = _mm256_permutevar8x32_epi32(vi16, permute_mask);
+
+        // Store the 256-bit result (16 shorts)
+        _mm256_store_si256((__m256i*)(&dst[i]), vi16);
+    }
+    for (; i < len; ++i) {
         auto val = std::round(src[i]);
         if (val > 32767.0f) { val = 32767.0f; }
         if (val < -32768.0f) { val = -32768.0f; }
@@ -35,26 +71,10 @@ auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex
     }
 }
 
-// [[gnu::target("avx2")]]
-// auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex=false) -> void {
-//     auto len = is_complex ? src.size() * 2 : src.size();
-//     auto i = std::size_t{};
-//     for (; i + 8 <= len; i += 8) {
-//         auto vf = _mm256_loadu_ps(&src[i]);
-//         auto vi32 = _mm256_cvtps_epi32(vf);
-//         auto vi16 = _mm256_cvtsepi32_epi16(vi32);
-//         _mm256_store_si256((__m256i*)(&dst[i]), vi16);
-//     }
-//     for (; i < len; ++i) {
-//         auto val = std::round(src[i]);
-//         if (val > 32767.0f) { val = 32767.0f; }
-//         if (val < -32768.0f) { val = -32768.0f; }
-//         dst[i] = static_cast<int16_t>(val);
-//     }
-// }
-
 [[gnu::target("avx512f")]]
 auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex=false) -> void {
+    const auto min_val = (float)SHRT_MIN;
+    const auto max_val = (float)SHRT_MAX;
     auto len = is_complex ? src.size() * 2 : src.size();
     auto i = std::size_t{};
     for (; i + 16 <= len; i += 16) {
@@ -65,8 +85,8 @@ auto convert(std::span<const float> src, std::span<int16_t> dst, bool is_complex
     }
     for (; i < len; ++i) {
         auto val = std::round(src[i]);
-        if (val > 32767.0f) { val = 32767.0f; }
-        if (val < -32768.0f) { val = -32768.0f; }
+        if (val > max_val) { val = max_val; }
+        if (val < min_val) { val = min_val; }
         dst[i] = static_cast<int16_t>(val);
     }
 }
