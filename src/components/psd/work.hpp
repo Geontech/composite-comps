@@ -36,13 +36,17 @@ class work<float> {
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(float)};
     static constexpr auto STRIDE_512 = std::size_t{512u / 8u / sizeof(float)};
 public:
-    explicit work(float normalization_const) {
+    explicit work(float normalization_const) : m_norm_const(normalization_const) {
         // Initialize the function pointer based on CPU features
         if (__builtin_cpu_supports("avx512f")) {
-            init_avx512(normalization_const);
+            init_avx512();
         } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            init_avx2(normalization_const);
+            init_avx2();
         }
+    }
+
+    auto norm_const() const -> float {
+        return m_norm_const;
     }
 
     auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
@@ -55,20 +59,20 @@ public:
 
 private:
     [[gnu::target("avx512f")]]
-    auto init_avx512(float normalization_const) -> void {
+    auto init_avx512() -> void {
         process_func = &work::process_avx512;
         apply_multiplier_func = &work::apply_multiplier_avx512;
-        m_norm_const_512 = _mm512_set1_ps(normalization_const);
+        m_norm_const_512 = _mm512_set1_ps(m_norm_const);
         m_log_const_512 = _mm512_set1_ps(float{10} / std::log2f(10));
         m_real_idx_512i = _mm512_set_epi32(30,28,26,24,22,20,18,16,14,12,10,8,6,4,2,0);
         m_imag_idx_512i = _mm512_set_epi32(31,29,27,25,23,21,19,17,15,13,11,9,7,5,3,1);
     }
 
     [[gnu::target("avx2,fma")]]
-    auto init_avx2(float normalization_const) -> void {
+    auto init_avx2() -> void {
         process_func = &work::process_avx2;
         apply_multiplier_func = &work::apply_multiplier_avx2;
-        m_norm_const_256 = _mm256_set1_ps(normalization_const);
+        m_norm_const_256 = _mm256_set1_ps(m_norm_const);
         m_log_const_256 = _mm256_set1_ps(float{10} / std::log2f(10));
         m_real_idx_256i = _mm256_set_epi32(14,12,10,8,6,4,2,0);
         m_imag_idx_256i = _mm256_set_epi32(15,13,11,9,7,5,3,1);
@@ -140,6 +144,7 @@ private:
 
     auto (work::*process_func)(cplx_data_type*) -> std::unique_ptr<real_data_type>;
     auto (work::*apply_multiplier_func)(real_data_type*) const -> void;
+    float m_norm_const{1};
     __m256 m_norm_const_256;
     __m512 m_norm_const_512;
     __m256 m_log_const_256;
@@ -158,13 +163,17 @@ class work<double> {
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(double)};
     static constexpr auto STRIDE_512 = std::size_t{512u / 8u / sizeof(double)};
 public:
-    explicit work(double normalization_const) {
+    explicit work(double normalization_const) : m_norm_const(normalization_const) {
         // Initialize the function pointer based on CPU features
         if (__builtin_cpu_supports("avx512f")) {
-            init_avx512(normalization_const);
+            init_avx512();
         } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-           init_avx2(normalization_const);
+           init_avx2();
         }
+    }
+
+    auto norm_const() const -> double {
+        return m_norm_const;
     }
 
     auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
@@ -177,20 +186,20 @@ public:
 
 private:
     [[gnu::target("avx512f")]]
-    auto init_avx512(double normalization_const) -> void {
+    auto init_avx512() -> void {
         process_func = &work::process_avx512;
         apply_multiplier_func = &work::apply_multiplier_avx512;
-        m_norm_const_512 = _mm512_set1_pd(normalization_const);
+        m_norm_const_512 = _mm512_set1_pd(m_norm_const);
         m_log_const_512 = _mm512_set1_pd(double{10} / std::log2(10));
         m_real_idx_512i = _mm512_set_epi64(14,12,10,8,6,4,2,0);
         m_imag_idx_512i = _mm512_set_epi64(15,13,11,9,7,5,3,1);
     }
 
     [[gnu::target("avx2,fma")]]
-    auto init_avx2(double normalization_const) -> void {
+    auto init_avx2() -> void {
         process_func = &work::process_avx2;
         apply_multiplier_func = &work::apply_multiplier_avx2;
-        m_norm_const_256 = _mm256_set1_pd(normalization_const);
+        m_norm_const_256 = _mm256_set1_pd(m_norm_const);
         m_log_const_256 = _mm256_set1_pd(double{10} / std::log2(10));
         m_real_idx_256i = _mm256_set_epi64x(6,4,2,0);
         m_imag_idx_256i = _mm256_set_epi64x(7,5,3,1);
@@ -262,6 +271,7 @@ private:
 
     auto (work::*process_func)(cplx_data_type*) -> std::unique_ptr<real_data_type>;
     auto (work::*apply_multiplier_func)(real_data_type*) const -> void;
+    double m_norm_const{1};
     __m256d m_norm_const_256;
     __m512d m_norm_const_512;
     __m256d m_log_const_256;

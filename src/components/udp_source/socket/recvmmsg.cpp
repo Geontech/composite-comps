@@ -18,10 +18,12 @@
  */
 
 #include "helpers.hpp"
+#include "overlay.hpp"
 #include "recvmmsg.hpp"
 #include "pmr/ring_resource.hpp"
 
 #include <arpa/inet.h>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <format>
@@ -36,9 +38,7 @@
 namespace udp {
 
 recvmmsg::recvmmsg(const config& config) :
-  interface(config.logger),
-  m_frame_size(std::bit_ceil(config.msg_size)),
-  m_resource({.frame_size=m_frame_size, .frame_count=config.frame_count, .alignment=64}) {
+  interface(config.logger) {
     // Create socket
     m_logger->trace("opening udp socket");
     m_socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -91,6 +91,83 @@ recvmmsg::recvmmsg(const config& config) :
             throw std::runtime_error(std::format("failed to join multicast group: {}", std::string{strerror(errno)}));
         }
     }
+
+    // Setup transport and msg_size properties from overrides or packets on wire
+    auto msg_size = std::size_t{}; // unknown msg size to start with
+    std::array<uint8_t, 9000> buffer{}; // Use a jumbo frame buffer
+    // User has overriden properties
+    if (config.transport == "sdds") {
+        m_transport = transport::sdds;
+        msg_size = 1080; // fixed-length protocol
+    } else if (config.transport == "vita49") {
+        m_transport = transport::vita49;
+        // Discover the size of the vita49 packets from the wire
+        while (true) {
+            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
+                auto packet = overlay::v49::overlay(buffer);
+                if (packet.is_data()) {
+                    msg_size = packet.header().packet_size();
+                    break;
+                }
+            }
+        }
+    } else {
+        // Discover both the transport and the size of the packets from the wire
+        while (true) {
+            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
+                if (recvd == 1080) { // likely sdds
+                    // Overlay SDDS
+                    auto packet_sdds = overlay::sdds::overlay(buffer);
+                    auto sf = packet_sdds.standard_format();
+                    auto dm = packet_sdds.data_mode();
+                    auto bps = packet_sdds.bps();
+                    auto valid_dm = (dm == 0 && bps == 4) ||
+                                 (dm == 1 && bps == 8) ||
+                                 (dm == 2 && bps == 16) ||
+                                 (dm == 5 && bps == 8) ||
+                                 (dm == 6 && bps == 16);
+                    m_logger->trace("SDDS standard_format={} data_mode={}, bps={}", sf, dm, bps);
+                    if (valid_dm) {
+                        m_transport = transport::sdds;
+                        msg_size = 1080;
+                        break;
+                    }
+
+                    // Try overlay V49
+                    auto packet_v49 = overlay::v49::overlay(buffer);
+                    if (packet_v49.is_data()) {
+                        m_transport = transport::vita49;
+                        msg_size = packet_v49.header().packet_size() * sizeof(uint32_t);
+                        break;
+                    }
+                } else {
+                    // Can't be SDDS, so overlay V49 and check the headers
+                    auto packet = overlay::v49::overlay(buffer);
+                    if (packet.is_data()) {
+                        m_transport = transport::vita49;
+                        msg_size = packet.header().packet_size() * sizeof(uint32_t);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    auto to_string = [](transport t) -> std::string {
+        if (t == transport::sdds) {
+            return "sdds";
+        } else if (t == transport::vita49) {
+            return "vita49";
+        }
+        return "unknown";
+    };
+    m_logger->trace("discovered protocol: {} with msg size: {}", to_string(m_transport), msg_size);
+
+    // Should have determined the size and can now create the ring buffer
+    // TODO: should probably throw if unable to determine transport and size
+    if (msg_size > 0) {
+        m_frame_size = std::bit_ceil(msg_size);
+        m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=config.frame_count, .alignment=64});
+    }
 }
 
 recvmmsg::~recvmmsg() {
@@ -139,7 +216,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
     };
 
     // Allocator for pmr vectors
-    auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
+    auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(m_resource.get());
 
     // Buffers
     buffer_ptr_t buffers[m_batch_size];

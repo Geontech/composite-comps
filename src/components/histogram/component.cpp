@@ -41,9 +41,9 @@ histogram::histogram() : composite::component("histogram") {
 
 auto histogram::initialize() -> void {
     if (m_display_as_bits) {
-        m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2 + 1, 0);
+        m_histogram = std::make_shared<histogram_t>(m_adc_bits * 2 + 1, 0);
     } else {
-        m_histogram = std::make_unique<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
+        m_histogram = std::make_shared<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
     }
 
     for (auto i = SHRT_MIN; i <= SHRT_MAX; ++i) {
@@ -57,7 +57,7 @@ auto histogram::initialize() -> void {
 
 auto histogram::process() -> composite::retval {
     using enum composite::retval;
-    auto [data, ts] = m_in_port.get_data();
+    auto [data, ts, meta] = m_in_port.get_data();
     if (data == nullptr) {
         return NOOP;
     }

@@ -39,8 +39,8 @@ class stov : public composite::component {
     using enum composite::properties::config_type;
 public:
     stov() : composite::component("stov") {
-        add_port(m_in_port.get());
-        add_port(m_out_port.get());
+        add_port(&m_in_port);
+        add_port(&m_out_port);
         add_property("output_size", &m_output_size).configurability(RUNTIME);
         add_property("byteswap", &m_byteswap).configurability(RUNTIME);
     }
@@ -54,14 +54,35 @@ public:
             m_converter = converter<int16_t, int16_t>(m_byteswap);
         }
         // flush input port
-        m_in_port->clear();
+        m_in_port.clear();
     }
 
     auto process() -> composite::retval override {
         using enum composite::retval;
-        auto [data, ts] = m_in_port->get_data();
+        auto [data, ts, meta] = m_in_port.get_data();
         if (data == nullptr) {
             return NORMAL;
+        }
+        if (meta.has_value()) {
+            logger()->trace("received metadata:\n{}", meta->to_string());
+            if (m_byteswap) {
+                meta->format.endianness = (meta->format.endianness == std::endian::big) ? std::endian::little : std::endian::big;
+            }
+            meta->format.bit_width = sizeof(T) * 8;
+            if (std::is_same_v<T, std::complex<float>> || std::is_same_v<T, std::complex<int16_t>>) {
+                meta->format.is_complex = true;
+                meta->format.bit_width = meta->format.bit_width / 2;
+            }
+            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
+                meta->format.type = composite::data_type::floating_point;
+            } else {
+                meta->format.type = composite::data_type::signed_integer;
+            }
+            if (m_metadata != meta.value()) {
+                m_metadata = meta.value();
+                logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+                m_out_port.send_metadata(m_metadata);
+            }
         }
         auto bit_len = std::size_t{256};
         if (__builtin_cpu_supports("avx512f")) {
@@ -88,7 +109,7 @@ public:
             }
             m_output_idx += stride;
             if (m_output_idx == m_output_size) {
-                m_out_port->send_data(std::move(m_output_buf), m_output_ts);
+                m_out_port.send_data(std::move(m_output_buf), m_output_ts);
                 m_output_buf.reset();
                 m_output_idx = 0;
             }
@@ -98,8 +119,8 @@ public:
 
 private:
     // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
-    std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
+    input_port_t m_in_port{"data_in"};
+    output_port_t m_out_port{"data_out"};
 
     // Properties
     uint32_t m_output_size{};
@@ -108,6 +129,7 @@ private:
     // Members
     std::variant<converter<int16_t, float>, converter<int16_t, int16_t>> m_converter;
     std::unique_ptr<output_t> m_output_buf;
+    composite::metadata m_metadata;
     uint32_t m_output_idx{};
     composite::timestamp m_output_ts;
     uint8_t m_pkt_count{};

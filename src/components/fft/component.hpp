@@ -39,8 +39,8 @@ class fft : public composite::component {
     using enum composite::properties::config_type;
 public:
     fft() : composite::component("fft") {
-        add_port(m_in_port.get());
-        add_port(m_out_port.get());
+        add_port(&m_in_port);
+        add_port(&m_out_port);
         add_property("window", &m_window_type).change_listener([this]() {
             return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
         });
@@ -70,9 +70,16 @@ public:
 
     auto process() -> composite::retval override {
         using enum composite::retval;
-        auto [data, ts] = m_in_port->get_data();
+        auto [data, ts, meta] = m_in_port.get_data();
         if (data == nullptr) {
             return NORMAL;
+        }
+        if (meta.has_value()) {
+            logger()->trace("received metadata:\n{}", meta->to_string());
+            meta->annotations["fft_size"] = std::to_string(m_fft_size);
+            meta->annotations["fft_window"] = m_window_type;
+            logger()->trace("sending updated metadata:\n{}", meta->to_string());
+            m_out_port.send_metadata(meta.value());
         }
         // Apply window
         if (m_window) {
@@ -82,7 +89,7 @@ public:
         // In-place for complex
         m_fft_plan->execute(data.get(), data.get());
         // Send data
-        m_out_port->send_data(std::move(data), ts);
+        m_out_port.send_data(std::move(data), ts);
         return NORMAL;
     }
 
@@ -144,8 +151,8 @@ private:
     }
 
     // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
-    std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
+    input_port_t m_in_port{"data_in"};
+    output_port_t m_out_port{"data_out"};
 
     // Properties
     std::string m_window_type;
