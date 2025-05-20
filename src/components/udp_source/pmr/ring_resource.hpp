@@ -14,7 +14,7 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #pragma once
@@ -53,6 +53,8 @@ public:
         std::size_t alignment{64};
 
     }; // struct ring_config
+
+    ring_resource() = default;
 
     /**
      * @brief Construct a ring_resource with the given configuration.
@@ -124,6 +126,6 @@ private:
      *
      * Uses a custom deleter to properly release memory.
      */
-    std::unique_ptr<std::uint8_t, void(*)(void*)> m_buffer;
+    std::unique_ptr<std::uint8_t, void(*)(void*)> m_buffer{nullptr, &std::free};
 
 }; // class ring_resource

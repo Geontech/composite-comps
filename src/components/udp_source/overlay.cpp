@@ -14,7 +14,7 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #include "overlay.hpp"
@@ -28,6 +28,10 @@ namespace sdds {
 
 overlay:: overlay(std::span<const uint8_t> data) : m_data(data) {}
 
+auto overlay::standard_format() const -> bool {
+    return m_data[0] & 0x80;
+}
+
 auto overlay::pp_id() const -> bool {
     return m_data[0] & 0x20;
 }
@@ -36,8 +40,16 @@ auto overlay::is_parity() const -> bool {
     return pp_id() && ((seq_num() % 32) == 31);
 }
 
+auto overlay::data_mode() const -> uint8_t {
+    return m_data[0] & 0x07;
+}
+
 auto overlay::bps() const -> uint8_t {
     return m_data[1] & 0x1F;
+}
+
+auto overlay::complex() const -> bool {
+    return m_data[1] & 0x80;
 }
 
 auto overlay::seq_num() const -> uint16_t {
@@ -54,6 +66,22 @@ auto overlay::ttag() const -> uint64_t {
 
 auto overlay::ttage() const -> uint32_t {
     return std::byteswap(*reinterpret_cast<const uint32_t*>(m_data.data() + 16));
+}
+
+auto overlay::dfdt() const -> int32_t {
+    return std::byteswap(*reinterpret_cast<const int32_t*>(m_data.data() + 20));
+}
+
+auto overlay::frequency() const -> uint64_t {
+    return std::byteswap(*reinterpret_cast<const uint64_t*>(m_data.data() + 24));
+}
+
+auto overlay::sample_rate() const -> double {
+    auto rate = static_cast<double>(frequency()) * FREQ_MULT;
+    if (complex()) {
+        return rate / 2;
+    }
+    return rate;
 }
 
 auto overlay::secs() const -> uint32_t {
@@ -164,6 +192,89 @@ overlay::overlay(std::span<uint8_t> data) : m_data(data) {
         auto pos = m_positions.at("payload");
         auto len = payload_size();
         swap_iq({m_data.data() + pos, len});
+    } else if (is_context()) {
+        m_cif0 = vrtgen::packing::CIF0{};
+        if (m_little_endian) {
+            auto cif0_word = std::byteswap(*reinterpret_cast<const uint32_t*>(m_data.data() + curr_idx));
+            m_cif0->unpack_from(reinterpret_cast<uint8_t*>(&cif0_word));
+        } else {
+            m_cif0->unpack_from(m_data.data() + curr_idx);
+        }
+        curr_idx += m_cif0->size();
+        if (m_cif0->reference_point_id()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->bandwidth()) {
+            auto bw = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
+            if (m_little_endian) {
+                m_bandwidth = vrtgen::fixed::to_fp<44,20>(bw);
+            } else {
+                m_bandwidth = vrtgen::fixed::to_fp<44,20>(std::byteswap(bw));
+            }
+            curr_idx += sizeof(bw);
+        }
+        if (m_cif0->if_ref_frequency()) {
+            curr_idx += sizeof(uint64_t); // advance past
+        }
+        if (m_cif0->rf_ref_frequency()) {
+            auto freq = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
+            if (m_little_endian) {
+                m_rf_frequency = vrtgen::fixed::to_fp<44,20>(freq);
+            } else {
+                m_rf_frequency = vrtgen::fixed::to_fp<44,20>(std::byteswap(freq));
+            }
+            curr_idx += sizeof(freq);
+        }
+        if (m_cif0->rf_ref_frequency_offset()) {
+            curr_idx += sizeof(uint64_t); // advance past
+        }
+        if (m_cif0->if_band_offset()) {
+            curr_idx += sizeof(uint64_t); // advance past
+        }
+        if (m_cif0->reference_level()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->gain()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->over_range_count()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->sample_rate()) {
+            auto sr = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
+            if (m_little_endian) {
+                m_sample_rate = vrtgen::fixed::to_fp<44,20>(sr);
+            } else {
+                m_sample_rate = vrtgen::fixed::to_fp<44,20>(std::byteswap(sr));
+            }
+            curr_idx += sizeof(sr);
+        }
+        if (m_cif0->timestamp_adjustment()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->timestamp_calibration_time()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->temperature()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->device_id()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->state_event_indicators()) {
+            curr_idx += sizeof(uint32_t); // advance past
+        }
+        if (m_cif0->signal_data_format()) {
+            m_signal_data_format = vrtgen::packing::PayloadFormat{};
+            if (m_little_endian) {
+                auto sdf_words = std::byteswap(*reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx));
+                m_signal_data_format->unpack_from(reinterpret_cast<uint8_t*>(&sdf_words));
+            } else {
+                m_signal_data_format->unpack_from(m_data.data() + curr_idx);
+            }
+            curr_idx += m_signal_data_format->size();
+        }
+        // TODO: more context fields
     }
 }
 
@@ -227,6 +338,26 @@ auto overlay::payload_start() const -> size_t {
         return {};
     }
     return m_positions.at("payload");
+}
+
+auto overlay::endianness() const -> std::endian {
+    return m_little_endian ? std::endian::little : std::endian::big;
+}
+
+auto overlay::bandwidth() const -> std::optional<double> {
+    return m_bandwidth;
+}
+
+auto overlay::rf_frequency() const -> std::optional<double> {
+    return m_rf_frequency;
+}
+
+auto overlay::sample_rate() const -> std::optional<double> {
+    return m_sample_rate;
+}
+
+auto overlay::signal_data_format() const -> const std::optional<vrtgen::packing::PayloadFormat>& {
+    return m_signal_data_format;
 }
 
 auto overlay::swap_iq(std::span<uint8_t> data) -> void {

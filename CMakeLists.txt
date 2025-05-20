@@ -27,7 +27,7 @@ include(FetchContent)
 # composite dependency
 FetchContent_Declare(composite
     GIT_REPOSITORY https://github.com/geontech/composite.git
-    GIT_TAG v0.3.4
+    GIT_TAG v0.4.0
 )
 # vrtgen dependency
 FetchContent_Declare(vrtgen

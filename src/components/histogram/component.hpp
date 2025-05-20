@@ -27,7 +27,7 @@ class histogram : public composite::component {
     using input_t = std::pmr::vector<uint8_t>;
     using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using histogram_t = std::vector<uint64_t>;
-    using output_port_t = composite::output_port<std::unique_ptr<histogram_t>>;
+    using output_port_t = composite::output_port<std::shared_ptr<histogram_t>>;
 public:
     histogram();
     ~histogram() override = default;
@@ -49,7 +49,7 @@ private:
     bool m_display_as_bits{};
 
     // Members
-    std::unique_ptr<histogram_t> m_histogram;
+    std::shared_ptr<histogram_t> m_histogram;
     std::vector<int8_t> m_sample_bits;
     uint32_t m_histogram_samples{};
     uint32_t m_skip_counter{};

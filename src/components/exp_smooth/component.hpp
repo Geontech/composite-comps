@@ -32,8 +32,8 @@ class exp_smooth : public composite::component {
     using enum composite::properties::config_type;
 public:
     exp_smooth() : composite::component("exp_smooth") {
-        add_port(m_in_port.get());
-        add_port(m_out_port.get());
+        add_port(&m_in_port);
+        add_port(&m_out_port);
         add_property("num_averages", &m_num_averages).configurability(RUNTIME).change_listener([this]() {
             if (m_num_averages > 0) {
                 m_alpha = T{1} - std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
@@ -48,13 +48,17 @@ public:
 
     auto process() -> composite::retval override {
         using enum composite::retval;
-        auto [data, ts] = m_in_port->get_data();
+        auto [data, ts, meta] = m_in_port.get_data();
         if (data == nullptr) {
             return NOOP;
         }
+        if (meta.has_value()) {
+            logger()->trace("pass-through metadata:\n{}", meta->to_string());
+            m_out_port.send_metadata(meta.value());
+        }
         if (m_alpha == T{1}) {
             // No smoothing, return as is
-            m_out_port->send_data(std::move(data), ts);
+            m_out_port.send_data(std::move(data), ts);
             return NORMAL;
         }
         // Handle first PSD
@@ -66,7 +70,7 @@ public:
         // Run algorithm
         m_work->process(data.get(), m_prev_psd.get());
         // Send previous PSD data and timestamp
-        m_out_port->send_data(std::move(m_prev_psd), m_prev_psd_ts);
+        m_out_port.send_data(std::move(m_prev_psd), m_prev_psd_ts);
         // Save current PSD for next pass
         m_prev_psd = std::move(data);
         m_prev_psd_ts = ts;
@@ -75,8 +79,8 @@ public:
 
 private:
     // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
-    std::unique_ptr<output_port_t> m_out_port{std::make_unique<output_port_t>("data_out")};
+    input_port_t m_in_port{"data_in"};
+    output_port_t m_out_port{"data_out"};
 
     // Properties
     uint32_t m_num_averages{};

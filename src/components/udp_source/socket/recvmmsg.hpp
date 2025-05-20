@@ -53,7 +53,7 @@ private:
     std::jthread m_recv_thread;
     queue_t m_queue;
     std::size_t m_frame_size{};
-    ring_resource m_resource;
+    std::unique_ptr<ring_resource> m_resource;
     std::size_t m_batch_size{128};
     std::atomic<uint32_t> m_pkts_recvd{};
 
