@@ -101,13 +101,17 @@ recvmmsg::recvmmsg(const config& config) :
         msg_size = 1080; // fixed-length protocol
     } else if (config.transport == "vita49") {
         m_transport = transport::vita49;
-        // Discover the size of the vita49 packets from the wire
-        while (true) {
-            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
-                auto packet = overlay::v49::overlay(buffer);
-                if (packet.is_data()) {
-                    msg_size = packet.header().packet_size();
-                    break;
+        if (config.msg_size > 0) {
+            msg_size = config.msg_size;
+        } else {
+            // Discover the size of the vita49 packets from the wire
+            while (true) {
+                if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
+                    auto packet = overlay::v49::overlay(buffer);
+                    if (packet.is_data()) {
+                        msg_size = recvd;
+                        break;
+                    }
                 }
             }
         }
@@ -137,7 +141,7 @@ recvmmsg::recvmmsg(const config& config) :
                     auto packet_v49 = overlay::v49::overlay(buffer);
                     if (packet_v49.is_data()) {
                         m_transport = transport::vita49;
-                        msg_size = packet_v49.header().packet_size() * sizeof(uint32_t);
+                        msg_size = recvd;
                         break;
                     }
                 } else {
@@ -145,7 +149,7 @@ recvmmsg::recvmmsg(const config& config) :
                     auto packet = overlay::v49::overlay(buffer);
                     if (packet.is_data()) {
                         m_transport = transport::vita49;
-                        msg_size = packet.header().packet_size() * sizeof(uint32_t);
+                        msg_size = recvd;
                         break;
                     }
                 }
