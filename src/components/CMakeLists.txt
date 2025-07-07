@@ -17,7 +17,7 @@
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
 
-add_subdirectory(aligned_mem_writer)
+# add_subdirectory(aligned_mem_writer)
 add_subdirectory(exp_smooth)
 add_subdirectory(fft)
 # add_subdirectory(file_writer)

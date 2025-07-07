@@ -18,28 +18,42 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
+project(mt_fft VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
+
+# Set the C++ version required
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Set compile flags
+set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Use FetchContent for dependencies
-include(FetchContent)
-# composite dependency
-FetchContent_Declare(composite
-    GIT_REPOSITORY https://github.com/geontech/composite.git
-    GIT_TAG v0.4.0
-)
-# vrtgen dependency
-FetchContent_Declare(vrtgen
-    GIT_REPOSITORY https://github.com/geontech/vrtgen.git
-    GIT_TAG v0.7.12
-)
-# spdlog dependency
-FetchContent_Declare(spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG v1.14.1
-)
-# Make all deps available
-FetchContent_MakeAvailable(composite vrtgen spdlog)
+# Custom compile options
+add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
 
-add_subdirectory(src)
+# Library
+add_library(mt_fft MODULE
+    component.cpp
+)
+# Includes
+target_include_directories(mt_fft
+    PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../include
+)
+target_link_libraries(mt_fft
+    PRIVATE
+    composite::composite
+    spdlog::spdlog_header_only
+    fftw3f
+    fftw3f_threads
+    fftw3
+    fftw3_threads
+)
+# Install
+install(TARGETS mt_fft
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)

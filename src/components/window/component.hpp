@@ -17,47 +17,43 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include "aligned_mem.hpp"
-#include "fft_plan.hpp"
-#include "windows.hpp"
-
-#include <bit>
-#include <composite/component.hpp>
-#include <complex>
-#include <fftw3.h>
-#include <immintrin.h>
-#include <memory>
-#include <vector>
+ #include "aligned_mem.hpp"
+//  #include "fft_plan.hpp"
+ #include "windows.hpp"
+ #include <chrono>
+ #include <iostream>
+ #include <bit>
+ #include <composite/component.hpp>
+ #include <complex>
+ #include <fftw3.h>
+ #include <immintrin.h>
+ #include <memory>
+ #include <queue>
+ #include <vector>
 
 template <typename T>
-class fft : public composite::component {
-    using plan_t = fft_plan<T, true>;
+class window : public composite::component {
     using fft_t = aligned::aligned_mem<std::complex<T>>;
     using window_t = aligned::aligned_mem<T>;
     using input_port_t = composite::input_port<std::unique_ptr<fft_t>>;
     using output_port_t = composite::output_port<std::unique_ptr<fft_t>>;
     using enum composite::properties::config_type;
 public:
-    fft() : composite::component("fft") {
+    window() : composite::component("window") {
         add_port(&m_in_port);
         add_port(&m_out_port);
-        add_property("window", &m_window_type).change_listener([this]() {
-            return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
-        });
         add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
             return std::has_single_bit(m_fft_size);
         });
-        add_property("fftw_threads", &m_fftw_threads);
-        add_property("shift", &m_shift).configurability(RUNTIME);
-        // Initialize the function pointer based on CPU features
+        add_property("window", &m_window_type).change_listener([this]() {
+            return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
+        });
         if (__builtin_cpu_supports("avx512f")) {
-            apply_window_func = &fft::apply_window_avx512;
+            apply_window_func = &window::apply_window_avx512;
         } else if (__builtin_cpu_supports("avx2")) {
-            apply_window_func = &fft::apply_window_avx2;
+            apply_window_func = &window::apply_window_avx2;
         }
     }
-
-    ~fft() override = default;
 
     auto property_change_handler() -> void override {
         if (m_window_type == "BLACKMAN_HARRIS") {
@@ -65,30 +61,23 @@ public:
         } else if (m_window_type == "HAMMING") {
             m_window = windows::hamming<T>(m_fft_size);
         }
-        m_fft_plan = std::make_unique<plan_t>(m_fft_size, m_fftw_threads, m_shift);
     }
 
     auto process() -> composite::retval override {
         using enum composite::retval;
         auto [data, ts, meta] = m_in_port.get_data();
-        if (data == nullptr) {
-            return NORMAL;
-        }
-        if (meta.has_value()) {
-            logger()->trace("received metadata:\n{}", meta->to_string());
-            meta->annotations["fft_size"] = std::to_string(m_fft_size);
+        if (!data) return NORMAL;
+
+        if (meta.has_value()){
+            logger()->trace ("receivied metadata:\n{}", meta->to_string());
             meta->annotations["fft_window"] = m_window_type;
             logger()->trace("sending updated metadata:\n{}", meta->to_string());
             m_out_port.send_metadata(meta.value());
         }
-        // Apply window
         if (m_window) {
             (this->*apply_window_func)(data.get(), m_window.get());
         }
-        // Execute the fft
-        // In-place for complex
-        m_fft_plan->execute(data.get(), data.get());
-        // Send data
+
         m_out_port.send_data(std::move(data), ts);
         return NORMAL;
     }
@@ -149,7 +138,6 @@ private:
             }
         }
     }
-
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
@@ -157,12 +145,8 @@ private:
     // Properties
     std::string m_window_type;
     uint32_t m_fft_size{1024};
-    uint32_t m_fftw_threads{1};
-    bool m_shift{true};
 
     // Members
-    auto (fft::*apply_window_func)(fft_t*, const window_t*) -> void;
-    std::unique_ptr<fft_plan<T, true>> m_fft_plan{nullptr};
     std::unique_ptr<window_t> m_window{nullptr};
-
-}; // class fft
+    auto (window::*apply_window_func)(fft_t*, const window_t*) -> void;
+};

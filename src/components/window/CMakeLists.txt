@@ -18,28 +18,43 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
+project(window VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
+
+# Set the C++ version required
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Set compile flags
+set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
+set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Use FetchContent for dependencies
-include(FetchContent)
-# composite dependency
-FetchContent_Declare(composite
-    GIT_REPOSITORY https://github.com/geontech/composite.git
-    GIT_TAG v0.4.0
+# Custom compile options
+add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
+# find_package(Boost REQUIRED)
+# Library
+add_library(window MODULE
+    component.cpp
 )
-# vrtgen dependency
-FetchContent_Declare(vrtgen
-    GIT_REPOSITORY https://github.com/geontech/vrtgen.git
-    GIT_TAG v0.7.12
+# Includes
+target_include_directories(window
+    PRIVATE
+    ${PROJECT_SOURCE_DIR}/../../../include
+    ${Boost_INCLUDE_DIRS}
 )
-# spdlog dependency
-FetchContent_Declare(spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG v1.14.1
+target_link_libraries(window
+    PRIVATE
+    composite::composite
+    spdlog::spdlog_header_only
+    fftw3f
+    fftw3f_threads
+    fftw3
+    fftw3_threads
 )
-# Make all deps available
-FetchContent_MakeAvailable(composite vrtgen spdlog)
-
-add_subdirectory(src)
+# Install
+install(TARGETS window
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)

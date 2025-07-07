@@ -14,7 +14,7 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #include "component.hpp"
@@ -48,13 +48,19 @@ udp_source::udp_source() : composite::component("udp_source") {
     add_property("interface", &m_interface).configurability(RUNTIME);
     add_property("ip_addr", &m_ip_addr).configurability(RUNTIME);
     add_property("port", &m_port).configurability(RUNTIME);
-    add_property("transport", &m_transport).configurability(RUNTIME).change_listener([this]() {
-        return (m_transport == "sdds") || (m_transport == "vita49");
-    });
     add_property("recv_buf_size", &m_recv_buf_size).units("bytes");
     add_property("num_msgs", &m_num_msgs).configurability(RUNTIME);
-    add_property("msg_size", &m_msg_size).units("bytes").configurability(RUNTIME);
     add_property("frame_count", &m_frame_count).configurability(RUNTIME);
+    add_struct_property("signal_overrides", &m_signal_overrides, [this](auto& set, auto* prop) {
+        set.add_property("center_frequency", &prop->center_frequency);
+        set.add_property("bandwidth", &prop->bandwidth);
+        set.add_property("sample_rate", &prop->sample_rate);
+        set.add_property("is_complex", &prop->is_complex);
+        set.add_property("msg_size", &prop->msg_size).units("bytes");
+        set.add_property("transport", &prop->transport).change_listener([this]() {
+            return (m_signal_overrides.transport == "sdds") || (m_signal_overrides.transport == "vita49");
+        });
+    });
     add_property("socket_mem", &m_socket_mem).configurability(RUNTIME);
     add_property("rx_ring_size", &m_rx_ring_size).configurability(RUNTIME);
     add_property("num_mbufs", &m_num_mbufs).configurability(RUNTIME);
@@ -65,9 +71,6 @@ udp_source::udp_source() : composite::component("udp_source") {
 auto udp_source::property_change_handler() -> void {
     logger()->trace(std::source_location::current().function_name());
     m_receiver.reset();
-    if (m_transport == "sdds") {
-        m_msg_size = 1080; // fixed length protocol
-    }
     auto config = udp::config{
         .logger = logger(),
         .interface = m_interface,
@@ -75,7 +78,6 @@ auto udp_source::property_change_handler() -> void {
         .port = m_port,
         .recv_buf_size = m_recv_buf_size,
         .batch_size = m_num_msgs,
-        .msg_size = m_msg_size,
         .frame_count = m_frame_count,
         .rx_ring_size = m_rx_ring_size,
         .num_mbufs = m_num_mbufs,
@@ -83,6 +85,12 @@ auto udp_source::property_change_handler() -> void {
         .burst_size = m_burst_size,
         .socket_mem = m_socket_mem,
     };
+    if (!m_signal_overrides.transport.empty()) {
+        config.transport = m_signal_overrides.transport;
+    }
+    if (m_signal_overrides.msg_size.has_value()) {
+        config.msg_size = m_signal_overrides.msg_size.value();
+    }
     if (m_socket_type == PACKET_MMAP) {
         m_receiver = std::make_unique<udp::packet_mmap>(config);
     } else if (m_socket_type == DPDK) {
@@ -140,8 +148,9 @@ auto udp_source::process() -> composite::retval {
     }
 
     // Parse packets based on protocol
+    auto meta = m_metadata;
     auto ts = composite::timestamp{};
-    if (m_transport == "sdds") {
+    if (m_receiver->get_transport() == udp::transport::sdds) {
         auto packet = overlay::sdds::overlay(*data);
         auto seq_num = packet.seq_num();
         if (packet.pp_id() && ((seq_num % 32) != 31)) [[unlikely]] {
@@ -157,10 +166,28 @@ auto udp_source::process() -> composite::retval {
             logger()->warn("dropped pkt(s) expected={}, got={}", expected_seq_num, seq_num);
         }
         m_pkt_count = seq_num;
+        meta.format.is_complex = packet.complex();
+        meta.format.type = composite::data_type::signed_integer;
+        meta.format.endianness = std::endian::big;
+        meta.format.bit_width = packet.bps();
+        meta.sample_rate = packet.sample_rate();
+        if (m_signal_overrides.is_complex.has_value()) {
+            meta.format.is_complex = m_signal_overrides.is_complex.value();
+        }
+        if (m_signal_overrides.center_frequency.has_value()) {
+            meta.center_frequency = m_signal_overrides.center_frequency.value();
+        }
+        if (m_signal_overrides.bandwidth.has_value()) {
+            meta.bandwidth = m_signal_overrides.bandwidth.value();
+        }
+        if (m_signal_overrides.sample_rate.has_value()) {
+            meta.sample_rate = m_signal_overrides.sample_rate.value();
+        }
+        meta.annotations["protocol"] = "sdds";
         ts = composite::timestamp{packet.secs(), packet.psecs()};
-        data->erase(data->begin(), data->begin() + 56); // move metadata off
+        std::copy(data->begin() + 56, data->end(), data->begin()); // move metadata off
         data->resize(1024);
-    } else if (m_transport == "vita49") {
+    } else if (m_receiver->get_transport() == udp::transport::vita49) {
         auto packet = overlay::v49::overlay(*data);
         if (packet.is_data()) [[likely]] {
             auto& header = packet.header();
@@ -174,15 +201,54 @@ auto udp_source::process() -> composite::retval {
             if (auto frac_ts = packet.fractional_timestamp()) {
                 ts.picoseconds = frac_ts.value();
             }
-            // data->erase(data->begin(), data->begin() + packet.payload_start()); // move metadata off
+            // std::copy(data->begin() + packet.payload_start(), data->end(), data->begin()); // move metadata off
             std::copy(data->begin() + packet.payload_start(), data->end(), data->begin());
             data->resize(packet.payload_size());
+        } else if (packet.is_context()) {
+            if (auto format = packet.signal_data_format()) {
+                meta.format.is_complex = format->real_complex_type() != vrtgen::packing::DataSampleType::REAL;
+                if (std::to_underlying(format->data_item_format()) <= 0x07) { // signed enumerations
+                    meta.format.type = composite::data_type::signed_integer;
+                } else if (std::to_underlying(format->data_item_format()) >= 0x10) { // unsigned enumerations
+                    meta.format.type = composite::data_type::unsigned_integer;
+                } else {
+                    meta.format.type = composite::data_type::floating_point;
+                }
+                meta.format.bit_width = format->data_item_size();
+                meta.format.endianness = packet.endianness();
+            }
+            meta.center_frequency = packet.rf_frequency().value_or(0);
+            meta.bandwidth = packet.bandwidth().value_or(0);
+            meta.sample_rate = packet.sample_rate().value_or(0);
         }
+        if (m_signal_overrides.is_complex.has_value()) {
+            meta.format.is_complex = m_signal_overrides.is_complex.value();
+        }
+        if (m_signal_overrides.center_frequency.has_value()) {
+            meta.center_frequency = m_signal_overrides.center_frequency.value();
+        }
+        if (m_signal_overrides.bandwidth.has_value()) {
+            meta.bandwidth = m_signal_overrides.bandwidth.value();
+        }
+        if (m_signal_overrides.sample_rate.has_value()) {
+            meta.sample_rate = m_signal_overrides.sample_rate.value();
+        }
+        meta.annotations["protocol"] = "v49";
     }
     m_pkts_processed.fetch_add(1, std::memory_order_relaxed);
 
+    // Send metadata on changes
+    if (m_metadata != meta) {
+        m_metadata = meta;
+        logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+        m_out_port.send_metadata(m_metadata);
+        m_init_metadata = true;
+    }
+
     // Send data
-    m_out_port.send_data(std::move(data), ts);
+    if (m_init_metadata) [[likely]] {
+        m_out_port.send_data(std::move(data), ts);
+    }
     
     return NORMAL;
 }

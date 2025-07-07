@@ -28,6 +28,12 @@
 
 namespace udp {
 
+enum class transport : uint8_t {
+    unknown,
+    sdds,
+    vita49
+}; // enum class transport
+
 /**
  * @brief Configuration parameters for a UDP receiver interface.
  *
@@ -56,6 +62,11 @@ struct config {
      * @brief UDP port to listen on.
      */
     uint16_t port{};
+
+    /**
+     * @brief The transport encapsulation of the UDP data (e.g., "sdds" or "vita49")
+     */
+    std::string transport;
 
     /**
      * @brief Size of the socket receive buffer (in bytes).
@@ -167,6 +178,15 @@ public:
      */
     virtual auto get_stats() -> statistics = 0;
 
+    /**
+     * @brief Get the discovered transport protocol being used
+     * 
+     * @return The transport protocol being received
+     */
+    auto get_transport() const -> transport {
+        return m_transport;
+    }
+
 protected:
     /**
      * @brief Default constructor.
@@ -179,6 +199,11 @@ protected:
      * @brief Logger instance
      */
     std::shared_ptr<spdlog::logger> m_logger;
+
+    /**
+     * @brief Trasnport protocol being received
+     */
+    transport m_transport;
 
 }; // class interface
 

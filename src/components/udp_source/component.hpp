@@ -14,7 +14,7 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #include "socket/interface.hpp"
@@ -52,10 +52,8 @@ private:
     std::string m_socket_type{RECVMMSG};
     std::string m_interface;
     std::string m_ip_addr;
-    uint32_t m_port{};
-    std::string m_transport;
+    uint16_t m_port{};
     uint32_t m_num_msgs{};
-    uint32_t m_msg_size{};
     uint32_t m_frame_count{32768};
     uint32_t m_recv_buf_size{};
     uint16_t m_rx_ring_size{4096};
@@ -65,7 +63,19 @@ private:
     std::string m_socket_mem{"4096"};
     
 
+    struct signal_overrides {
+        std::optional<double> center_frequency;
+        std::optional<double> bandwidth;
+        std::optional<double> sample_rate;
+        std::optional<bool> is_complex;
+        std::string transport;
+        std::optional<uint32_t> msg_size{};
+    }; // struct signal_overrides
+    signal_overrides m_signal_overrides;
+
     // Members
+    composite::metadata m_metadata;
+    bool m_init_metadata{false};
     std::unique_ptr<udp::interface> m_receiver;
     std::jthread m_stat_thread;
     uint16_t m_pkt_count{};
