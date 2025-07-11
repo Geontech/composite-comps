@@ -1,6 +1,9 @@
 #include "helpers.hpp"
 #include "dpdk.hpp"
+
 #include "overlay.hpp"
+// #include "pcapng.hpp"
+#include "pcap_writer_thread.hpp"
 #include "pmr/ring_resource.hpp"
 
 #include <filesystem>
@@ -24,7 +27,7 @@ dpdk_udp::dpdk_udp(const config& config) :
   interface(config.logger),
   m_frame_size(std::bit_ceil(config.msg_size)),
   m_frame_count(config.frame_count),
-  m_resource({.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}) {
+  m_resource({.frame_size=4120, .frame_count=m_frame_count, .alignment=64}) {
     // set defaults if not provided 
     m_rx_ring_size = config.rx_ring_size;
     m_num_mbufs = config.num_mbufs;
@@ -33,7 +36,25 @@ dpdk_udp::dpdk_udp(const config& config) :
     m_socket_mem = config.socket_mem;
     m_interface = config.interface;
     m_ip_addr = config.ip_addr;
-
+    m_port = config.port;
+    if (config.transport == "sdds"){
+        m_transport = transport::sdds;
+        m_frame_size = 2048; 
+        // m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=config.frame_count, .alignment=64});
+    }
+    else if (config.transport == "vita49"){
+        m_transport =  transport::vita49;
+        m_frame_size = 8192;
+    }
+    in_addr inaddr;
+    if (inet_aton(m_ip_addr.c_str(), &inaddr) == 0) {
+        throw std::runtime_error("Invalid IP address format");
+    }
+    m_ip_addr_le = rte_cpu_to_le_32(inaddr.s_addr);
+    m_logger->trace("m_frame_size: {}", m_frame_size);
+    m_frame_size = 4120;
+    m_logger->trace("m_frame_size: {}", m_frame_size);
+    m_transport = transport::vita49;
     m_logger->trace("m_rx_ring_size={}, m_num_mbufs={}, m_mbuf_cache_size={}, m_burst_size={}, m_socket_mem={}",
                     m_rx_ring_size, m_num_mbufs, m_mbuf_cache_size, m_burst_size, m_socket_mem);
 }
@@ -96,8 +117,6 @@ auto dpdk_udp::get_stats() -> statistics {
         stats.avg_pkts_per_burst = stats.total_nb_rx/stats.iterations;
     }
     stats.no_queue = m_no_queue.exchange(0);
-    uint32_t free_count = rte_mempool_avail_count(m_mbuf_pool);
-    m_logger->trace("MBUF_POOL free mbufs: {}", free_count);
 
     rte_eth_stats_reset(m_selected_port);
 
@@ -105,6 +124,7 @@ auto dpdk_udp::get_stats() -> statistics {
 }
 
 auto dpdk_udp::receive(std::stop_token token) -> void {
+    PcapWriterThread pcap_writer_thread(1000000);
     const char* pci_env = std::getenv("PCIDEVICE_INTEL_COM_INTEL_SRIOV_VFIO");
     const char* hostname = std::getenv("HOSTNAME");
     if (!pci_env) {
@@ -284,22 +304,20 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
 
     rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(m_selected_port, &dev_info);
-
-    if (1 >= dev_info.max_rx_queues) {
-        m_logger->error("Queue index {} exceeds max_rx_queues {}", 1, dev_info.max_rx_queues);
-        std::abort();
-    }
-
-    if (m_rx_ring_size % dev_info.rx_desc_lim.nb_align != 0) {
-        m_logger->error("RX ring size {} is not aligned to {}", m_rx_ring_size, dev_info.rx_desc_lim.nb_align);
-        std::abort();
-    }
-
-    if (m_rx_ring_size < dev_info.rx_desc_lim.nb_min || m_rx_ring_size > dev_info.rx_desc_lim.nb_max) {
-        m_logger->error("RX ring size {} is out of valid range [{} - {}]",
-                        m_rx_ring_size, dev_info.rx_desc_lim.nb_min, dev_info.rx_desc_lim.nb_max);
-        std::abort();
+    if (rte_eth_dev_info_get(m_selected_port, &dev_info) == 0){
+        if (1 >= dev_info.max_rx_queues) {
+            m_logger->error("Queue index {} exceeds max_rx_queues {}", 1, dev_info.max_rx_queues);
+            std::abort();
+        }
+        if (m_rx_ring_size % dev_info.rx_desc_lim.nb_align != 0) {
+            m_logger->error("RX ring size {} is not aligned to {}", m_rx_ring_size, dev_info.rx_desc_lim.nb_align);
+            std::abort();
+        }
+        if (m_rx_ring_size < dev_info.rx_desc_lim.nb_min || m_rx_ring_size > dev_info.rx_desc_lim.nb_max) {
+            m_logger->error("RX ring size {} is out of valid range [{} - {}]",
+                            m_rx_ring_size, dev_info.rx_desc_lim.nb_min, dev_info.rx_desc_lim.nb_max);
+            std::abort();
+        }
     }
 
     if (m_mbuf_pool == nullptr) {
@@ -399,6 +417,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
 
     // Receive logic
     m_logger->trace("Starting Rx loop...");
+    
 
     uint8_t queue_id = 0;
     rte_mbuf* pkts[m_burst_size];
@@ -406,63 +425,77 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     uint16_t offset{};
     uint16_t pkt_len{};
     uint16_t payload_len{};
+    int sleep_us = 1;
     auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
-    static float avg_fill = m_burst_size;
 
     while (!token.stop_requested()) {
         uint64_t tsc_start = rte_get_tsc_cycles();
         nb_rx = rte_eth_rx_burst(m_selected_port, queue_id, pkts, m_burst_size);
-        avg_fill = 0.9 * avg_fill + 0.1 * nb_rx;
+        // avg_fill = 0.9 * avg_fill + 0.1 * nb_rx;
         if (nb_rx > 0){
             for (uint16_t i = 0; i < nb_rx; i++) {
                 m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
                 pkt_len = rte_pktmbuf_pkt_len(pkts[i]);
-
+                
                 if (pkt_len < sizeof(struct rte_ether_hdr)) {
                     continue;
                 }
                 uint8_t* pkt_data = rte_pktmbuf_mtod(pkts[i], uint8_t*);
-            
+
                 struct rte_ether_hdr* eth_hdr = (struct rte_ether_hdr*)pkt_data;
                 if (rte_is_broadcast_ether_addr(&eth_hdr->dst_addr)) {
                     continue;
                 }
-            
                 size_t l3_offset = sizeof(struct rte_ether_hdr);
                 uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
-            
                 while (ether_type == RTE_ETHER_TYPE_VLAN) {
-                    if (pkt_len < l3_offset + sizeof(struct rte_vlan_hdr)) continue;;
+                    if (pkt_len < l3_offset + sizeof(struct rte_vlan_hdr)) {
+                        continue;}
                     struct rte_vlan_hdr* vlan_hdr = (struct rte_vlan_hdr*)(pkt_data + l3_offset);
                     ether_type = rte_be_to_cpu_16(vlan_hdr->eth_proto);
                     l3_offset += sizeof(struct rte_vlan_hdr);
                 }
-            
+
                 if (ether_type != RTE_ETHER_TYPE_IPV4) {
                     continue;
                 }
-            
-                if (pkt_len < l3_offset + sizeof(struct rte_ipv4_hdr)) continue;;
-            
+
+                if (pkt_len < l3_offset + sizeof(struct rte_ipv4_hdr)) {
+                    continue;}
                 struct rte_ipv4_hdr* ip_hdr = (struct rte_ipv4_hdr*)(pkt_data + l3_offset);
                 if (ip_hdr->next_proto_id != IPPROTO_UDP) {
                     continue;
                 }
-            
+                if (ip_hdr->dst_addr != m_ip_addr_le) {
+                    continue;
+                }
                 size_t ip_header_len = rte_ipv4_hdr_len(ip_hdr);
                 size_t l4_offset = l3_offset + ip_header_len;
-            
-                if (pkt_len < l4_offset + sizeof(struct rte_udp_hdr)) continue;
-            
+                if (pkt_len < l4_offset + sizeof(struct rte_udp_hdr)) {
+                    continue;
+                }
+                struct rte_udp_hdr* udp_hdr = (struct rte_udp_hdr*)(pkt_data + l4_offset);
+                uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
+                if (dst_port != m_port) {
+                    continue;
+                }
                 offset = l4_offset + sizeof(struct rte_udp_hdr); 
-                if (pkt_len <= offset) continue;
+                if (pkt_len <= offset){ 
+                    continue;}
                 payload_len = pkt_len - offset;
-                
                 auto payload = pkt_data + offset;
                 auto vec = std::make_unique<buffer_t>(allocator);
-                vec->resize(payload_len);
+                try {
+                    vec->resize(payload_len);
+                } catch (const std::exception& e) {
+                    m_logger->error("Failed to resize buffer: {}", e.what());
+                    exit;
+                }
                 rte_memcpy(vec->data(), payload, payload_len);
-
+                // New copy for writing
+                auto copy = std::make_unique<uint8_t[]>(pkt_len);
+                rte_memcpy(copy.get(), pkt_data, pkt_len);
+                pcap_writer_thread.enqueue(std::move(copy), pkt_len);
                 m_queue.push(std::move(vec));
             }
             rte_pktmbuf_free_bulk(pkts, nb_rx);
@@ -472,8 +505,9 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
             m_iterations.fetch_add(1, std::memory_order_relaxed);
         } 
         else {
-            int sleep_us = std::min(100 + (int)((1.0 - (avg_fill / m_burst_size)) * 400), 500);
-            rte_delay_us_block(sleep_us);
+            // int sleep_us = std::min(100 + (int)((1.0 - (avg_fill / m_burst_size)) * 400), 500);
+            // rte_delay_us_block(sleep_us);
+            rte_delay_us_sleep(sleep_us);
         }
     }
 }

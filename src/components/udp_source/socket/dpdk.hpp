@@ -63,7 +63,10 @@ private:
     struct rte_eth_conf m_port_conf;
     uint16_t m_selected_port;
     std::string m_interface;
+    uint16_t m_port;
+    uint32_t m_ip_addr_le;
     std::string m_ip_addr;
+    // std::string m_transport;
     uint16_t m_rx_ring_size{};
     uint32_t m_num_mbufs{};
     uint32_t m_mbuf_cache_size{};

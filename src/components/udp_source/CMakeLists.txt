@@ -34,6 +34,15 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-march=x86-64-v2 -mtune=generic)
 
+include(FetchContent)
+
+FetchContent_Declare(
+  readerwriterqueue
+  GIT_REPOSITORY    https://github.com/cameron314/readerwriterqueue
+  GIT_TAG           master
+)
+
+FetchContent_MakeAvailable(readerwriterqueue)
 # DPDK
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DPDK REQUIRED libdpdk)
@@ -47,6 +56,8 @@ add_library(udp_source MODULE
     helpers.cpp
     overlay.cpp
     pmr/ring_resource.cpp
+    # socket/pcapng.hpp
+    socket/pcap_writer_thread.hpp
 )
 # Includes
 target_include_directories(udp_source
@@ -63,6 +74,7 @@ target_link_libraries(udp_source
     composite::composite
     spdlog::spdlog_header_only
     ${DPDK_LIBRARIES}
+    readerwriterqueue
 )
 # Install
 install(TARGETS udp_source
