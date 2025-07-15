@@ -25,21 +25,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Use FetchContent for dependencies
 include(FetchContent)
 # composite dependency
-FetchContent_Declare(composite
-    GIT_REPOSITORY https://github.com/geontech/composite.git
-    GIT_TAG v0.4.0
-)
+include(cmake/composite.cmake)
 # vrtgen dependency
-FetchContent_Declare(vrtgen
-    GIT_REPOSITORY https://github.com/geontech/vrtgen.git
-    GIT_TAG v0.7.12
-)
+include(cmake/vrtgen.cmake)
 # spdlog dependency
-FetchContent_Declare(spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG v1.14.1
-)
-# Make all deps available
-FetchContent_MakeAvailable(composite vrtgen spdlog)
+include(cmake/spdlog.cmake)
 
 add_subdirectory(src)
