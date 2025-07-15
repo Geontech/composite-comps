@@ -22,6 +22,8 @@
 #include "interface.hpp"
 #include "pmr/ring_resource.hpp"
 #include "processing_queue.hpp"
+#include "pcap_cleaner_thread.hpp"
+#include "pcap_writer_thread.hpp"
 
 #include <atomic>
 #include <composite/timestamp.hpp>
@@ -52,12 +54,6 @@ private:
     uint32_t m_frame_size{};
     uint32_t m_frame_count{};
     ring_resource m_resource;
-    std::atomic<uint32_t> m_pkts_recvd{};
-    std::atomic<uint64_t> m_cycles{};
-    std::atomic<uint32_t> m_iterations{};
-    std::atomic<uint32_t> m_pkts_in_burst{};
-    std::atomic<uint32_t> m_no_queue{};
-    struct rte_eth_stats m_dpdk_stats;
     bool m_eth_dev_configured{false};
     struct rte_mempool* m_mbuf_pool = nullptr;
     struct rte_eth_conf m_port_conf;
@@ -72,6 +68,19 @@ private:
     uint32_t m_mbuf_cache_size{};
     uint32_t m_burst_size{};
     std::string m_socket_mem{};
+
+    // Stats
+    std::atomic<uint32_t> m_pkts_recvd{};
+    std::atomic<uint64_t> m_cycles{};
+    std::atomic<uint32_t> m_iterations{};
+    std::atomic<uint32_t> m_pkts_in_burst{};
+    std::atomic<uint32_t> m_no_queue{};
+    struct rte_eth_stats m_dpdk_stats;
+
+    // Pcap
+    bool m_write_pcap{false};
+    std::unique_ptr<PcapWriterThread> m_pcap_writer_thread;
+    std::unique_ptr<PcapDirectoryCleanerThread> m_cleaner_thread;
 
 }; // class dpdk_udp
 

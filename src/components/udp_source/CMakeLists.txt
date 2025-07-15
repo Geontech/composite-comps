@@ -58,6 +58,7 @@ add_library(udp_source MODULE
     pmr/ring_resource.cpp
     # socket/pcapng.hpp
     socket/pcap_writer_thread.hpp
+    socket/pcap_cleaner_thread.hpp
 )
 # Includes
 target_include_directories(udp_source

@@ -61,6 +61,12 @@ private:
     uint16_t m_mbuf_cache_size{512};
     uint32_t m_burst_size{64};
     std::string m_socket_mem{"4096"};
+
+    // Pcap
+    std::string m_writer_directory{};
+    uint64_t m_packets_per_pcap{};
+    bool m_write_pcap{};
+    uint64_t m_dir_size{};
     
 
     struct signal_overrides {

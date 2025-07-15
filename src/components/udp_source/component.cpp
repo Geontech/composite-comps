@@ -66,6 +66,9 @@ udp_source::udp_source() : composite::component("udp_source") {
     add_property("num_mbufs", &m_num_mbufs).configurability(RUNTIME);
     add_property("mbuf_cache_size", &m_mbuf_cache_size).configurability(RUNTIME);
     add_property("burst_size", &m_burst_size).configurability(RUNTIME);
+    add_property("write_pcap", &m_write_pcap);
+    add_property("packets_per_pcap", &m_packets_per_pcap);
+    add_property("m_dir_size", &m_dir_size);
 }
 
 auto udp_source::property_change_handler() -> void {
@@ -84,6 +87,10 @@ auto udp_source::property_change_handler() -> void {
         .mbuf_cache_size = m_mbuf_cache_size,
         .burst_size = m_burst_size,
         .socket_mem = m_socket_mem,
+        .write_pcap = m_write_pcap,
+        // .dir_size_GB = m_dir_size,
+        // .write_directory = m_writer_directory,
+        // .packets_per_pcap = m_packets_per_pcap
     };
     if (!m_signal_overrides.transport.empty()) {
         config.transport = m_signal_overrides.transport;

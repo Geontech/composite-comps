@@ -113,6 +113,25 @@ struct config {
      */
     std::string socket_mem{};
 
+    /**
+     * @brief Record PCAP
+     */
+    bool write_pcap{};
+
+    /**
+     * @brief Max directory size for pcap recording in integer gigabytes
+     */
+    std::optional<uint64_t> dir_size_GB;
+    /**
+     * @brief Directory to write pcaps to
+     */
+    std::optional<std::string> write_directory;
+    /**
+     * @brief Number of packets per pcap
+     * Lower values may slow performance due to file rotation
+     */
+    std::optional<uint64_t> packets_per_pcap; 
+
 }; // struct config
 
 /**

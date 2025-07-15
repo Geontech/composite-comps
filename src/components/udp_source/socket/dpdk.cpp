@@ -1,13 +1,12 @@
-#include "helpers.hpp"
-#include "dpdk.hpp"
 
-#include "overlay.hpp"
-// #include "pcapng.hpp"
-#include "pcap_writer_thread.hpp"
+#include "helpers.hpp"
+#include "overlay.hpp" //Overlay before dpdk or 'this->INVALID_SOCKET' conflicts
+#include "dpdk.hpp"
 #include "pmr/ring_resource.hpp"
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -57,6 +56,18 @@ dpdk_udp::dpdk_udp(const config& config) :
     m_transport = transport::vita49;
     m_logger->trace("m_rx_ring_size={}, m_num_mbufs={}, m_mbuf_cache_size={}, m_burst_size={}, m_socket_mem={}",
                     m_rx_ring_size, m_num_mbufs, m_mbuf_cache_size, m_burst_size, m_socket_mem);
+    m_logger->trace("Write pcap: {}", config.write_pcap);
+    if (config.write_pcap) {
+        m_write_pcap = true;
+        constexpr uint64_t GB = 1024ULL * 1024 * 1024;
+        uint64_t dir_size = config.dir_size_GB.value_or(1);
+        uint64_t max_bytes = dir_size * GB;
+        std::string write_dir = config.write_directory.value_or("/data/output");
+        m_logger->trace("Cleaner Dir Size: {}", max_bytes);
+        m_pcap_writer_thread = std::make_unique<PcapWriterThread>(config);
+        m_cleaner_thread = std::make_unique<PcapDirectoryCleanerThread>(
+            write_dir, max_bytes, 1);
+    }
 }
 
 dpdk_udp::~dpdk_udp() {
@@ -103,19 +114,19 @@ auto dpdk_udp::get_data(std::shared_ptr<buffer_t>& data) -> bool {
 auto dpdk_udp::get_stats() -> statistics {
     rte_eth_stats_get(m_selected_port, &m_dpdk_stats);
     auto stats = statistics{};
-    stats.pkts_recvd_user = m_pkts_recvd.exchange(0);
-    stats.cycles = m_cycles.exchange(0);
-    if (stats.cycles != 0 && stats.pkts_recvd_user != 0){
-        stats.cycles_per_packet = stats.cycles/stats.pkts_recvd_user;
-    }
+    // stats.pkts_recvd_user = m_pkts_recvd.exchange(0);
+    // stats.cycles = m_cycles.exchange(0);
+    // if (stats.cycles != 0 && stats.pkts_recvd_user != 0){
+    //     stats.cycles_per_packet = stats.cycles/stats.pkts_recvd_user;
+    // }
     stats.pkts_recvd_nic = m_dpdk_stats.ipackets;
     stats.pkts_dropped_nic = m_dpdk_stats.imissed;
     stats.rx_nombuf = m_dpdk_stats.rx_nombuf;
-    stats.total_nb_rx = m_pkts_in_burst.exchange(0);
-    stats.iterations = m_iterations.exchange(0);
-    if (stats.iterations != 0 && stats.total_nb_rx != 0){
-        stats.avg_pkts_per_burst = stats.total_nb_rx/stats.iterations;
-    }
+    // stats.total_nb_rx = m_pkts_in_burst.exchange(0);
+    // stats.iterations = m_iterations.exchange(0);
+    // if (stats.iterations != 0 && stats.total_nb_rx != 0){
+    //     stats.avg_pkts_per_burst = stats.total_nb_rx/stats.iterations;
+    // }
     stats.no_queue = m_no_queue.exchange(0);
 
     rte_eth_stats_reset(m_selected_port);
@@ -124,7 +135,6 @@ auto dpdk_udp::get_stats() -> statistics {
 }
 
 auto dpdk_udp::receive(std::stop_token token) -> void {
-    PcapWriterThread pcap_writer_thread(1000000);
     const char* pci_env = std::getenv("PCIDEVICE_INTEL_COM_INTEL_SRIOV_VFIO");
     const char* hostname = std::getenv("HOSTNAME");
     if (!pci_env) {
@@ -429,12 +439,12 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
     auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
 
     while (!token.stop_requested()) {
-        uint64_t tsc_start = rte_get_tsc_cycles();
+        // uint64_t tsc_start = rte_get_tsc_cycles();
         nb_rx = rte_eth_rx_burst(m_selected_port, queue_id, pkts, m_burst_size);
         // avg_fill = 0.9 * avg_fill + 0.1 * nb_rx;
         if (nb_rx > 0){
             for (uint16_t i = 0; i < nb_rx; i++) {
-                m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
+                // m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
                 pkt_len = rte_pktmbuf_pkt_len(pkts[i]);
                 
                 if (pkt_len < sizeof(struct rte_ether_hdr)) {
@@ -448,7 +458,7 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
                 }
                 size_t l3_offset = sizeof(struct rte_ether_hdr);
                 uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
-                while (ether_type == RTE_ETHER_TYPE_VLAN) {
+                if (ether_type == RTE_ETHER_TYPE_VLAN) {
                     if (pkt_len < l3_offset + sizeof(struct rte_vlan_hdr)) {
                         continue;}
                     struct rte_vlan_hdr* vlan_hdr = (struct rte_vlan_hdr*)(pkt_data + l3_offset);
@@ -492,22 +502,23 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
                     exit;
                 }
                 rte_memcpy(vec->data(), payload, payload_len);
-                // New copy for writing
-                auto copy = std::make_unique<uint8_t[]>(pkt_len);
-                rte_memcpy(copy.get(), pkt_data, pkt_len);
-                pcap_writer_thread.enqueue(std::move(copy), pkt_len);
+                if (m_write_pcap) {
+                    auto copy = std::make_unique<uint8_t[]>(pkt_len);
+                    rte_memcpy(copy.get(), pkt_data, pkt_len);
+                    m_pcap_writer_thread->enqueue(std::move(copy), pkt_len);
+                }
                 m_queue.push(std::move(vec));
             }
             rte_pktmbuf_free_bulk(pkts, nb_rx);
-            uint64_t tsc_end = rte_get_tsc_cycles();
-            m_cycles.fetch_add(tsc_end-tsc_start, std::memory_order_relaxed);
-            m_pkts_in_burst.fetch_add(nb_rx, std::memory_order_relaxed);
-            m_iterations.fetch_add(1, std::memory_order_relaxed);
+            // uint64_t tsc_end = rte_get_tsc_cycles();
+            // m_cycles.fetch_add(tsc_end-tsc_start, std::memory_order_relaxed);
+            // m_pkts_in_burst.fetch_add(nb_rx, std::memory_order_relaxed);
+            // m_iterations.fetch_add(1, std::memory_order_relaxed);
         } 
         else {
             // int sleep_us = std::min(100 + (int)((1.0 - (avg_fill / m_burst_size)) * 400), 500);
-            // rte_delay_us_block(sleep_us);
-            rte_delay_us_sleep(sleep_us);
+            rte_delay_us_block(sleep_us);
+            // rte_delay_us_sleep(sleep_us);
         }
     }
 }
