@@ -326,7 +326,11 @@ auto overlay::payload_size() const -> size_t {
     if (!m_positions.contains("payload")) {
         return {};
     }
-    auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - m_positions.at("payload");
+    auto pos = m_positions.at("payload");
+    if (m_is_vrl) {
+        pos -= sizeof(uint32_t)/*VRLP*/ + sizeof(uint32_t)/*frame word*/;
+    }
+    auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - pos;
     if (m_trailer.has_value()) {
         size -= sizeof(uint32_t);
     }
