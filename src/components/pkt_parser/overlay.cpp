@@ -102,7 +102,7 @@ auto overlay::payload() const -> std::span<const T> {
 
 namespace v49 {
 
-overlay::overlay(std::span<uint8_t> data) : m_data(data) {
+overlay::overlay(std::span<const uint8_t> data) : m_data(data) {
     auto curr_idx = std::size_t{};
     auto v49_header_pos = curr_idx;
     // Check for VRL frame
@@ -187,11 +187,11 @@ overlay::overlay(std::span<uint8_t> data) : m_data(data) {
                 m_trailer->unpack_from(m_data.data() + pos);
             }
         }
-        
+
         // Check for needed q/i to i/q swap
         auto pos = m_positions.at("payload");
         auto len = payload_size();
-        swap_iq({m_data.data() + pos, len});
+        // swap_iq({m_data.data() + pos, len});
     } else if (is_context()) {
         m_cif0 = vrtgen::packing::CIF0{};
         if (m_little_endian) {

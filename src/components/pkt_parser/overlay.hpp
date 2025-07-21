@@ -68,7 +68,7 @@ namespace v49 {
 
 class overlay {
 public:
-    explicit overlay(std::span<uint8_t> data);
+    explicit overlay(std::span<const uint8_t> data);
 
     auto is_vrl() const -> bool;
     auto is_data() const -> bool;
@@ -96,7 +96,7 @@ private:
     auto swap_iq_avx2(std::span<uint8_t>) -> void;
     auto swap_iq_avx512(std::span<uint8_t>) -> void;
 
-    std::span<uint8_t> m_data;
+    std::span<const uint8_t> m_data;
     std::map<std::string, std::size_t> m_positions;
     bool m_is_vrl{false};
     bool m_little_endian{false};
