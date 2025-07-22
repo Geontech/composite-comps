@@ -41,7 +41,18 @@ pkt_parser::pkt_parser() : composite::component("pkt_parser") {
         set.add_property("center_frequency", &prop->center_frequency);
         set.add_property("bandwidth", &prop->bandwidth);
         set.add_property("sample_rate", &prop->sample_rate);
-        set.add_property("is_complex", &prop->is_complex);
+        set.add_struct_property("data_format", &prop->data_format, [this](auto& set, auto* prop) {
+            set.add_property("is_complex", &prop->is_complex);
+            set.add_property("type", &prop->type).change_listener([this]() {
+                return (m_signal_overrides.data_format.type == "signed_integer") ||
+                       (m_signal_overrides.data_format.type == "unsigned_integer") ||
+                       (m_signal_overrides.data_format.type == "floating_point");
+            });
+            set.add_property("bit_width", &prop->bit_width);
+            set.add_property("endianness", &prop->endianness).change_listener([this]() {
+                return (m_signal_overrides.data_format.type == "big") || (m_signal_overrides.data_format.type == "little");
+            });
+        });
         set.add_property("transport", &prop->transport).change_listener([this]() {
             return (m_signal_overrides.transport == "sdds") || (m_signal_overrides.transport == "vita49");
         });
@@ -97,8 +108,8 @@ auto pkt_parser::process() -> composite::retval {
         meta.format.endianness = std::endian::big;
         meta.format.bit_width = packet.bps();
         meta.sample_rate = packet.sample_rate();
-        if (m_signal_overrides.is_complex.has_value()) {
-            meta.format.is_complex = m_signal_overrides.is_complex.value();
+        if (m_signal_overrides.data_format.is_complex.has_value()) {
+            meta.format.is_complex = m_signal_overrides.data_format.is_complex.value();
         }
         if (m_signal_overrides.center_frequency.has_value()) {
             meta.center_frequency = m_signal_overrides.center_frequency.value();
@@ -146,8 +157,27 @@ auto pkt_parser::process() -> composite::retval {
             meta.bandwidth = packet.bandwidth().value_or(0);
             meta.sample_rate = packet.sample_rate().value_or(0);
         }
-        if (m_signal_overrides.is_complex.has_value()) {
-            meta.format.is_complex = m_signal_overrides.is_complex.value();
+        if (m_signal_overrides.data_format.is_complex.has_value()) {
+            meta.format.is_complex = m_signal_overrides.data_format.is_complex.value();
+        }
+        if (!m_signal_overrides.data_format.type.empty()) {
+            if (m_signal_overrides.data_format.type == "signed_integer") {
+                meta.format.type = composite::data_type::signed_integer;
+            } else if (m_signal_overrides.data_format.type == "unsigned_integer") {
+                meta.format.type = composite::data_type::unsigned_integer;
+            } else if (m_signal_overrides.data_format.type == "floating_point") {
+                meta.format.type = composite::data_type::floating_point;
+            }
+        }
+        if (m_signal_overrides.data_format.bit_width > 0) {
+            meta.format.bit_width = m_signal_overrides.data_format.bit_width;
+        }
+        if (!m_signal_overrides.data_format.endianness.empty()) {
+            if (m_signal_overrides.data_format.type == "big") {
+                meta.format.endianness = std::endian::big;
+            } else if (m_signal_overrides.data_format.type == "little") {
+                meta.format.endianness = std::endian::little;
+            }
         }
         if (m_signal_overrides.center_frequency.has_value()) {
             meta.center_frequency = m_signal_overrides.center_frequency.value();

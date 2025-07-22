@@ -54,11 +54,17 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Properties
+    struct format {
+        std::optional<bool> is_complex;
+        std::string type;
+        uint32_t bit_width{};
+        std::string endianness;
+    }; // struct format
     struct signal_overrides {
         std::optional<double> center_frequency;
         std::optional<double> bandwidth;
         std::optional<double> sample_rate;
-        std::optional<bool> is_complex;
+        format data_format;
         std::string transport;
     }; // struct signal_overrides
     signal_overrides m_signal_overrides;

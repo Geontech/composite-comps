@@ -174,6 +174,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
 
+    auto msgs_recvd = std::size_t{};
     while (!token.stop_requested()) {
         if (auto poll_res = ::poll(&pfd, 1, 1/*ms*/); poll_res <= 0) {
             continue;
@@ -182,12 +183,12 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         if (pfd.revents & POLLIN) [[likely]] {
             // Call recvmmsg
             struct timespec ts{.tv_sec=0, .tv_nsec=100'000}; // 100 us
-            auto msgs_recvd = std::size_t{};
-            while (!token.stop_requested() && (msgs_recvd < m_batch_size)) {
-                if (auto recvd = ::recvmmsg(m_socket, &msgs[msgs_recvd], m_batch_size - msgs_recvd, 0, &ts); recvd > 0) {
-                    msgs_recvd += recvd;
-                    m_pkts_recvd.fetch_add(recvd, std::memory_order_relaxed);
-                }
+            if (auto recvd = ::recvmmsg(m_socket, &msgs[msgs_recvd], m_batch_size - msgs_recvd, 0, &ts); recvd > 0) {
+                msgs_recvd += recvd;
+                m_pkts_recvd.fetch_add(recvd, std::memory_order_relaxed);
+            }
+            if (msgs_recvd < m_batch_size) {
+                continue;
             }
 
             // Place onto queue
@@ -200,8 +201,10 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                 buffers[i]->resize(m_frame_size);
                 iovecs[i].iov_base = buffers[i]->data();
             }
+            msgs_recvd = 0;
         }
     }
+
 }
 
 } // namespace udp
