@@ -48,7 +48,7 @@ public:
     ~stov() override = default;
 
     auto property_change_handler() -> void override {
-        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
+        if constexpr (std::is_same_v<T, std::complex<float>>) {
             m_converter = converter<int16_t, float>(m_byteswap);
         } else {
             m_converter = converter<int16_t, int16_t>(m_byteswap);
@@ -84,19 +84,30 @@ public:
                 m_out_port.send_metadata(m_metadata);
             }
         }
-        auto bit_len = std::size_t{256};
-        if (__builtin_cpu_supports("avx512f")) {
-            bit_len = std::size_t{512};
-        }
+        auto bit_len = __builtin_cpu_supports("avx512f") ? std::size_t{512} : std::size_t{256};
         auto stride = size_t{bit_len / 8u / sizeof(T)};
         auto data_ci16 = reinterpret_cast<std::complex<int16_t>*>(data->data());
         auto data_ci16_len = data->size() / sizeof(std::complex<int16_t>);
         for (auto i=0u; i < data_ci16_len; i += stride) {
             if (m_output_buf == nullptr) {
                 m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
-                m_output_ts = ts;
+                if (i == 0) {
+                    m_output_ts = ts;
+                } else {
+                    // calculate timestamp
+                    const auto ps_per_sec = uint64_t{1'000'000'000'000};
+                    const auto xdelta = 1. / m_metadata.sample_rate;
+                    const auto sample_ps = i * xdelta * ps_per_sec;
+                    m_output_ts.seconds = ts.seconds;
+                    m_output_ts.picoseconds = ts.picoseconds + sample_ps;
+                    if (m_output_ts.picoseconds > ps_per_sec) {
+                        m_output_ts.seconds += 1;
+                        m_output_ts.picoseconds = m_output_ts.picoseconds % ps_per_sec;
+                    }
+                    logger()->info("xdelta: {}, curr_idx={}, ts={}.{} sample_ps={} new_ts={}.{}", xdelta, i, ts.seconds, ts.picoseconds, sample_ps, m_output_ts.seconds, m_output_ts.picoseconds);
+                }
             }
-            if constexpr (std::is_same_v<T, float> || std::is_same_v<T, std::complex<float>>) {
+            if constexpr (std::is_same_v<T, std::complex<float>>) {
                 std::get<0>(m_converter).process(
                     reinterpret_cast<const int16_t*>(data_ci16 + i),
                     reinterpret_cast<float*>(m_output_buf->data() + m_output_idx)
@@ -127,7 +138,7 @@ private:
     bool m_byteswap{true};
 
     // Members
-    std::variant<converter<int16_t, float>, converter<int16_t, int16_t>> m_converter;
+    std::variant<converter<int16_t, float>, converter<int16_t, int16_t>, converter<float, float>> m_converter;
     std::unique_ptr<output_t> m_output_buf;
     composite::metadata m_metadata;
     uint32_t m_output_idx{};
