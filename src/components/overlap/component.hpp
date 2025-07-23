@@ -28,6 +28,7 @@
 #include <spdlog/spdlog.h>
 #include <variant>
 #include <vector>
+#include <cmath>  // for std::fmod and std::round
 
 #include <chrono>
 
@@ -58,14 +59,14 @@ public:
         // using namespace std::chrono;
         using enum composite::retval;
     
-        // const auto start = steady_clock::now();
-    
         auto [data, ts, meta] = m_in_port.get_data();
         if (!data) return NORMAL;
     
         if (meta.has_value()) {
             if (m_metadata != meta.value()) {
                 m_metadata = meta.value();
+                // if packet_drop
+                // m_output_idx = 0
                 m_out_port.send_metadata(m_metadata);
             }
         }
@@ -73,6 +74,12 @@ public:
         auto* input_ptr = data->data();
         auto input_len = data->size();
         size_t offset = 0;
+
+        if (!m_overlap_packet_boundary_checked){
+            logger()->info("Checking packet boundary");
+            check_overlap_alignment(input_len);
+            m_overlap_packet_boundary_checked = true;
+        }
 
         while (offset < input_len) {
             if (!m_output_buf) {
@@ -92,8 +99,12 @@ public:
                 copy_count * sizeof(typename overlap_t::value_type)
             );
 
+            if (m_output_idx == m_overlap_count){
+                m_next_frame_ts = ts;
+            }
             m_output_idx += copy_count;
             offset += copy_count;
+            
 
             if (m_output_idx == m_window_size) {
                 auto new_buf = aligned::make_aligned<typename overlap_t::value_type>(64, m_window_size);
@@ -108,32 +119,44 @@ public:
 
                 m_output_buf = std::move(new_buf);
                 m_output_idx = m_overlap_count;
-                m_output_ts = ts;
-                // ++m_total_windows_sent;
+                m_output_ts = m_next_frame_ts;
             }
         }
-        // const auto duration = steady_clock::now() - start;
-        // m_total_duration += duration;
-        // ++m_total_process_calls;
-    
-        // const auto now = steady_clock::now();
-        // if (now - m_last_log_time > seconds(5)) {
-        //     double avg_us = duration_cast<microseconds>(m_total_duration).count() / static_cast<double>(m_total_process_calls);
-        //     logger()->info("[overlap] avg process time: {:.2f} µs over {} calls, {} windows emitted",
-        //                    avg_us, m_total_process_calls, m_total_windows_sent);
-        //     m_last_log_time = now;
-        //     m_total_duration = nanoseconds{0};
-        //     m_total_process_calls = 0;
-        //     m_total_windows_sent = 0;
-        // }
     
         return NORMAL;
     }
-    
-    
+
     
 
 private:
+    void check_overlap_alignment(uint32_t input_len) {
+        double percentage = m_overlap_percentage / 100.0;
+        double overlap_samples = percentage * static_cast<double>(m_window_size);
+
+        // Only adjust if not already aligned
+        if (std::fmod(overlap_samples, static_cast<double>(input_len)) != 0.0) {
+            // Compute nearest higher alignment
+            double remainder = std::fmod(overlap_samples, static_cast<double>(input_len));
+            double adjusted_overlap = overlap_samples - remainder + input_len;
+
+            m_overlap_percentage = (adjusted_overlap / static_cast<double>(m_window_size)) * 100.0;
+
+            logger()->info("Auto-adjusted overlap from {:.4f}% to {:.4f}% for packet-aligned stride ({} samples)",
+                        percentage * 100.0,
+                        m_overlap_percentage,
+                        input_len);
+        } else {
+            logger()->info("Overlap {:.4f}% already aligned to packet stride ({} samples)",
+                        percentage * 100.0,
+                        input_len);
+        }
+
+        // Always recalculate overlap_count
+        m_overlap_count = static_cast<uint32_t>(
+            std::round(static_cast<double>(m_window_size) * (m_overlap_percentage / 100.0))
+        );
+    }
+
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
@@ -143,18 +166,13 @@ private:
     composite::metadata m_metadata;
     std::unique_ptr<overlap_t> m_output_buf;
     composite::timestamp m_output_ts;
+    composite::timestamp m_next_frame_ts;
     
 
     // Properties
     uint32_t m_window_size{65536};
-    uint32_t m_overlap_percentage{50};
+    double m_overlap_percentage{50};
     uint32_t m_overlap_count = m_window_size * m_overlap_percentage / 100;
-
-    // Timing / profiling
-    std::chrono::steady_clock::time_point m_last_log_time{};
-    uint64_t m_total_process_calls{0};
-    uint64_t m_total_windows_sent{0};
-    std::chrono::nanoseconds m_total_duration{};
-
+    bool m_overlap_packet_boundary_checked{false};
 
 }; // class overlap
