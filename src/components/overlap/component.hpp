@@ -56,77 +56,108 @@ public:
     }
 
     auto process() -> composite::retval override {
-        // using namespace std::chrono;
         using enum composite::retval;
     
         auto [data, ts, meta] = m_in_port.get_data();
         if (!data) return NORMAL;
     
-        if (meta.has_value()) {
-            if (m_metadata != meta.value()) {
-                m_metadata = meta.value();
-                // if packet_drop
-                // m_output_idx = 0
-                m_out_port.send_metadata(m_metadata);
-            }
+        if (meta.has_value() && m_metadata != meta.value()) {
+            m_metadata = meta.value();
+            m_out_port.send_metadata(m_metadata);
         }
     
         auto* input_ptr = data->data();
         auto input_len = data->size();
-        size_t offset = 0;
-
-        if (!m_overlap_packet_boundary_checked){
+    
+        if (!m_overlap_packet_boundary_checked) {
             logger()->info("Checking packet boundary");
-            check_overlap_alignment(input_len);
+            check_overlap_alignment(input_len); 
             m_overlap_packet_boundary_checked = true;
         }
-
-        while (offset < input_len) {
-            if (!m_output_buf) {
-                m_output_buf = aligned::make_aligned<typename overlap_t::value_type>(64, m_window_size);
-                m_output_idx = 0;
-                m_output_ts = ts;
-            }
-            auto space_left = m_window_size - m_output_idx;
-            auto copy_count = std::min<std::size_t>(
-                static_cast<std::size_t>(space_left),
-                input_len - offset
-            );
-
-            std::memcpy(
-                m_output_buf->data() + m_output_idx,
-                input_ptr + offset,
-                copy_count * sizeof(typename overlap_t::value_type)
-            );
-
-            if (m_output_idx == m_overlap_count){
-                m_next_frame_ts = ts;
-            }
-            m_output_idx += copy_count;
-            offset += copy_count;
-            
-
-            if (m_output_idx == m_window_size) {
-                auto new_buf = aligned::make_aligned<typename overlap_t::value_type>(64, m_window_size);
-
-                std::memcpy(
-                    new_buf->data(),
-                    m_output_buf->data() + (m_window_size - m_overlap_count),
-                    m_overlap_count * sizeof(typename overlap_t::value_type)
-                );                
-
-                m_out_port.send_data(std::move(m_output_buf), m_output_ts);
-
-                m_output_buf = std::move(new_buf);
-                m_output_idx = m_overlap_count;
-                m_output_ts = m_next_frame_ts;
-            }
+    
+        // Initialize ring and state
+        if (!m_ring_initialized) {
+            m_ring_size = m_window_size * 2; // Headroom for wrap
+            m_ring_buf = aligned::make_aligned<std::complex<T>>(64, m_ring_size);
+            m_ring_head = 0;
+            m_ring_count = 0;
+            m_stride = m_window_size - m_overlap_count;
+            logger()->info("m_stride: {}", m_stride);
+            m_ring_initialized = true;
+            m_output_ts = ts;
         }
     
+        size_t offset = 0;
+        size_t samples_remaining = input_len;
+
+        while (samples_remaining > 0) {
+            size_t space_to_end = m_ring_size - m_ring_head;
+
+            if (samples_remaining <= space_to_end) {
+                // Contiguous write
+                std::memcpy(
+                    m_ring_buf->data() + m_ring_head,
+                    input_ptr + offset,
+                    samples_remaining * sizeof(std::complex<T>)
+                );
+                m_ring_head += samples_remaining;
+                m_ring_count += samples_remaining;
+                offset += samples_remaining;
+                samples_remaining = 0;
+            } else {
+                // Wraparound write
+                std::memcpy(
+                    m_ring_buf->data() + m_ring_head,
+                    input_ptr + offset,
+                    space_to_end * sizeof(std::complex<T>)
+                );
+                std::memcpy(
+                    m_ring_buf->data(),
+                    input_ptr + offset + space_to_end,
+                    (samples_remaining - space_to_end) * sizeof(std::complex<T>)
+                );
+                m_ring_head = samples_remaining - space_to_end;
+                m_ring_count += samples_remaining;
+                offset += samples_remaining;
+                samples_remaining = 0;
+            }
+
+            m_ring_head %= m_ring_size;
+
+            // Drain full windows
+            while (m_ring_count >= m_window_size) {
+                auto output = aligned::make_aligned<std::complex<T>>(64, m_window_size);
+                size_t start = (m_ring_head + m_ring_size - m_window_size) % m_ring_size;
+
+                if (start + m_window_size <= m_ring_size) {
+                    std::memcpy(
+                        output->data(),
+                        m_ring_buf->data() + start,
+                        m_window_size * sizeof(std::complex<T>)
+                    );
+                } else {
+                    size_t first = m_ring_size - start;
+                    size_t second = m_window_size - first;
+                    std::memcpy(
+                        output->data(),
+                        m_ring_buf->data() + start,
+                        first * sizeof(std::complex<T>)
+                    );
+                    std::memcpy(
+                        output->data() + first,
+                        m_ring_buf->data(),
+                        second * sizeof(std::complex<T>)
+                    );
+                }
+
+                m_out_port.send_data(std::move(output), m_output_ts);
+                m_output_ts = ts;
+                m_ring_count -= m_stride;
+            }
+        }
+
         return NORMAL;
     }
-
-    
 
 private:
     void check_overlap_alignment(uint32_t input_len) {
@@ -174,5 +205,12 @@ private:
     double m_overlap_percentage{50};
     uint32_t m_overlap_count = m_window_size * m_overlap_percentage / 100;
     bool m_overlap_packet_boundary_checked{false};
+    std::unique_ptr<aligned::aligned_mem<std::complex<T>>> m_ring_buf;
+    std::size_t m_ring_size = 0;
+    std::size_t m_ring_head = 0;
+    std::size_t m_ring_count = 0; // samples currently in ring
+    std::size_t m_stride = 0;     // window_size - overlap_count
+    bool m_ring_initialized = false;
+
 
 }; // class overlap
