@@ -104,7 +104,6 @@ public:
                         m_output_ts.seconds += 1;
                         m_output_ts.picoseconds = m_output_ts.picoseconds % ps_per_sec;
                     }
-                    logger()->info("xdelta: {}, curr_idx={}, ts={}.{} sample_ps={} new_ts={}.{}", xdelta, i, ts.seconds, ts.picoseconds, sample_ps, m_output_ts.seconds, m_output_ts.picoseconds);
                 }
             }
             if constexpr (std::is_same_v<T, std::complex<float>>) {

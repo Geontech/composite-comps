@@ -70,7 +70,7 @@ private:
     signal_overrides m_signal_overrides;
 
     // Members
-    transport m_transport;
+    transport m_transport{};
     composite::metadata m_metadata;
     bool m_init_metadata{};
     uint16_t m_pkt_count{};

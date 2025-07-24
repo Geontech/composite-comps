@@ -287,6 +287,11 @@ auto overlay::is_data() const -> bool {
     return m_header.packet_type() == SIGNAL_DATA || m_header.packet_type() == SIGNAL_DATA_STREAM_ID;
 }
 
+auto overlay::is_ext_data() const -> bool {
+    using enum vrtgen::packing::PacketType;
+    return m_header.packet_type() == EXTENSION_DATA || m_header.packet_type() == EXTENSION_DATA_STREAM_ID;
+}
+
 auto overlay::is_context() const -> bool {
     using enum vrtgen::packing::PacketType;
     return m_header.packet_type() == CONTEXT;

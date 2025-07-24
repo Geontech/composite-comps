@@ -50,7 +50,7 @@ pkt_parser::pkt_parser() : composite::component("pkt_parser") {
             });
             set.add_property("bit_width", &prop->bit_width);
             set.add_property("endianness", &prop->endianness).change_listener([this]() {
-                return (m_signal_overrides.data_format.type == "big") || (m_signal_overrides.data_format.type == "little");
+                return (m_signal_overrides.data_format.endianness == "big") || (m_signal_overrides.data_format.endianness == "little");
             });
         });
         set.add_property("transport", &prop->transport).change_listener([this]() {
@@ -81,7 +81,33 @@ auto pkt_parser::process() -> composite::retval {
 
     // Have we determined the protocol?
     if (m_transport == transport::unknown) {
-
+        if (data->size() == 1080) { // likely sdds
+            // Overlay SDDS
+            auto packet = overlay::sdds::overlay(*data);
+            auto sf = packet.standard_format();
+            auto dm = packet.data_mode();
+            auto bps = packet.bps();
+            auto valid_dm = (dm == 0 && bps == 4) ||
+                            (dm == 1 && bps == 8) ||
+                            (dm == 2 && bps == 16) ||
+                            (dm == 5 && bps == 8) ||
+                            (dm == 6 && bps == 16);
+            logger()->trace("SDDS standard_format={} data_mode={}, bps={}", sf, dm, bps);
+            if (valid_dm) {
+                m_transport = transport::sdds;
+            }
+        }
+        if (m_transport == transport::unknown) { // not sdds
+            // Can't be SDDS, so overlay V49 and check the headers
+            auto packet = overlay::v49::overlay(*data);
+            if (packet.is_data() || packet.is_ext_data() || packet.is_context()) {
+                m_transport = transport::vita49;
+            } else {
+                logger()->warn("unknown pkt protocol; dumping data and continuing");
+                return NORMAL;
+            }
+        }
+        logger()->trace("discovered transport protocol: {}", m_transport == transport::sdds ? "sdds" : "vita49");
     }
 
     // Parse packets based on protocol
