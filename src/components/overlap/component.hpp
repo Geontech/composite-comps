@@ -16,9 +16,8 @@
 * You should have received a copy of the GNU Lesser General Public License
 * along with this program.  If not, see http://www.gnu.org/licenses/.
 */
-#include "convert.hpp"
+
 #include <aligned_mem.hpp>
-#include <readerwriterqueue.h>
 
 #include <algorithm>
 #include <composite/component.hpp>
@@ -28,9 +27,10 @@
 #include <spdlog/spdlog.h>
 #include <variant>
 #include <vector>
-#include <cmath>  // for std::fmod and std::round
+#include <cmath>
 
 #include <chrono>
+
 
 template <typename T>
 class overlap : public composite::component {
@@ -60,33 +60,58 @@ public:
     
         auto [data, ts, meta] = m_in_port.get_data();
         if (!data) return NORMAL;
-    
+        
         if (meta.has_value() && m_metadata != meta.value()) {
             m_metadata = meta.value();
-            m_out_port.send_metadata(m_metadata);
+            // logger()->trace("received metadata:\n{}", meta->to_string());
+                if (meta->sample_rate < 0.0) {
+                    return NORMAL;
+                }
+            // if (meta->WHATEVER_VALUE_FOR_BREAK_IN_SEQUENCE_NUMBERS){
+            //     reset_ring(ts);
+            // }
+            m_out_port.send_metadata(meta.value());
+        }
+        if (m_metadata.sample_rate == 0.0) {
+            return NORMAL;
         }
     
         auto* input_ptr = data->data();
         auto input_len = data->size();
     
-        if (!m_overlap_packet_boundary_checked) {
-            logger()->info("Checking packet boundary");
-            check_overlap_alignment(input_len); 
-            m_overlap_packet_boundary_checked = true;
-        }
-    
         // Initialize ring and state
         if (!m_ring_initialized) {
             m_ring_size = m_window_size * 2; // Headroom for wrap
-            m_ring_buf = aligned::make_aligned<std::complex<T>>(64, m_ring_size);
-            m_ring_head = 0;
-            m_ring_count = 0;
-            m_stride = m_window_size - m_overlap_count;
-            logger()->info("m_stride: {}", m_stride);
             m_ring_initialized = true;
-            m_output_ts = ts;
+            m_ring_buf = aligned::make_aligned<std::complex<T>>(64, m_ring_size);
+            reset_ring(ts);
+            // m_overlap_count = static_cast<uint32_t>(
+            //     std::round(m_window_size * m_overlap_percentage / 100.0)
+            // );            
+            // m_ring_head = 0;
+            // m_ring_count = 0;
+            // m_stride = m_window_size - m_overlap_count;
+            // m_output_ts = ts;
+            // m_next_window_start_sample = 0;
+            // m_picoseconds_per_sample = (1. / m_metadata.sample_rate) * 1'000'000'000'000;
         }
-    
+
+        size_t packet_start_sample = m_total_samples_seen;
+        size_t packet_end_sample = m_total_samples_seen + input_len;
+        // Check if the window starting point lands inside this packet
+        if (m_next_window_start_sample >= packet_start_sample &&
+            m_next_window_start_sample < packet_end_sample) {
+                const auto ps_per_sec = uint64_t{1'000'000'000'000};
+                size_t offset_within_packet = m_next_window_start_sample - packet_start_sample;
+                const auto sample_ps = offset_within_packet * m_picoseconds_per_sample;
+                m_next_output_ts.seconds = ts.seconds;
+                m_next_output_ts.picoseconds = ts.picoseconds + sample_ps;
+                if (m_next_output_ts.picoseconds > ps_per_sec) {
+                    m_next_output_ts.seconds += 1;
+                    m_next_output_ts.picoseconds = m_next_output_ts.picoseconds % ps_per_sec;
+                }
+            }      
+
         size_t offset = 0;
         size_t samples_remaining = input_len;
 
@@ -151,7 +176,7 @@ public:
                 }
 
                 m_out_port.send_data(std::move(output), m_output_ts);
-                m_output_ts = ts;
+                m_output_ts = m_next_output_ts;
                 m_ring_count -= m_stride;
             }
         }
@@ -160,34 +185,18 @@ public:
     }
 
 private:
-    void check_overlap_alignment(uint32_t input_len) {
-        double percentage = m_overlap_percentage / 100.0;
-        double overlap_samples = percentage * static_cast<double>(m_window_size);
-
-        // Only adjust if not already aligned
-        if (std::fmod(overlap_samples, static_cast<double>(input_len)) != 0.0) {
-            // Compute nearest higher alignment
-            double remainder = std::fmod(overlap_samples, static_cast<double>(input_len));
-            double adjusted_overlap = overlap_samples - remainder + input_len;
-
-            m_overlap_percentage = (adjusted_overlap / static_cast<double>(m_window_size)) * 100.0;
-
-            logger()->info("Auto-adjusted overlap from {:.4f}% to {:.4f}% for packet-aligned stride ({} samples)",
-                        percentage * 100.0,
-                        m_overlap_percentage,
-                        input_len);
-        } else {
-            logger()->info("Overlap {:.4f}% already aligned to packet stride ({} samples)",
-                        percentage * 100.0,
-                        input_len);
-        }
-
-        // Always recalculate overlap_count
+    void reset_ring(composite::timestamp ts){
         m_overlap_count = static_cast<uint32_t>(
-            std::round(static_cast<double>(m_window_size) * (m_overlap_percentage / 100.0))
-        );
+            std::round(m_window_size * m_overlap_percentage / 100.0)
+        );            
+        m_ring_head = 0;
+        m_ring_count = 0;
+        m_stride = m_window_size - m_overlap_count;
+        m_output_ts = ts;
+        m_next_window_start_sample = 0;
+        m_total_samples_seen = 0;
+        m_picoseconds_per_sample = (1. / m_metadata.sample_rate) * 1'000'000'000'000;
     }
-
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
@@ -197,20 +206,24 @@ private:
     composite::metadata m_metadata;
     std::unique_ptr<overlap_t> m_output_buf;
     composite::timestamp m_output_ts;
-    composite::timestamp m_next_frame_ts;
+    composite::timestamp m_next_output_ts;
     
 
     // Properties
     uint32_t m_window_size{65536};
     double m_overlap_percentage{50};
     uint32_t m_overlap_count = m_window_size * m_overlap_percentage / 100;
-    bool m_overlap_packet_boundary_checked{false};
+    // bool m_overlap_packet_boundary_checked{false};
     std::unique_ptr<aligned::aligned_mem<std::complex<T>>> m_ring_buf;
     std::size_t m_ring_size = 0;
     std::size_t m_ring_head = 0;
-    std::size_t m_ring_count = 0; // samples currently in ring
-    std::size_t m_stride = 0;     // window_size - overlap_count
+    std::size_t m_ring_count = 0; 
+    std::size_t m_stride = 0; 
     bool m_ring_initialized = false;
-
+    double m_sample_rate{};
+    
+    size_t m_next_window_start_sample = 0;
+    size_t m_total_samples_seen{0};
+    double m_picoseconds_per_sample{0};
 
 }; // class overlap
