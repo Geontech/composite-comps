@@ -89,7 +89,8 @@ dpdk_udp::~dpdk_udp() {
     m_logger->trace("Clean up complete");
 }
 
-auto dpdk_udp::start_recv() -> void {
+auto dpdk_udp::start_recv(output_port_t* port) -> void {
+    m_out_port = port;
     m_recv_thread = std::jthread(&dpdk_udp::receive, this);
     pthread_setname_np(m_recv_thread.native_handle(), "dpdk_udp");
 }
@@ -103,13 +104,13 @@ auto dpdk_udp::stop_recv() -> void {
     m_queue.clear();
 }
 
-auto dpdk_udp::get_data(std::shared_ptr<buffer_t>& data) -> bool {
-    if (auto pop_res = m_queue.pop()) {
-        data.reset(pop_res.release());
-        return true;
-    }
-    return false;
-}
+// auto dpdk_udp::get_data(std::shared_ptr<buffer_t>& data) -> bool {
+//     if (auto pop_res = m_queue.pop()) {
+//         data.reset(pop_res.release());
+//         return true;
+//     }
+//     return false;
+// }
 
 auto dpdk_udp::get_stats() -> statistics {
     rte_eth_stats_get(m_selected_port, &m_dpdk_stats);
@@ -507,7 +508,8 @@ auto dpdk_udp::receive(std::stop_token token) -> void {
                     rte_memcpy(copy.get(), pkt_data, pkt_len);
                     m_pcap_writer_thread->enqueue(std::move(copy), pkt_len);
                 }
-                m_queue.push(std::move(vec));
+                // m_queue.push(std::move(vec));
+                m_out_port->send_data(std::move(vec), {});
             }
             rte_pktmbuf_free_bulk(pkts, nb_rx);
             // uint64_t tsc_end = rte_get_tsc_cycles();

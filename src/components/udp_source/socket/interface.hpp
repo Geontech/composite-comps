@@ -22,6 +22,7 @@
 #include "statistics.hpp"
 
 #include <bit>
+#include <composite/output_port.hpp>
 #include <memory>
 #include <memory_resource>
 #include <spdlog/spdlog.h>
@@ -152,7 +153,8 @@ public:
     /**
      * @brief Type alias for a unique pointer to a receive buffer.
      */
-    using buffer_ptr_t = std::unique_ptr<buffer_t>;
+    using buffer_ptr_t = std::shared_ptr<buffer_t>;
+    using output_port_t = composite::output_port<buffer_ptr_t>;
 
     // Non-copyable and non-movable
     interface(const interface&) = delete;
@@ -169,9 +171,9 @@ public:
      * @brief Start the receive loop.
      *
      * This method must be implemented by derived classes to begin
-     * packet capture and buffer population.
+     * packet capture, buffer population, and data output.
      */
-    virtual auto start_recv() -> void = 0;
+    virtual auto start_recv(output_port_t*) -> void = 0;
 
     /**
      * @brief Stop the receive loop.
@@ -180,14 +182,14 @@ public:
      */
     virtual auto stop_recv() -> void = 0;
 
-    /**
-     * @brief Retrieve the next available received buffer.
-     *
-     * @param out Reference to a shared pointer that will be populated
-     *        with the next available data buffer, if any.
-     * @return True if a buffer was successfully retrieved, false otherwise.
-     */
-    virtual auto get_data(std::shared_ptr<buffer_t>&) -> bool = 0;
+    // /**
+    //  * @brief Retrieve the next available received buffer.
+    //  *
+    //  * @param out Reference to a shared pointer that will be populated
+    //  *        with the next available data buffer, if any.
+    //  * @return True if a buffer was successfully retrieved, false otherwise.
+    //  */
+    // virtual auto get_data(std::shared_ptr<buffer_t>&) -> bool = 0;
 
     /**
      * @brief Retrieve runtime statistics for the receiver.

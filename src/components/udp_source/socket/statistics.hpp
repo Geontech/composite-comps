@@ -33,6 +33,7 @@ uint32_t pkts_dropped_nic{};
 uint32_t pkts_processed{};
 uint32_t rx_nombuf{}; //Total number of Rx mbuf allocation failures.
 uint32_t pkts_recvd_nic{};
+uint32_t pkts_recvd;
 uint64_t cycles{};
 double cycles_per_packet{};
 uint64_t avg_pkts_per_burst{};

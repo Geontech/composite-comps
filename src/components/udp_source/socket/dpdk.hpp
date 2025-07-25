@@ -40,13 +40,15 @@ public:
     dpdk_udp(const config& config);
     ~dpdk_udp() final;
 
-    auto start_recv() -> void override;
+    auto start_recv(output_port_t*) -> void override;
     auto stop_recv() -> void override;
-    auto get_data(std::shared_ptr<buffer_t>&) -> bool override;
+    // auto get_data(std::shared_ptr<buffer_t>&) -> bool override;
     auto get_stats() -> statistics override;
     
 private:
     auto receive(std::stop_token token) -> void;
+
+    output_port_t* m_out_port{nullptr};
 
     int m_join_socket{-1};
     std::jthread m_recv_thread;
