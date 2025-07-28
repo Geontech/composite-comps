@@ -20,6 +20,7 @@ RUN set -ex; \
 
 FROM build AS project
 
+COPY cmake /opt/composite-comps/cmake
 COPY include /opt/composite-comps/include
 COPY src /opt/composite-comps/src
 COPY CMakeLists.txt /opt/composite-comps
