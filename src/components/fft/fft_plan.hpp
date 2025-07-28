@@ -25,15 +25,7 @@
 #include <algorithm>
 #include <complex>
 #include <fftw3.h>
-
-template <typename T>
-auto shift(aligned::aligned_mem<T>* out) {
-    std::rotate(
-        out->data(),
-        out->data() + (out->size() / 2),
-        out->data() + out->size()
-    );
-}
+#include <mutex>
 
 template <typename T, bool complex>
 class fft_plan{};
@@ -41,8 +33,9 @@ class fft_plan{};
 template <>
 class fft_plan<float, true> {
 public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads, bool do_shift) : m_shift(do_shift) {
-        fftwf_init_threads();
+    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
+        static std::mutex plan_mtx;
+        auto lock = std::scoped_lock{plan_mtx};
         fftwf_plan_with_nthreads(fftw_threads);
         auto plan_buf = aligned::make_aligned<std::complex<float>>(64, fft_size);
         m_plan = fftwf_plan_dft_1d(
@@ -56,11 +49,14 @@ public:
 
     ~fft_plan() {
         fftwf_destroy_plan(m_plan);
-        fftwf_cleanup_threads();
     }
 
     auto plan() -> fftwf_plan {
         return m_plan;
+    }
+
+    auto size() const noexcept -> std::size_t {
+        return m_size;
     }
 
     auto execute(aligned::aligned_mem<std::complex<float>>* in, aligned::aligned_mem<std::complex<float>>* out) -> void {
@@ -69,23 +65,20 @@ public:
             reinterpret_cast<fftwf_complex*>(in->data()),
             reinterpret_cast<fftwf_complex*>(out->data())
         );
-        // Shift
-        if (m_shift) {
-            shift(out);
-        }
     }
 
 private:
     fftwf_plan m_plan;
-    bool m_shift{false};
+    std::size_t m_size;
 
 }; // class fft_plan<float, true>
 
 template <>
 class fft_plan<float, false> {
 public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads, bool do_shift) : m_shift(do_shift) {
-        fftwf_init_threads();
+    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
+        static std::mutex plan_mtx;
+        auto lock = std::scoped_lock{plan_mtx};
         fftwf_plan_with_nthreads(fftw_threads);
         auto in_buf = aligned::make_aligned<float>(64, fft_size);
         auto out_buf = aligned::make_aligned<std::complex<float>>(64, fft_size);
@@ -99,11 +92,14 @@ public:
 
     ~fft_plan() {
         fftwf_destroy_plan(m_plan);
-        fftwf_cleanup_threads();
     }
 
     auto plan() -> fftwf_plan {
         return m_plan;
+    }
+
+    auto size() const noexcept -> std::size_t {
+        return m_size;
     }
 
     auto execute(aligned::aligned_mem<float>* in, aligned::aligned_mem<std::complex<float>>* out) -> void {
@@ -112,24 +108,20 @@ public:
             in->data(),
             reinterpret_cast<fftwf_complex*>(out->data())
         );
-        // Shift
-        if (m_shift) {
-            shift(out);
-        }
     }
-
 
 private:
     fftwf_plan m_plan;
-    bool m_shift{false};
+    std::size_t m_size;
 
 }; // class fft_plan<float, false>
 
 template <>
 class fft_plan<double, true> {
 public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads, bool do_shift) : m_shift(do_shift) {
-        fftw_init_threads();
+    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
+        static std::mutex plan_mtx;
+        auto lock = std::scoped_lock{plan_mtx};
         fftw_plan_with_nthreads(fftw_threads);
         auto plan_buf = aligned::make_aligned<std::complex<double>>(64, fft_size);
         m_plan = fftw_plan_dft_1d(
@@ -143,11 +135,14 @@ public:
 
     ~fft_plan() {
         fftw_destroy_plan(m_plan);
-        fftw_cleanup_threads();
     }
 
     auto plan() -> fftw_plan {
         return m_plan;
+    }
+
+    auto size() const noexcept -> std::size_t {
+        return m_size;
     }
 
     auto execute(aligned::aligned_mem<std::complex<double>>* in, aligned::aligned_mem<std::complex<double>>* out) -> void {
@@ -156,23 +151,20 @@ public:
             reinterpret_cast<fftw_complex*>(in->data()),
             reinterpret_cast<fftw_complex*>(out->data())
         );
-        // Shift
-        if (m_shift) {
-            shift(out);
-        }
     }
 
 private:
     fftw_plan m_plan;
-    bool m_shift{false};
+    std::size_t m_size;
 
 }; // class fft_plan<double, true>
 
 template <>
 class fft_plan<double, false> {
 public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads, bool do_shift) : m_shift(do_shift) {
-        fftw_init_threads();
+    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
+        static std::mutex plan_mtx;
+        auto lock = std::scoped_lock{plan_mtx};
         fftw_plan_with_nthreads(fftw_threads);
         auto in_buf = aligned::make_aligned<double>(64, fft_size);
         auto out_buf = aligned::make_aligned<std::complex<double>>(64, fft_size);
@@ -186,11 +178,14 @@ public:
 
     ~fft_plan() {
         fftw_destroy_plan(m_plan);
-        fftw_cleanup_threads();
     }
 
     auto plan() -> fftw_plan {
         return m_plan;
+    }
+
+    auto size() const noexcept -> std::size_t {
+        return m_size;
     }
 
     auto execute(aligned::aligned_mem<double>* in, aligned::aligned_mem<std::complex<double>>* out) -> void {
@@ -199,14 +194,10 @@ public:
             in->data(),
             reinterpret_cast<fftw_complex*>(out->data())
         );
-        // Shift
-        if (m_shift) {
-            shift(out);
-        }
     }
 
 private:
     fftw_plan m_plan;
-    bool m_shift{false};
+    std::size_t m_size;
 
 }; // class fft_plan<double, false>
