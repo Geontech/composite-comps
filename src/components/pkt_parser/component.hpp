@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -17,8 +17,6 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "socket/interface.hpp"
-
 #include <array>
 #include <composite/component.hpp>
 #include <memory>
@@ -29,43 +27,48 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
-class udp_source : public composite::component {
-    static constexpr std::string_view RECVMMSG = "recvmmsg";
-    static constexpr std::string_view PACKET_MMAP = "packet_mmap";
-    static constexpr std::string_view DPDK = "dpdk";
+enum class transport : uint8_t {
+    unknown,
+    sdds,
+    vita49
+}; // enum class transport
 
-    using output_t = std::shared_ptr<std::pmr::vector<uint8_t>>;
-    using output_port_t = composite::output_port<output_t>;
+class pkt_parser : public composite::component {
+    using input_t = std::pmr::vector<uint8_t>;
+    using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
+    using output_t = input_t;
+    using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
 public:
-    udp_source();
-    ~udp_source() override = default;
+    pkt_parser();
+    ~pkt_parser() override = default;
     auto property_change_handler() -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
     auto process() -> composite::retval override;
 
 private:
     // Ports
+    input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
 
     // Properties
-    std::string m_socket_type{RECVMMSG};
-    std::string m_interface;
-    std::string m_ip_addr;
-    uint16_t m_port{};
-    uint32_t m_num_msgs{};
-    uint32_t m_frame_count{32768};
-    uint32_t m_recv_buf_size{};
-
-    struct overrides {
-        std::optional<uint32_t> msg_size{};
-    }; // struct overrides
-    overrides m_overrides;
+    struct format {
+        std::optional<bool> is_complex;
+        std::string type;
+        uint32_t bit_width{};
+        std::string endianness;
+    }; // struct format
+    struct signal_overrides {
+        std::optional<double> center_frequency;
+        std::optional<double> bandwidth;
+        std::optional<double> sample_rate;
+        format data_format;
+        std::string transport;
+    }; // struct signal_overrides
+    signal_overrides m_signal_overrides;
 
     // Members
-    std::unique_ptr<udp::interface> m_receiver;
-    std::jthread m_stat_thread;
+    transport m_transport{};
+    composite::metadata m_metadata;
+    bool m_init_metadata{};
     uint16_t m_pkt_count{};
-    bool m_new_socket_required{true};
 
-}; // class udp_source
+}; // class pkt_parser

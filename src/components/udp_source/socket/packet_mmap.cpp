@@ -14,7 +14,7 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #include "helpers.hpp"
@@ -143,17 +143,17 @@ packet_mmap::~packet_mmap() {
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();
     }
-    m_queue.clear();
     if (m_join_socket != -1) {
-        ::close(m_join_socket); 
+        ::close(m_join_socket);
     }
     if (m_socket != -1) {
-        ::close(m_socket); 
+        ::close(m_socket);
     }
     ::munmap(m_ring, block_size * m_block_nr);
 }
 
-auto packet_mmap::start_recv() -> void {
+auto packet_mmap::start_recv(output_port_t* port) -> void {
+    m_out_port = port;
     m_recv_thread = std::jthread(&packet_mmap::receive, this);
     pthread_setname_np(m_recv_thread.native_handle(), "packet_mmap");
 }
@@ -163,26 +163,17 @@ auto packet_mmap::stop_recv() -> void {
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();
     }
-    m_queue.clear();
 }
 
-auto packet_mmap::get_data(std::shared_ptr<buffer_t>& data) -> bool {
-    if (auto pop_res = m_queue.pop()) {
-        data.reset(pop_res.release());
-        return true;
-    }
-    return false;
-}
-
-auto packet_mmap::get_stats() -> statistics {
-    auto stats = statistics{};
+auto packet_mmap::get_stats() -> std::map<std::string, std::string> {
+    auto stats = std::map<std::string, std::string>{};
     auto tp_stats = tpacket_stats{};
     socklen_t len = sizeof(tp_stats);
     if (getsockopt(m_socket, SOL_PACKET, PACKET_STATISTICS, &tp_stats, &len) == 0) {
-        stats.pkts_recvd_kernel = tp_stats.tp_packets;
-        stats.pkts_dropped_kernel = tp_stats.tp_drops;
+        stats["pkts_recvd_kernel"] = std::to_string(tp_stats.tp_packets);
+        stats["pkts_dropped_kernel"] = std::to_string(tp_stats.tp_drops);
     }
-    stats.pkts_recvd_user = m_pkts_recvd.exchange(0);
+    stats["pkts_recvd"] = std::to_string(m_pkts_recvd.exchange(0));
     return stats;
 }
 
@@ -207,12 +198,12 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
 
                 // Create a pmr vector and copy udp payload into it
-                auto vec = std::make_unique<buffer_t>(allocator);
+                auto vec = std::make_shared<buffer_t>(allocator);
                 vec->resize(payload_len);
                 std::memcpy(vec->data(), payload, payload_len);
 
-                // Place onto queue
-                m_queue.push(std::move(vec));
+                // Send data vector
+                m_out_port->send_data(std::move(vec), {});
             }
 
             // Release the frame

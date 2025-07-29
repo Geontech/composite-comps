@@ -14,14 +14,13 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #pragma once
 
 #include "interface.hpp"
 #include "pmr/ring_resource.hpp"
-#include "processing_queue.hpp"
 
 #include <atomic>
 #include <composite/timestamp.hpp>
@@ -33,25 +32,23 @@
 namespace udp {
 
 class packet_mmap : public interface {
-    using queue_t = processing_queue<buffer_ptr_t>;
     static constexpr auto block_size = uint32_t{1 << 20};
 public:
     packet_mmap(const config& config);
     ~packet_mmap() final;
 
-    auto start_recv() -> void override;
+    auto start_recv(output_port_t*) -> void override;
     auto stop_recv() -> void override;
-    auto get_data(std::shared_ptr<buffer_t>&) -> bool override;
-    auto get_stats() -> statistics override;
+    auto get_stats() -> std::map<std::string, std::string> override;
 
 private:
     auto receive(std::stop_token token) -> void;
 
+    output_port_t* m_out_port{nullptr};
     int m_socket{-1};
     int m_join_socket{-1};
     void* m_ring;
     std::jthread m_recv_thread;
-    queue_t m_queue;
     uint32_t m_frame_size{};
     uint32_t m_frame_count{};
     uint32_t m_block_nr{};

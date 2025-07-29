@@ -14,14 +14,13 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #pragma once
 
 #include "interface.hpp"
 #include "pmr/ring_resource.hpp"
-#include "processing_queue.hpp"
 
 #include <atomic>
 #include <composite/timestamp.hpp>
@@ -32,7 +31,6 @@
 namespace udp {
 
 class recvmmsg : public interface {
-    using queue_t = processing_queue<buffer_ptr_t>;
 public:
     explicit recvmmsg(const config& config);
     ~recvmmsg() final;
@@ -41,18 +39,18 @@ public:
     recvmmsg& operator=(const recvmmsg&) = delete;
     recvmmsg& operator=(recvmmsg&&) = delete;
 
-    auto start_recv() -> void override;
+    auto start_recv(output_port_t*) -> void override;
     auto stop_recv() -> void override;
-    auto get_data(std::shared_ptr<buffer_t>&) -> bool override;
-    auto get_stats() -> statistics override;
+    auto get_stats() -> std::map<std::string, std::string> override;
 
 private:
     auto receive(std::stop_token token) -> void;
 
+    output_port_t* m_out_port{nullptr};
     int m_socket{-1};
     std::jthread m_recv_thread;
-    queue_t m_queue;
     std::size_t m_frame_size{};
+    std::size_t m_frame_count{};
     std::unique_ptr<ring_resource> m_resource;
     std::size_t m_batch_size{128};
     std::atomic<uint32_t> m_pkts_recvd{};

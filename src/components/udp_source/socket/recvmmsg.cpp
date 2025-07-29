@@ -14,11 +14,10 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #include "helpers.hpp"
-#include "overlay.hpp"
 #include "recvmmsg.hpp"
 #include "pmr/ring_resource.hpp"
 
@@ -38,7 +37,8 @@
 namespace udp {
 
 recvmmsg::recvmmsg(const config& config) :
-  interface(config.logger) {
+  interface(config.logger),
+  m_frame_count(config.frame_count) {
     // Create socket
     m_logger->trace("opening udp socket");
     m_socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -92,85 +92,11 @@ recvmmsg::recvmmsg(const config& config) :
         }
     }
 
-    // Setup transport and msg_size properties from overrides or packets on wire
-    auto msg_size = std::size_t{}; // unknown msg size to start with
-    std::array<uint8_t, 9000> buffer{}; // Use a jumbo frame buffer
     // User has overriden properties
-    if (config.transport == "sdds") {
-        m_transport = transport::sdds;
-        msg_size = 1080; // fixed-length protocol
-    } else if (config.transport == "vita49") {
-        m_transport = transport::vita49;
-        if (config.msg_size > 0) {
-            msg_size = config.msg_size;
-        } else {
-            // Discover the size of the vita49 packets from the wire
-            while (true) {
-                if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
-                    auto packet = overlay::v49::overlay(buffer);
-                    if (packet.is_data()) {
-                        msg_size = recvd;
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        // Discover both the transport and the size of the packets from the wire
-        while (true) {
-            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
-                if (recvd == 1080) { // likely sdds
-                    // Overlay SDDS
-                    auto packet_sdds = overlay::sdds::overlay(buffer);
-                    auto sf = packet_sdds.standard_format();
-                    auto dm = packet_sdds.data_mode();
-                    auto bps = packet_sdds.bps();
-                    auto valid_dm = (dm == 0 && bps == 4) ||
-                                 (dm == 1 && bps == 8) ||
-                                 (dm == 2 && bps == 16) ||
-                                 (dm == 5 && bps == 8) ||
-                                 (dm == 6 && bps == 16);
-                    m_logger->trace("SDDS standard_format={} data_mode={}, bps={}", sf, dm, bps);
-                    if (valid_dm) {
-                        m_transport = transport::sdds;
-                        msg_size = 1080;
-                        break;
-                    }
-
-                    // Try overlay V49
-                    auto packet_v49 = overlay::v49::overlay(buffer);
-                    if (packet_v49.is_data()) {
-                        m_transport = transport::vita49;
-                        msg_size = recvd;
-                        break;
-                    }
-                } else {
-                    // Can't be SDDS, so overlay V49 and check the headers
-                    auto packet = overlay::v49::overlay(buffer);
-                    if (packet.is_data()) {
-                        m_transport = transport::vita49;
-                        msg_size = recvd;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    auto to_string = [](transport t) -> std::string {
-        if (t == transport::sdds) {
-            return "sdds";
-        } else if (t == transport::vita49) {
-            return "vita49";
-        }
-        return "unknown";
-    };
-    m_logger->trace("discovered protocol: {} with msg size: {}", to_string(m_transport), msg_size);
-
-    // Should have determined the size and can now create the ring buffer
-    // TODO: should probably throw if unable to determine transport and size
-    if (msg_size > 0) {
-        m_frame_size = std::bit_ceil(msg_size);
-        m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=config.frame_count, .alignment=64});
+    if (config.msg_size > 0) {
+        m_frame_size = std::bit_ceil(config.msg_size);
+        m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64});
+        m_logger->trace("using user-provided msg_size of: {} bytes", config.msg_size);
     }
 }
 
@@ -179,13 +105,42 @@ recvmmsg::~recvmmsg() {
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();
     }
-    m_queue.clear();
     if (m_socket != -1) {
         ::close(m_socket);
     }
 }
 
-auto recvmmsg::start_recv() -> void {
+auto recvmmsg::start_recv(output_port_t* port) -> void {
+    // User has not overriden properties
+    if (m_frame_size == 0) {
+        // Discover the size of the incoming packets from the wire
+        std::array<uint8_t, 9000> buffer{}; // Use a jumbo frame buffer
+        while (true) {
+            struct pollfd pfd{
+                .fd = m_socket,
+                .events = POLLIN,
+                .revents = 0
+            };
+            if (auto poll_res = ::poll(&pfd, 1, 1000/*ms*/); poll_res <= 0) {
+                m_logger->debug("waiting for data to know how to size internal buffers...");
+                continue;
+            }
+            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
+                // Assume anything over 512 bytes is a valid data packet (either SDDS or V49)
+                if (recvd < 512) {
+                    continue;
+                }
+                if (auto pkt_type = buffer[0] & 0xF0; pkt_type == 0x40 || pkt_type == 0x50) { // ignore v49 context signatures
+                    continue;
+                }
+                m_logger->trace("using discovered msg_size of: {} bytes", recvd);
+                m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
+                m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64});
+                break;
+            }
+        }
+    }
+    m_out_port = port;
     m_recv_thread = std::jthread(&recvmmsg::receive, this);
     pthread_setname_np(m_recv_thread.native_handle(), "recvmmsg");
 }
@@ -195,20 +150,11 @@ auto recvmmsg::stop_recv() -> void {
     if (m_recv_thread.joinable()) {
         m_recv_thread.join();
     }
-    m_queue.clear();
 }
 
-auto recvmmsg::get_data(std::shared_ptr<buffer_t>& data) -> bool {
-    if (auto pop_res = m_queue.pop()) {
-        data.reset(pop_res.release());
-        return true;
-    }
-    return false;
-}
-
-auto recvmmsg::get_stats() -> statistics {
-    auto stats = statistics{};
-    stats.pkts_recvd_user = m_pkts_recvd.exchange(0);
+auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
+    auto stats = std::map<std::string, std::string>{};
+    stats["pkts_recvd"] = std::to_string(m_pkts_recvd.exchange(0));
     return stats;
 }
 
@@ -229,7 +175,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
 
     // Initialize buffers and iovecs
     for (std::size_t i = 0; i < m_batch_size; ++i) {
-        buffers[i] = std::make_unique<buffer_t>(allocator);
+        buffers[i] = std::make_shared<buffer_t>(allocator);
         buffers[i]->resize(m_frame_size);
         iovecs[i].iov_base = buffers[i]->data();
         iovecs[i].iov_len = buffers[i]->size();
@@ -237,6 +183,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
 
+    auto msgs_recvd = std::size_t{};
     while (!token.stop_requested()) {
         if (auto poll_res = ::poll(&pfd, 1, 1/*ms*/); poll_res <= 0) {
             continue;
@@ -245,26 +192,28 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         if (pfd.revents & POLLIN) [[likely]] {
             // Call recvmmsg
             struct timespec ts{.tv_sec=0, .tv_nsec=100'000}; // 100 us
-            auto msgs_recvd = std::size_t{};
-            while (!token.stop_requested() && (msgs_recvd < m_batch_size)) {
-                if (auto recvd = ::recvmmsg(m_socket, &msgs[msgs_recvd], m_batch_size - msgs_recvd, 0, &ts); recvd > 0) {
-                    msgs_recvd += recvd;
-                    m_pkts_recvd.fetch_add(recvd, std::memory_order_relaxed);
-                }
+            if (auto recvd = ::recvmmsg(m_socket, &msgs[msgs_recvd], m_batch_size - msgs_recvd, 0, &ts); recvd > 0) {
+                msgs_recvd += recvd;
+                m_pkts_recvd.fetch_add(recvd, std::memory_order_relaxed);
+            }
+            if (msgs_recvd < m_batch_size) {
+                continue;
             }
 
             // Place onto queue
             for (auto i=0u; i<msgs_recvd; ++i) {
                 buffers[i]->resize(msgs[i].msg_len); // trim to actual recvd size
-                m_queue.push(std::move(buffers[i]));
+                m_out_port->send_data(std::move(buffers[i]), {});
 
                 // Reallocate for next loop
-                buffers[i] = std::make_unique<buffer_t>(allocator);
+                buffers[i] = std::make_shared<buffer_t>(allocator);
                 buffers[i]->resize(m_frame_size);
                 iovecs[i].iov_base = buffers[i]->data();
             }
+            msgs_recvd = 0;
         }
     }
+
 }
 
 } // namespace udp
