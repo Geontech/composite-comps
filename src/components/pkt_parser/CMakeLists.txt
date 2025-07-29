@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2024 Geon Technologies, LLC
+# Copyright (C) 2025 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.20)
-project(udp_source VERSION 0.1.0 LANGUAGES CXX)
+project(pkt_parser VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -35,26 +35,23 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-march=x86-64-v2 -mtune=generic)
 
 # Library
-add_library(udp_source MODULE
+add_library(pkt_parser MODULE
     component.cpp
-    socket/packet_mmap.cpp
-    socket/recvmmsg.cpp
-    helpers.cpp
-    pmr/ring_resource.cpp
+    overlay.cpp
 )
 # Includes
-target_include_directories(udp_source
+target_include_directories(pkt_parser
     PRIVATE
     ${vrtgen_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 # Link
-target_link_libraries(udp_source
+target_link_libraries(pkt_parser
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
 )
 # Install
-install(TARGETS udp_source
+install(TARGETS pkt_parser
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )

@@ -72,6 +72,7 @@ public:
 
     auto is_vrl() const -> bool;
     auto is_data() const -> bool;
+    auto is_ext_data() const -> bool;
     auto is_context() const -> bool;
     auto header() const -> const vrtgen::packing::Header&;
     auto stream_id() const -> std::optional<uint32_t>;

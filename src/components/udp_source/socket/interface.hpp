@@ -14,25 +14,19 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
  #pragma once
 
-#include "statistics.hpp"
-
 #include <bit>
+#include <composite/output_port.hpp>
+#include <map>
 #include <memory>
 #include <memory_resource>
 #include <spdlog/spdlog.h>
 
 namespace udp {
-
-enum class transport : uint8_t {
-    unknown,
-    sdds,
-    vita49
-}; // enum class transport
 
 /**
  * @brief Configuration parameters for a UDP receiver interface.
@@ -62,11 +56,6 @@ struct config {
      * @brief UDP port to listen on.
      */
     uint16_t port{};
-
-    /**
-     * @brief The transport encapsulation of the UDP data (e.g., "sdds" or "vita49")
-     */
-    std::string transport;
 
     /**
      * @brief Size of the socket receive buffer (in bytes).
@@ -106,9 +95,11 @@ public:
     using buffer_t = std::pmr::vector<uint8_t>;
 
     /**
-     * @brief Type alias for a unique pointer to a receive buffer.
+     * @brief Type alias for a shared pointer to a receive buffer.
      */
-    using buffer_ptr_t = std::unique_ptr<buffer_t>;
+    using buffer_ptr_t = std::shared_ptr<buffer_t>;
+
+    using output_port_t = composite::output_port<buffer_ptr_t>;
 
     // Non-copyable and non-movable
     interface(const interface&) = delete;
@@ -125,9 +116,9 @@ public:
      * @brief Start the receive loop.
      *
      * This method must be implemented by derived classes to begin
-     * packet capture and buffer population.
+     * packet capture, buffer population, and data output.
      */
-    virtual auto start_recv() -> void = 0;
+    virtual auto start_recv(output_port_t*) -> void = 0;
 
     /**
      * @brief Stop the receive loop.
@@ -137,30 +128,12 @@ public:
     virtual auto stop_recv() -> void = 0;
 
     /**
-     * @brief Retrieve the next available received buffer.
-     *
-     * @param out Reference to a shared pointer that will be populated
-     *        with the next available data buffer, if any.
-     * @return True if a buffer was successfully retrieved, false otherwise.
-     */
-    virtual auto get_data(std::shared_ptr<buffer_t>&) -> bool = 0;
-
-    /**
      * @brief Retrieve runtime statistics for the receiver.
      *
      * @return A snapshot of internal statistics such as packets received,
      *         dropped, errors, etc.
      */
-    virtual auto get_stats() -> statistics = 0;
-
-    /**
-     * @brief Get the discovered transport protocol being used
-     * 
-     * @return The transport protocol being received
-     */
-    auto get_transport() const -> transport {
-        return m_transport;
-    }
+    virtual auto get_stats() -> std::map<std::string, std::string> = 0;
 
 protected:
     /**
@@ -174,11 +147,6 @@ protected:
      * @brief Logger instance
      */
     std::shared_ptr<spdlog::logger> m_logger;
-
-    /**
-     * @brief Trasnport protocol being received
-     */
-    transport m_transport;
 
 }; // class interface
 

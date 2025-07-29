@@ -187,7 +187,7 @@ overlay::overlay(std::span<uint8_t> data) : m_data(data) {
                 m_trailer->unpack_from(m_data.data() + pos);
             }
         }
-        
+
         // Check for needed q/i to i/q swap
         auto pos = m_positions.at("payload");
         auto len = payload_size();
@@ -287,6 +287,11 @@ auto overlay::is_data() const -> bool {
     return m_header.packet_type() == SIGNAL_DATA || m_header.packet_type() == SIGNAL_DATA_STREAM_ID;
 }
 
+auto overlay::is_ext_data() const -> bool {
+    using enum vrtgen::packing::PacketType;
+    return m_header.packet_type() == EXTENSION_DATA || m_header.packet_type() == EXTENSION_DATA_STREAM_ID;
+}
+
 auto overlay::is_context() const -> bool {
     using enum vrtgen::packing::PacketType;
     return m_header.packet_type() == CONTEXT;
@@ -326,7 +331,11 @@ auto overlay::payload_size() const -> size_t {
     if (!m_positions.contains("payload")) {
         return {};
     }
-    auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - m_positions.at("payload");
+    auto pos = m_positions.at("payload");
+    if (m_is_vrl) {
+        pos -= sizeof(uint32_t)/*VRLP*/ + sizeof(uint32_t)/*frame word*/;
+    }
+    auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - pos;
     if (m_trailer.has_value()) {
         size -= sizeof(uint32_t);
     }
