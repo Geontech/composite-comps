@@ -113,6 +113,7 @@ auto pkt_parser::process() -> composite::retval {
     // Parse packets based on protocol
     auto meta = m_metadata;
     auto ts = composite::timestamp{};
+    auto is_tsf_sc = false;
     if (m_transport == transport::sdds) {
         auto packet = overlay::sdds::overlay(*data);
         auto seq_num = packet.seq_num();
@@ -163,6 +164,7 @@ auto pkt_parser::process() -> composite::retval {
             }
             if (auto frac_ts = packet.fractional_timestamp()) {
                 ts.picoseconds = frac_ts.value();
+                is_tsf_sc = (header.tsf() == vrtgen::packing::TSF::SAMPLE_COUNT);
             }
             std::copy(data->begin() + packet.payload_start(), data->end(), data->begin()); // move metadata off
             data->resize(packet.payload_size());
@@ -223,6 +225,18 @@ auto pkt_parser::process() -> composite::retval {
         logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
         m_out_port.send_metadata(m_metadata);
         m_init_metadata = true;
+    }
+
+    // Need to adjust fractional timestamp
+    if (is_tsf_sc) {
+        if (m_metadata.sample_rate == 0.0) {
+            if (!m_tsf_warn) {
+                logger()->warn("unable to set fractional timestamp: unknown sample rate in SAMPLE_COUNT mode; dropping data until sample rate discovered");
+                m_tsf_warn = true;
+            }
+            return NORMAL;
+        }
+        ts.picoseconds *= 1e12 / m_metadata.sample_rate;
     }
 
     // Send data
