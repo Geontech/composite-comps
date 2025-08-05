@@ -70,5 +70,6 @@ private:
     composite::metadata m_metadata;
     bool m_init_metadata{};
     uint16_t m_pkt_count{};
+    bool m_tsf_warn{};
 
 }; // class pkt_parser
