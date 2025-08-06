@@ -77,6 +77,9 @@ public:
         } else if (m_window_type == "HAMMING") {
             m_window = windows::hamming<T>(m_fft_size);
         }
+        if (m_task_queue.thread_name_prefix() != id()) {
+            m_task_queue.thread_name_prefix(id());
+        }
         m_task_queue.resize(m_num_workers);
     }
 

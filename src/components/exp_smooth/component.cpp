@@ -19,8 +19,57 @@
 
 #include "component.hpp"
 
+#include <cmath>
 #include <string_view>
 
+template <typename T>
+exp_smooth<T>::exp_smooth() : composite::component("exp_smooth") {
+    using enum composite::properties::config_type;
+    add_port(&m_in_port);
+    add_port(&m_out_port);
+    add_property("num_averages", &m_num_averages).configurability(RUNTIME).change_listener([this]() {
+        if (m_num_averages > 0) {
+            m_alpha = T{1} - std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
+        }
+        m_work = std::make_unique<work<T>>(m_alpha);
+        m_prev_psd.reset();
+        return true;
+    });
+}
+
+template <typename T>
+auto exp_smooth<T>::process() -> composite::retval {
+    using enum composite::retval;
+    auto [data, ts, meta] = m_in_port.get_data();
+    if (data == nullptr) {
+        return NOOP;
+    }
+    if (meta.has_value()) {
+        logger()->trace("pass-through metadata:\n{}", meta->to_string());
+        m_out_port.send_metadata(meta.value());
+    }
+    if (m_alpha == T{1}) {
+        // No smoothing, return as is
+        m_out_port.send_data(std::move(data), ts);
+        return NORMAL;
+    }
+    // Handle first PSD
+    if (!m_prev_psd) {
+        m_prev_psd = std::move(data);
+        m_prev_psd_ts = ts;
+        return NORMAL;
+    }
+    // Run algorithm
+    m_work->process(data.get(), m_prev_psd.get());
+    // Send previous PSD data and timestamp
+    m_out_port.send_data(std::move(m_prev_psd), m_prev_psd_ts);
+    // Save current PSD for next pass
+    m_prev_psd = std::move(data);
+    m_prev_psd_ts = ts;
+    return NORMAL;
+}
+
+// --- Factory Function ---
 extern "C" {
     auto create(std::string_view type) -> std::shared_ptr<composite::component> {
         if (type == "f32") {
