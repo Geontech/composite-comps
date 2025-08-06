@@ -114,6 +114,7 @@ auto pkt_parser::process() -> composite::retval {
     auto meta = m_metadata;
     auto ts = composite::timestamp{};
     auto is_tsf_sc = false;
+    auto do_send = true;
     if (m_transport == transport::sdds) {
         auto packet = overlay::sdds::overlay(*data);
         auto seq_num = packet.seq_num();
@@ -184,6 +185,7 @@ auto pkt_parser::process() -> composite::retval {
             meta.center_frequency = packet.rf_frequency().value_or(0);
             meta.bandwidth = packet.bandwidth().value_or(0);
             meta.sample_rate = packet.sample_rate().value_or(0);
+            do_send = false;
         }
         if (m_signal_overrides.data_format.is_complex.has_value()) {
             meta.format.is_complex = m_signal_overrides.data_format.is_complex.value();
@@ -240,7 +242,7 @@ auto pkt_parser::process() -> composite::retval {
     }
 
     // Send data
-    if (m_init_metadata) [[likely]] {
+    if (m_init_metadata && do_send) [[likely]] {
         m_out_port.send_data(std::move(data), ts);
     }
 
