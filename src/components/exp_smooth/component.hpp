@@ -20,62 +20,18 @@
 #include "work.hpp"
 #include <aligned_mem.hpp>
 
-#include <cmath>
 #include <composite/component.hpp>
-#include <tuple>
 
 template <typename T>
 class exp_smooth : public composite::component {
     using input_t = aligned::aligned_mem<T>;
     using input_port_t = composite::input_port<std::unique_ptr<input_t>>;
     using output_port_t = composite::output_port<std::unique_ptr<input_t>>;
-    using enum composite::properties::config_type;
 public:
-    exp_smooth() : composite::component("exp_smooth") {
-        add_port(&m_in_port);
-        add_port(&m_out_port);
-        add_property("num_averages", &m_num_averages).configurability(RUNTIME).change_listener([this]() {
-            if (m_num_averages > 0) {
-                m_alpha = T{1} - std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
-            }
-            m_work = std::make_unique<work<T>>(m_alpha);
-            m_prev_psd.reset();
-            return true;
-        });
-    }
-
+    exp_smooth();
     ~exp_smooth() override = default;
 
-    auto process() -> composite::retval override {
-        using enum composite::retval;
-        auto [data, ts, meta] = m_in_port.get_data();
-        if (data == nullptr) {
-            return NOOP;
-        }
-        if (meta.has_value()) {
-            logger()->trace("pass-through metadata:\n{}", meta->to_string());
-            m_out_port.send_metadata(meta.value());
-        }
-        if (m_alpha == T{1}) {
-            // No smoothing, return as is
-            m_out_port.send_data(std::move(data), ts);
-            return NORMAL;
-        }
-        // Handle first PSD
-        if (!m_prev_psd) {
-            m_prev_psd = std::move(data);
-            m_prev_psd_ts = ts;
-            return NORMAL;
-        }
-        // Run algorithm
-        m_work->process(data.get(), m_prev_psd.get());
-        // Send previous PSD data and timestamp
-        m_out_port.send_data(std::move(m_prev_psd), m_prev_psd_ts);
-        // Save current PSD for next pass
-        m_prev_psd = std::move(data);
-        m_prev_psd_ts = ts;
-        return NORMAL;
-    }
+    auto process() -> composite::retval override;
 
 private:
     // Ports

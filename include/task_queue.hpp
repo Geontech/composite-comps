@@ -19,16 +19,14 @@
 
 #pragma once
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstddef>
-#include <deque>
 #include <format>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <queue>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -37,8 +35,10 @@
 class task_queue {
     using task_type = std::packaged_task<void()>;
 public:
-    task_queue() : task_queue(1) {}
-    explicit task_queue(std::size_t num_workers) {
+    task_queue() : task_queue("") {}
+    explicit task_queue(std::string_view worker_name_prefix) : task_queue(worker_name_prefix, 1) {}
+    task_queue(std::string_view worker_name_prefix, std::size_t num_workers) {
+        thread_name_prefix(worker_name_prefix);
         resize(num_workers);
     }
 
@@ -53,6 +53,21 @@ public:
     task_queue(task_queue&&) = delete;
     task_queue& operator=(const task_queue&) = delete;
     task_queue& operator=(task_queue&&) = delete;
+
+    auto thread_name_prefix() const noexcept -> const std::string& {
+        return m_thread_name_prefix;
+    }
+
+    auto thread_name_prefix(std::string_view name) -> void {
+        // Thread names must be <= 15 characters
+        // Format is <prefix>_w<ii>
+        m_thread_name_prefix = name.substr(0, 11);
+        auto lock = std::scoped_lock{m_wmtx};
+        for (auto i=0u; i<m_workers.size(); ++i) {
+            const auto name = std::format("{}_w{}", m_thread_name_prefix, i);
+            pthread_setname_np(m_workers[i].native_handle(), name.c_str());
+        }
+    }
 
     auto size() const noexcept -> std::size_t {
         auto lock = std::scoped_lock{m_wmtx};
@@ -72,7 +87,7 @@ public:
                 m_workers.emplace_back([this](std::stop_token stoken) {
                     thread_func(stoken);
                 });
-                const auto name = std::format("fft_worker_{}", i);
+                const auto name = std::format("{}_w{}", m_thread_name_prefix, i);
                 pthread_setname_np(m_workers.back().native_handle(), name.c_str());
             }
         } else {
@@ -130,6 +145,7 @@ private:
         }
     }
 
+    std::string m_thread_name_prefix;
     std::vector<std::jthread> m_workers;
     std::queue<task_type> m_tasks;
     std::mutex m_mtx;
