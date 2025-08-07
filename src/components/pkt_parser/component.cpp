@@ -26,6 +26,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <future>
+#include <memory_resource>
 #include <netinet/in.h>
 #include <net/if.h>
 #include <source_location>
@@ -36,6 +37,7 @@
 pkt_parser::pkt_parser() : composite::component("pkt_parser") {
     add_port(&m_in_port);
     add_port(&m_out_port);
+    add_port(&m_pcap_port);
     using enum composite::properties::config_type;
     add_struct_property("signal_overrides", &m_signal_overrides, [this](auto& set, auto* prop) {
         set.add_property("center_frequency", &prop->center_frequency);
@@ -113,6 +115,16 @@ auto pkt_parser::process() -> composite::retval {
     // Parse packets based on protocol
     auto meta = m_metadata;
     auto ts = composite::timestamp{};
+    auto is_tsf_sc = false;
+    auto do_send = true;
+    std::shared_ptr<input_t> original;
+    if (m_pcap_port.is_connected()){
+        auto* allocator = std::pmr::get_default_resource();
+        original = std::allocate_shared<input_t>(
+            std::pmr::polymorphic_allocator<uint8_t>{allocator},
+            *data
+        );
+    }
     if (m_transport == transport::sdds) {
         auto packet = overlay::sdds::overlay(*data);
         auto seq_num = packet.seq_num();
@@ -127,6 +139,7 @@ auto pkt_parser::process() -> composite::retval {
         }
         if (seq_num != expected_seq_num) [[unlikely]] {
             logger()->warn("dropped pkt(s) expected={}, got={}", expected_seq_num, seq_num);
+            meta.annotations["contiguous"] = "false";
         }
         m_pkt_count = seq_num;
         meta.format.is_complex = packet.complex();
@@ -156,6 +169,7 @@ auto pkt_parser::process() -> composite::retval {
             auto& header = packet.header();
             if (auto expected_count = ((m_pkt_count + 1) % 16); header.packet_count() != expected_count) {
                 logger()->warn("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());
+                meta.annotations["contiguous"] = "false";
             }
             m_pkt_count = header.packet_count();
             if (auto int_ts = packet.integer_timestamp()) {
@@ -163,6 +177,7 @@ auto pkt_parser::process() -> composite::retval {
             }
             if (auto frac_ts = packet.fractional_timestamp()) {
                 ts.picoseconds = frac_ts.value();
+                is_tsf_sc = (header.tsf() == vrtgen::packing::TSF::SAMPLE_COUNT);
             }
             std::copy(data->begin() + packet.payload_start(), data->end(), data->begin()); // move metadata off
             data->resize(packet.payload_size());
@@ -182,6 +197,7 @@ auto pkt_parser::process() -> composite::retval {
             meta.center_frequency = packet.rf_frequency().value_or(0);
             meta.bandwidth = packet.bandwidth().value_or(0);
             meta.sample_rate = packet.sample_rate().value_or(0);
+            do_send = false;
         }
         if (m_signal_overrides.data_format.is_complex.has_value()) {
             meta.format.is_complex = m_signal_overrides.data_format.is_complex.value();
@@ -221,14 +237,29 @@ auto pkt_parser::process() -> composite::retval {
     if (m_metadata != meta) {
         m_metadata = meta;
         logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+        m_pcap_port.send_metadata(m_metadata);
         m_out_port.send_metadata(m_metadata);
         m_init_metadata = true;
+        m_metadata.annotations.erase("contiguous");
+    }
+
+    // Need to adjust fractional timestamp
+    if (is_tsf_sc) {
+        if (m_metadata.sample_rate == 0.0) {
+            if (!m_tsf_warn) {
+                logger()->warn("unable to set fractional timestamp: unknown sample rate in SAMPLE_COUNT mode; dropping data until sample rate discovered");
+                m_tsf_warn = true;
+            }
+            return NORMAL;
+        }
+        ts.picoseconds *= 1e12 / m_metadata.sample_rate;
     }
 
     // Send data
-    if (m_init_metadata) [[likely]] {
+    if (m_init_metadata && do_send) [[likely]] {
         m_out_port.send_data(std::move(data), ts);
     }
+    m_pcap_port.send_data(original, ts);
 
     return NORMAL;
 }

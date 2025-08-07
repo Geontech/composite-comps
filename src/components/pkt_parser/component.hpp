@@ -34,14 +34,11 @@ enum class transport : uint8_t {
 }; // enum class transport
 
 class pkt_parser : public composite::component {
-    // using input_t = const uint8_t;
-    // using input_port_t = composite::input_port<input_t>;
-    // using output_t = input_t;
-    // using output_port_t = composite::output_port<output_t>;
     using input_t = std::pmr::vector<uint8_t>;
     using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
     using output_t = input_t;
     using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
+    using pcap_port_t = composite::output_port<std::shared_ptr<output_t>>;
 public:
     pkt_parser();
     ~pkt_parser() override = default;
@@ -52,6 +49,7 @@ private:
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
+    pcap_port_t m_pcap_port{"pcap_out"};
 
     // Properties
     struct format {
@@ -74,5 +72,6 @@ private:
     composite::metadata m_metadata;
     bool m_init_metadata{};
     uint16_t m_pkt_count{};
+    bool m_tsf_warn{};
 
 }; // class pkt_parser
