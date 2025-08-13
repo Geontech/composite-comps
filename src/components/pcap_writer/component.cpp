@@ -38,6 +38,7 @@ pcap_writer::pcap_writer() : composite::component("pcap_writer") {
     add_property("write_dir", &m_write_dir);    
     add_property("duration_seconds", &m_duration_seconds);
     add_property("mission", &m_mission);
+    add_property("polarization", &m_polarization);
 }
 
 pcap_writer::~pcap_writer() {
@@ -63,6 +64,7 @@ auto pcap_writer::process() -> composite::retval {
         m_metadata = meta.value();
         m_meta = sigmf::build_sigmf_json(m_metadata);
         m_meta["global"]["rfnext:mission"] = m_mission;
+        m_meta["global"]["rfnext:polarization"] = m_polarization;
         logger()->trace("metadata:\n{}", m_metadata.to_string());
         m_started = true;
         m_start_time = std::chrono::steady_clock::now();

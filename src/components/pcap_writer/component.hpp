@@ -60,6 +60,7 @@ private:
     std::map<std::string, nlohmann::json> m_timestamp_map;
     std::string m_meta_file{"meta.sigmf-collection"};
     std::string m_mission{"rfnext_pcap"};
+    std::string m_polarization{"UNKOWN"};
 
     std::chrono::steady_clock::time_point m_start_time{};
     uint32_t m_duration_seconds{10}; // 0 = no timeout

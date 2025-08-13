@@ -14,7 +14,7 @@ namespace sigmf {
             {"core:version", "1.0.0"},
             {"core:datatype", encode_datatype(meta)}, 
             {"core:sample_rate", meta.sample_rate},
-            {"core:center_frequency", meta.center_frequency},
+            {"core:frequency", meta.center_frequency},
             {"core:author", "RFNEXT"},
             {"core:extensions", {
                     {"name", "rfnext"},
@@ -62,10 +62,10 @@ namespace sigmf {
         if (format.bit_width > 8) {
             switch (format.endianness) {
                 case std::endian::little:
-                    dtype += "le";
+                    dtype += "_le";
                     break;
                 case std::endian::big:
-                    dtype += "be";
+                    dtype += "_be";
                     break;
                 default:
                     // std::endian::native or unrecognized — assume host-native (do nothing or log?)
