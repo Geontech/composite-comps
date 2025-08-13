@@ -61,21 +61,24 @@ public:
     
         auto [data, ts, meta] = m_in_port.get_data();
         if (!data) return NORMAL;
-    
+        
         if (meta.has_value() && m_metadata != meta.value()) {
             m_metadata = meta.value();
-            if (meta->sample_rate <= 0.0) return NORMAL;
-            auto it = m_metadata.annotations.find("contiguous:");
+            logger()->trace("RX metadata:\n{}", m_metadata.to_string());
+            auto it = m_metadata.annotations.find("contiguous");
             if (it != m_metadata.annotations.end() && it->second == "false") {
                 reset_state(ts);
                 logger()->warn("Non-contiguous stream detected — resetting overlap state for next window.");
+            } else {
+                m_contiguous = true;
             }
+            if (meta->sample_rate <= 0.0) return NORMAL;
             m_out_port.send_metadata(meta.value());
         }
-    
+     
         if (m_metadata.sample_rate == 0.0) return NORMAL;
     
-        if (!m_output_buf) {
+        if (!m_output_buf || !m_contiguous) {
             reset_state(ts);
         }
     
@@ -156,8 +159,11 @@ private:
         );            
         m_stride = m_window_size - m_overlap_count;
         m_output_ts = ts;
-        m_output_buf = aligned::make_aligned<std::complex<T>>(64, m_window_size);
+        if (!m_output_buf){
+            m_output_buf = aligned::make_aligned<std::complex<T>>(64, m_window_size);
+        }
         m_output_buf_count = 0;
+        m_contiguous = false;
         m_total_samples_seen = 0;
         m_next_window_start_sample = 0;
         m_picoseconds_per_sample = (1. / m_metadata.sample_rate) * 1'000'000'000'000;
@@ -173,6 +179,7 @@ private:
     std::size_t m_output_buf_count = 0;
     composite::timestamp m_output_ts;
     composite::timestamp m_next_output_ts;
+    bool m_contiguous = true;
 
     // Properties
     uint32_t m_window_size{65536};
