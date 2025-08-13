@@ -65,6 +65,11 @@ public:
         if (meta.has_value() && m_metadata != meta.value()) {
             m_metadata = meta.value();
             logger()->trace("RX metadata:\n{}", m_metadata.to_string());
+            if (meta->sample_rate <= 0.0) return NORMAL;
+            if (meta->sample_rate != m_sample_rate){
+                m_sample_rate = meta->sample_rate;
+                m_picoseconds_per_sample = (1. / m_metadata.sample_rate) * 1'000'000'000'000;
+            }
             auto it = m_metadata.annotations.find("contiguous");
             if (it != m_metadata.annotations.end() && it->second == "false") {
                 reset_state(ts);
@@ -72,7 +77,6 @@ public:
             } else {
                 m_contiguous = true;
             }
-            if (meta->sample_rate <= 0.0) return NORMAL;
             m_out_port.send_metadata(meta.value());
         }
      
@@ -166,7 +170,6 @@ private:
         m_contiguous = false;
         m_total_samples_seen = 0;
         m_next_window_start_sample = 0;
-        m_picoseconds_per_sample = (1. / m_metadata.sample_rate) * 1'000'000'000'000;
     }
     // Ports
     input_port_t m_in_port{"data_in"};
