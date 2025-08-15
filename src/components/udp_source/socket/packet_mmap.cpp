@@ -198,12 +198,23 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
 
                 // Create a pmr vector and copy udp payload into it
-                auto vec = std::make_shared<buffer_t>(allocator);
-                vec->resize(payload_len);
-                std::memcpy(vec->data(), payload, payload_len);
-
-                // Send data vector
-                m_out_port->send_data(std::move(vec), {});
+                // Spin when no available frames
+                while (true) {
+                    try {
+                        auto vec = std::make_shared<buffer_t>(allocator);
+                        vec->resize(payload_len);
+                        std::memcpy(vec->data(), payload, payload_len);
+                        m_out_port->send_data(std::move(vec), {});
+                        break;
+                    } catch (const std::bad_alloc& ex) {
+                        if (m_log_frame_warn) {
+                            m_logger->warn("ring_resource: no available frames; waiting for next available");
+                            m_log_frame_warn = false;
+                        }
+                        std::this_thread::yield();
+                        continue;
+                    }
+                }
             }
 
             // Release the frame

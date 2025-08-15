@@ -52,6 +52,7 @@ private:
     std::size_t m_frame_size{};
     std::size_t m_frame_count{};
     std::unique_ptr<ring_resource> m_resource;
+    bool m_log_frame_warn{true};
     std::size_t m_batch_size{128};
     std::atomic<uint32_t> m_pkts_recvd{};
 
