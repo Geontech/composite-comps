@@ -95,7 +95,9 @@ recvmmsg::recvmmsg(const config& config) :
     // User has overriden properties
     if (config.msg_size > 0) {
         m_frame_size = std::bit_ceil(config.msg_size);
-        m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64});
+        m_resource = std::make_unique<ring_resource>(
+            ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}
+        );
         m_logger->trace("using user-provided msg_size of: {} bytes", config.msg_size);
     }
 }
@@ -135,7 +137,9 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
                 }
                 m_logger->trace("using discovered msg_size of: {} bytes", recvd);
                 m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
-                m_resource = std::make_unique<ring_resource>(ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64});
+                m_resource = std::make_unique<ring_resource>(
+                    ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}
+                );
                 break;
             }
         }
@@ -206,9 +210,21 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                 m_out_port->send_data(std::move(buffers[i]), {});
 
                 // Reallocate for next loop
-                buffers[i] = std::make_shared<buffer_t>(allocator);
-                buffers[i]->resize(m_frame_size);
-                iovecs[i].iov_base = buffers[i]->data();
+                while (true) {
+                    try {
+                        buffers[i] = std::make_shared<buffer_t>(allocator);
+                        buffers[i]->resize(m_frame_size);
+                        iovecs[i].iov_base = buffers[i]->data();
+                        break;
+                    } catch (const std::bad_alloc& ex) {
+                        if (m_log_frame_warn) {
+                            m_logger->warn("ring_resource: no available frames; waiting for next available");
+                            m_log_frame_warn = false;
+                        }
+                        std::this_thread::yield();
+                        continue;
+                    }
+                }
             }
             msgs_recvd = 0;
         }

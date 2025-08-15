@@ -14,12 +14,13 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
 #include "component.hpp"
 
 #include <cmath>
+#include <format>
 #include <string_view>
 
 template <typename T>
@@ -77,6 +78,6 @@ extern "C" {
         } else if (type == "f64") {
             return std::make_shared<exp_smooth<double>>();
         }
-        return std::make_shared<exp_smooth<float>>();
+        throw std::runtime_error(std::format("unknown type {} for exp_smooth create", type));
     }
 }

@@ -36,7 +36,6 @@ public:
      * @brief Configuration for the ring buffer memory resource.
      */
     struct ring_config {
-
         /**
          * @brief Size of each frame in bytes.
          */

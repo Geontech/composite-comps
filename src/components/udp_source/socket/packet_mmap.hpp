@@ -53,6 +53,7 @@ private:
     uint32_t m_frame_count{};
     uint32_t m_block_nr{};
     ring_resource m_resource;
+    bool m_log_frame_warn{true};
     std::atomic<uint32_t> m_pkts_recvd{};
 
 }; // class packet_mmap
