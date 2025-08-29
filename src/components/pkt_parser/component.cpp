@@ -203,9 +203,9 @@ auto pkt_parser::process() -> composite::retval {
             meta.format.bit_width = m_signal_overrides.data_format.bit_width;
         }
         if (!m_signal_overrides.data_format.endianness.empty()) {
-            if (m_signal_overrides.data_format.type == "big") {
+            if (m_signal_overrides.data_format.endianness == "big") {
                 meta.format.endianness = std::endian::big;
-            } else if (m_signal_overrides.data_format.type == "little") {
+            } else if (m_signal_overrides.data_format.endianness == "little") {
                 meta.format.endianness = std::endian::little;
             }
         }
