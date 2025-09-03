@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -22,6 +22,7 @@
 #include <aligned_mem.hpp>
 
 #include <algorithm>
+#include <bit>
 #include <composite/component.hpp>
 #include <complex>
 #include <cstdint>
@@ -88,23 +89,10 @@ public:
         auto stride = size_t{bit_len / 8u / sizeof(T)};
         auto data_ci16 = reinterpret_cast<std::complex<int16_t>*>(data->data());
         auto data_ci16_len = data->size() / sizeof(std::complex<int16_t>);
-        for (auto i=0u; i < data_ci16_len; i += stride) {
+        auto i = std::size_t{};
+        for (; i + stride <= data_ci16_len && m_output_idx + stride <= m_output_size; i += stride) {
             if (m_output_buf == nullptr) {
-                m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
-                if (i == 0) {
-                    m_output_ts = ts;
-                } else {
-                    // calculate timestamp
-                    const auto ps_per_sec = uint64_t{1'000'000'000'000};
-                    const auto xdelta = 1. / m_metadata.sample_rate;
-                    const auto sample_ps = i * xdelta * ps_per_sec;
-                    m_output_ts.seconds = ts.seconds;
-                    m_output_ts.picoseconds = ts.picoseconds + sample_ps;
-                    if (m_output_ts.picoseconds > ps_per_sec) {
-                        m_output_ts.seconds += 1;
-                        m_output_ts.picoseconds = m_output_ts.picoseconds % ps_per_sec;
-                    }
-                }
+                create_outputs(ts, i);
             }
             if constexpr (std::is_same_v<T, std::complex<float>>) {
                 std::get<0>(m_converter).process(
@@ -124,10 +112,49 @@ public:
                 m_output_idx = 0;
             }
         }
+        // tail handling with scalar
+        for (; i < data_ci16_len; ++i) {
+            if (m_output_buf == nullptr) {
+                create_outputs(ts, i);
+            }
+            if constexpr (std::is_same_v<T, std::complex<float>>) {
+                m_output_buf->at(m_output_idx) = m_byteswap 
+                    ? std::complex<float>(std::byteswap(data_ci16[i].real()), std::byteswap(data_ci16[i].imag()))
+                    : std::complex<float>(data_ci16[i]);
+            } else { // int16_t or std::complex<int16_t>
+                m_output_buf->at(m_output_idx) = m_byteswap 
+                    ? std::complex<int16_t>(std::byteswap(data_ci16[i].real()), std::byteswap(data_ci16[i].imag()))
+                    : data_ci16[i];
+            }
+            ++m_output_idx;
+            if (m_output_idx == m_output_size) {
+                m_out_port.send_data(std::move(m_output_buf), m_output_ts);
+                m_output_buf.reset();
+                m_output_idx = 0;
+            }
+        }
         return NORMAL;
     }
 
 private:
+    auto create_outputs(composite::timestamp ts, std::size_t sample_idx) -> void {
+        m_output_buf = aligned::make_aligned<typename output_t::value_type>(64, m_output_size);
+        if (sample_idx == 0) {
+            m_output_ts = ts;
+        } else {
+            // calculate timestamp
+            const auto ps_per_sec = uint64_t{1'000'000'000'000};
+            const auto xdelta = 1. / m_metadata.sample_rate;
+            const auto sample_ps = sample_idx * xdelta * ps_per_sec;
+            m_output_ts.seconds = ts.seconds;
+            m_output_ts.picoseconds = ts.picoseconds + sample_ps;
+            if (m_output_ts.picoseconds > ps_per_sec) {
+                m_output_ts.seconds += 1;
+                m_output_ts.picoseconds = m_output_ts.picoseconds % ps_per_sec;
+            }
+        }
+    }
+
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
