@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -29,11 +29,12 @@ exp_smooth<T>::exp_smooth() : composite::component("exp_smooth") {
     add_port(&m_in_port);
     add_port(&m_out_port);
     add_property("num_averages", &m_num_averages).configurability(RUNTIME).change_listener([this]() {
+        m_alpha.reset();
         if (m_num_averages > 0) {
-            m_alpha = T{1} - std::pow(T{10}, (std::log10(1 - .98) / m_num_averages));
+            m_alpha = T{1} - std::pow(T{10}, (std::log10(T{1} - T{0.98}) / m_num_averages));
         }
-        m_work = std::make_unique<work<T>>(m_alpha);
-        m_prev_psd.reset();
+        m_work = std::make_unique<work<T>>(m_alpha.value_or(T{1}));
+        m_prev_psd = composite::mutable_buffer<T>{}; // Reset to empty buffer
         return true;
     });
 }
@@ -42,26 +43,26 @@ template <typename T>
 auto exp_smooth<T>::process() -> composite::retval {
     using enum composite::retval;
     auto [data, ts, meta] = m_in_port.get_data();
-    if (data == nullptr) {
+    if (!data) {
         return NOOP;
     }
     if (meta.has_value()) {
         logger()->trace("pass-through metadata:\n{}", meta->to_string());
         m_out_port.send_metadata(meta.value());
     }
-    if (m_alpha == T{1}) {
+    if (!m_alpha.has_value()) {
         // No smoothing, return as is
         m_out_port.send_data(std::move(data), ts);
         return NORMAL;
     }
     // Handle first PSD
-    if (!m_prev_psd) {
+    if (m_prev_psd.empty()) {
         m_prev_psd = std::move(data);
         m_prev_psd_ts = ts;
         return NORMAL;
     }
     // Run algorithm
-    m_work->process(data.get(), m_prev_psd.get());
+    m_work->process(data, m_prev_psd);
     // Send previous PSD data and timestamp
     m_out_port.send_data(std::move(m_prev_psd), m_prev_psd_ts);
     // Save current PSD for next pass

@@ -1,9 +1,9 @@
-find_package(composite 0.4.0 QUIET)
+find_package(composite 0.5.0 QUIET)
 if(NOT TARGET composite::composite)
     message(STATUS "composite not found, falling back to FetchContent")
     FetchContent_Declare(composite
         GIT_REPOSITORY https://github.com/geontech/composite.git
-        GIT_TAG v0.4.0
+        GIT_TAG develop
     )
     FetchContent_MakeAvailable(composite)
 else()

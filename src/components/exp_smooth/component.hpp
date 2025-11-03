@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -18,15 +18,13 @@
  */
 
 #include "work.hpp"
-#include <aligned_mem.hpp>
 
-#include <composite/component.hpp>
+#include <composite/core/component.hpp>
 
 template <typename T>
 class exp_smooth : public composite::component {
-    using input_t = aligned::aligned_mem<T>;
-    using input_port_t = composite::input_port<std::unique_ptr<input_t>>;
-    using output_port_t = composite::output_port<std::unique_ptr<input_t>>;
+    using input_port_t = composite::input_port<composite::mutable_buffer<T>>;
+    using output_port_t = composite::output_port<composite::mutable_buffer<T>>;
 public:
     exp_smooth();
     ~exp_smooth() override = default;
@@ -42,7 +40,7 @@ private:
     uint32_t m_num_averages{};
 
     // Members
-    T m_alpha{1};
+    std::optional<T> m_alpha;
     std::unique_ptr<work<T>> m_work;
     typename input_port_t::buffer_type m_prev_psd;
     composite::timestamp m_prev_psd_ts;
