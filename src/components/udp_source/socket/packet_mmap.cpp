@@ -230,7 +230,6 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                     payload_len,
                     frame_release{hdr}
                 );
-
                 m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
             } else {
                 // Non-UDP packet, release frame immediately
