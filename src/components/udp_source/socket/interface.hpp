@@ -17,10 +17,12 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
- #pragma once
+#pragma once
 
+#include <atomic>
 #include <bit>
-#include <composite/output_port.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/ports/output_port.hpp>
 #include <map>
 #include <memory>
 #include <memory_resource>
@@ -77,6 +79,12 @@ struct config {
      */
     std::size_t frame_count{};
 
+    /**
+     * @brief Timeout in seconds for packet size auto-discovery.
+     * Only applies to recvmmsg socket type when msg_size is not set.
+     */
+    std::size_t autodiscovery_timeout{10};
+
 }; // struct config
 
 /**
@@ -89,17 +97,9 @@ struct config {
  */
 class interface {
 public:
-    /**
-     * @brief Type alias for a polymorphic vector of bytes.
-     */
     using buffer_t = std::pmr::vector<uint8_t>;
-
-    /**
-     * @brief Type alias for a shared pointer to a receive buffer.
-     */
     using buffer_ptr_t = std::shared_ptr<buffer_t>;
-
-    using output_port_t = composite::output_port<buffer_ptr_t>;
+    using output_port_t = composite::output_port<composite::immutable_buffer<uint8_t>>;
 
     // Non-copyable and non-movable
     interface(const interface&) = delete;
@@ -147,6 +147,8 @@ protected:
      * @brief Logger instance
      */
     std::shared_ptr<spdlog::logger> m_logger;
+
+    std::atomic<uint64_t> m_pkts_recvd{0};      ///< Total packets received
 
 }; // class interface
 

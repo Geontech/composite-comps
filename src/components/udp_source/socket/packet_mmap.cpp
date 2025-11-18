@@ -17,15 +17,22 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "helpers.hpp"
-#include "packet_mmap.hpp"
-#include "pmr/ring_resource.hpp"
+#include <composite/buffers/external_buffer.hpp>
 
+#include "net/utils.hpp"
+#include "packet_mmap.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <arpa/inet.h>
+#include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <format>
 #include <immintrin.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/ip.h>
@@ -33,22 +40,39 @@
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <poll.h>
+#include <thread>
 #include <stdexcept>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <iostream>
-#include <linux/ethtool.h>
-#include <linux/sockios.h>
-#include <sys/ioctl.h>
+
+namespace {
+constexpr std::size_t DEFAULT_FRAME_SIZE_BYTES = 2048;
+constexpr std::size_t MAX_IDLE_SPINS = 1024;
+constexpr auto IDLE_BACKOFF = std::chrono::microseconds(50);
+
+struct frame_release {
+    tpacket2_hdr* hdr{nullptr};
+    void operator()() const {
+        if (hdr) {
+            std::atomic_ref<uint32_t>(hdr->tp_status).store(TP_STATUS_KERNEL, std::memory_order_release);
+        }
+    }
+};
+}
 
 namespace udp {
 
 packet_mmap::packet_mmap(const config& config) :
   interface(config.logger),
-  m_frame_size(std::bit_ceil(config.msg_size)),
-  m_frame_count(config.frame_count),
-  m_resource({.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}) {
+  m_frame_count(config.frame_count) {
+    auto requested_size = config.msg_size;
+    if (requested_size == 0) {
+        requested_size = DEFAULT_FRAME_SIZE_BYTES;
+        m_logger->debug("msg_size not provided; defaulting to {} bytes for PACKET_MMAP", requested_size);
+    }
+    m_frame_size = std::bit_ceil(requested_size);
     // Create socket
     m_logger->trace("opening af_packet udp socket");
     m_socket = ::socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_IP));
@@ -57,27 +81,23 @@ packet_mmap::packet_mmap(const config& config) :
     }
 
     // Set packet version to v2
-    // int version = TPACKET_V3;
     int version = TPACKET_V2;
     m_logger->trace("setting tpacket version: {}", version);
     if (::setsockopt(m_socket, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0) {
         ::close(m_socket);
-        throw std::runtime_error(std::format("failed to set packet version to v3: {}", std::string{strerror(errno)}));
+        throw std::runtime_error(std::format("failed to set packet version: {}", std::string{strerror(errno)}));
     }
 
     // Set receive buffer size
     if (config.recv_buf_size > 0) {
         m_logger->trace("setting socket receive buffer size to {}", config.recv_buf_size);
-        if (::setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&config.recv_buf_size, sizeof(config.recv_buf_size)) < 0) {
-            ::close(m_socket);
-            throw std::runtime_error(std::format("failed to set receive buffer size: {}", std::string{strerror(errno)}));
-        }
+        net::set_socket_recv_buffer(m_socket, config.recv_buf_size);
     }
 
     // Bind the socket
     auto sll = sockaddr_ll{};
     sll.sll_family = AF_PACKET;
-    sll.sll_ifindex = if_nametoindex(config.interface.c_str());
+    sll.sll_ifindex = net::get_interface_index(config.interface);
     sll.sll_protocol = htons(ETH_P_IP);
     if (sll.sll_ifindex == 0) {
         ::close(m_socket);
@@ -92,7 +112,8 @@ packet_mmap::packet_mmap(const config& config) :
     }
 
     // Set socket ring properties
-    m_block_nr = m_frame_count * m_frame_size / block_size;
+    auto blocks = (m_frame_count * m_frame_size) / block_size;
+    m_block_nr = std::max<uint32_t>(1, blocks);
     struct tpacket_req req{
         .tp_block_size = block_size,
         .tp_block_nr   = m_block_nr,
@@ -149,13 +170,17 @@ packet_mmap::~packet_mmap() {
     if (m_socket != -1) {
         ::close(m_socket);
     }
-    ::munmap(m_ring, block_size * m_block_nr);
+    if (m_ring != nullptr) {
+        ::munmap(m_ring, block_size * m_block_nr);
+    }
 }
 
 auto packet_mmap::start_recv(output_port_t* port) -> void {
     m_out_port = port;
     m_recv_thread = std::jthread(&packet_mmap::receive, this);
-    pthread_setname_np(m_recv_thread.native_handle(), "packet_mmap");
+    if (auto ret = pthread_setname_np(m_recv_thread.native_handle(), "packet_mmap"); ret != 0) {
+        m_logger->warn("failed to set thread name: {}", std::string{strerror(ret)});
+    }
 }
 
 auto packet_mmap::stop_recv() -> void {
@@ -173,20 +198,23 @@ auto packet_mmap::get_stats() -> std::map<std::string, std::string> {
         stats["pkts_recvd_kernel"] = std::to_string(tp_stats.tp_packets);
         stats["pkts_dropped_kernel"] = std::to_string(tp_stats.tp_drops);
     }
-    stats["pkts_recvd"] = std::to_string(m_pkts_recvd.exchange(0));
+    stats["pkts_recvd"] = std::to_string(m_pkts_recvd.load());
     return stats;
 }
 
 auto packet_mmap::receive(std::stop_token token) -> void {
     auto frame_idx = std::size_t{};
-    auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(&m_resource);
+    std::size_t idle_spins = 0;
 
     while (!token.stop_requested()) {
         // Get pointer to current frame
         auto* hdr = (struct tpacket2_hdr*)((uint8_t*)m_ring + (frame_idx * m_frame_size));
 
+        auto status = std::atomic_ref<uint32_t>(hdr->tp_status).load(std::memory_order_acquire);
+
         // Check for ready
-        if (hdr->tp_status & TP_STATUS_USER) [[likely]] {
+        if (status & TP_STATUS_USER) [[likely]] {
+            idle_spins = 0;
             m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
 
             // Validate protocol
@@ -197,34 +225,26 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 auto* payload = (uint8_t*)(udp_hdr) + sizeof(struct udphdr);
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
 
-                // Create a pmr vector and copy udp payload into it
-                // Spin when no available frames
-                while (true) {
-                    try {
-                        auto vec = std::make_shared<buffer_t>(allocator);
-                        vec->resize(payload_len);
-                        std::memcpy(vec->data(), payload, payload_len);
-                        m_out_port->send_data(std::move(vec), {});
-                        break;
-                    } catch (const std::bad_alloc& ex) {
-                        if (m_log_frame_warn) {
-                            m_logger->warn("ring_resource: no available frames; waiting for next available");
-                            m_log_frame_warn = false;
-                        }
-                        std::this_thread::yield();
-                        continue;
-                    }
-                }
-            }
+                auto buffer = std::make_shared<composite::external_buffer<uint8_t, frame_release>>(
+                    payload,
+                    payload_len,
+                    frame_release{hdr}
+                );
 
-            // Release the frame
-            hdr->tp_status = TP_STATUS_KERNEL;
+                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
+            } else {
+                // Non-UDP packet, release frame immediately
+                std::atomic_ref<uint32_t>(hdr->tp_status).store(TP_STATUS_KERNEL, std::memory_order_release);
+            }
             frame_idx = (frame_idx + 1) % m_frame_count;
-            hdr = (struct tpacket2_hdr*)((uint8_t*)m_ring + (frame_idx * m_frame_size));
         } else {
-            struct timespec ts{.tv_sec=0, .tv_nsec=1};
-            nanosleep(&ts, nullptr);
-            // std::this_thread::yield();
+            if (idle_spins < MAX_IDLE_SPINS) {
+                ++idle_spins;
+                std::this_thread::yield();
+            } else {
+                idle_spins = 0;
+                std::this_thread::sleep_for(IDLE_BACKOFF);
+            }
         }
     }
 }

@@ -19,18 +19,18 @@
 
 #pragma once
 
+#include "frame_pool.hpp"
 #include "interface.hpp"
-#include "pmr/ring_resource.hpp"
 
-#include <atomic>
-#include <composite/timestamp.hpp>
 #include <cstdint>
+#include <memory>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace udp {
 
-class recvmmsg : public interface {
+class recvmmsg final : public interface {
 public:
     explicit recvmmsg(const config& config);
     ~recvmmsg() final;
@@ -51,10 +51,9 @@ private:
     std::jthread m_recv_thread;
     std::size_t m_frame_size{};
     std::size_t m_frame_count{};
-    std::unique_ptr<ring_resource> m_resource;
-    bool m_log_frame_warn{true};
+    std::size_t m_autodiscovery_timeout{};
+    std::shared_ptr<frame_pool> m_frame_pool;
     std::size_t m_batch_size{128};
-    std::atomic<uint32_t> m_pkts_recvd{};
 
 }; // class recvmmsg
 

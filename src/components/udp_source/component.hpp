@@ -19,25 +19,22 @@
 
 #include "socket/interface.hpp"
 
+#include <composite/composite.hpp>
+
 #include <array>
-#include <composite/component.hpp>
 #include <memory>
-#include <poll.h>
+#include <mutex>
 #include <string>
 #include <string_view>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
 
 class udp_source : public composite::component {
     static constexpr std::string_view RECVMMSG = "recvmmsg";
     static constexpr std::string_view PACKET_MMAP = "packet_mmap";
     static constexpr std::string_view DPDK = "dpdk";
 
-    using output_t = std::shared_ptr<std::pmr::vector<uint8_t>>;
-    using output_port_t = composite::output_port<output_t>;
+    using output_port_t = composite::output_port<composite::immutable_buffer<uint8_t>>;
 public:
-    udp_source();
+    explicit udp_source(std::string_view id);
     ~udp_source() override = default;
     auto property_change_handler() -> void override;
     auto start() -> void override;
@@ -54,18 +51,36 @@ private:
     std::string m_ip_addr;
     uint16_t m_port{};
     uint32_t m_num_msgs{};
-    uint32_t m_frame_count{32768};
+    uint32_t m_frame_count{8192};
     uint32_t m_recv_buf_size{};
+    uint32_t m_autodiscovery_timeout{10};
 
     struct overrides {
-        std::optional<uint32_t> msg_size{};
+        std::optional<uint32_t> msg_size;
     }; // struct overrides
     overrides m_overrides;
+
+    // DPDK-specific properties
+    struct dpdk_config {
+        std::optional<uint16_t> port_id;        // Optional: auto-resolved from interface
+        std::optional<uint16_t> queue_id;       // Optional: auto-assigned
+        std::string mempool_name{"mbuf_pool"};
+        uint16_t burst_size{32};
+
+        // IGMP configuration (automatically enabled for multicast if src_ip provided)
+        bool igmp_respond_to_queries{true};
+        std::string src_ip;                     // Source IP for IGMP (enables IGMP if dst is multicast)
+    }; // struct dpdk_config
+    dpdk_config m_dpdk;
 
     // Members
     std::unique_ptr<udp::interface> m_receiver;
     std::jthread m_stat_thread;
-    uint16_t m_pkt_count{};
-    bool m_new_socket_required{true};
+    std::mutex m_receiver_mtx;
+    bool m_component_running{false};
+    bool m_receiver_running{false};
+
+    auto start_receiver_locked() -> void;
+    auto stop_receiver_locked() -> void;
 
 }; // class udp_source

@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <array>
 #include <linux/if_packet.h>
 #include <netinet/in.h>
 #include <string_view>
@@ -27,7 +28,11 @@ namespace net {
 
 auto is_ipv4_multicast(std::string_view ip_addr) -> bool;
 auto create_packet_mreq(std::string_view interface, std::string_view ip_addr) -> packet_mreq;
+auto create_multicast_mac(std::string_view mcast_ip) -> std::array<uint8_t, 6>;
 auto get_interface_ip(int fd, std::string_view interface) -> std::string;
 auto create_ip_mreq(int fd, std::string_view interface, std::string_view ip_addr) -> ip_mreq;
+auto set_socket_recv_buffer(int fd, std::size_t size) -> void;
+auto set_socket_reuse_addr(int fd, bool enable=true) -> void;
+auto get_interface_index(std::string_view interface) -> std::size_t;
 
 } // namespace net

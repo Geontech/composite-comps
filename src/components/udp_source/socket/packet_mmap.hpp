@@ -20,10 +20,7 @@
 #pragma once
 
 #include "interface.hpp"
-#include "pmr/ring_resource.hpp"
 
-#include <atomic>
-#include <composite/timestamp.hpp>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -31,7 +28,7 @@
 
 namespace udp {
 
-class packet_mmap : public interface {
+class packet_mmap final : public interface {
     static constexpr auto block_size = uint32_t{1 << 20};
 public:
     packet_mmap(const config& config);
@@ -47,14 +44,11 @@ private:
     output_port_t* m_out_port{nullptr};
     int m_socket{-1};
     int m_join_socket{-1};
-    void* m_ring;
+    void* m_ring{nullptr};
     std::jthread m_recv_thread;
     uint32_t m_frame_size{};
     uint32_t m_frame_count{};
     uint32_t m_block_nr{};
-    ring_resource m_resource;
-    bool m_log_frame_warn{true};
-    std::atomic<uint32_t> m_pkts_recvd{};
 
 }; // class packet_mmap
 

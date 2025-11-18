@@ -17,28 +17,34 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "helpers.hpp"
+#include <composite/buffers/external_buffer.hpp>
+
+#include "net/utils.hpp"
 #include "recvmmsg.hpp"
-#include "pmr/ring_resource.hpp"
 
 #include <arpa/inet.h>
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <netinet/in.h>
 #include <net/if.h>
 #include <poll.h>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace udp {
 
 recvmmsg::recvmmsg(const config& config) :
   interface(config.logger),
-  m_frame_count(config.frame_count) {
+  m_frame_count(config.frame_count),
+  m_autodiscovery_timeout(config.autodiscovery_timeout) {
     // Create socket
     m_logger->trace("opening udp socket");
     m_socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -49,10 +55,7 @@ recvmmsg::recvmmsg(const config& config) :
     // Set receive buffer size
     if (config.recv_buf_size > 0) {
         m_logger->trace("setting socket receive buffer size to {}", config.recv_buf_size);
-        if (::setsockopt(m_socket, SOL_SOCKET, SO_RCVBUF, (char*)&config.recv_buf_size, sizeof(config.recv_buf_size)) < 0) {
-            ::close(m_socket);
-            throw std::runtime_error(std::format("failed to set receive buffer size: {}", std::string{strerror(errno)}));
-        }
+        net::set_socket_recv_buffer(m_socket, config.recv_buf_size);
     }
 
     // Set batch size
@@ -62,7 +65,7 @@ recvmmsg::recvmmsg(const config& config) :
     m_logger->trace("using recvmmsg batch size of {}", m_batch_size);
 
     // Bind the socket
-    auto bind_addr = htonl(inet_addr(config.ip_addr.data()));
+    auto bind_addr = inet_addr(config.ip_addr.data());
     auto is_multicast = net::is_ipv4_multicast(config.ip_addr);
     if (is_multicast) {
         bind_addr = INADDR_ANY;
@@ -75,7 +78,7 @@ recvmmsg::recvmmsg(const config& config) :
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = ntohl(bind_addr);
+    addr.sin_addr.s_addr = bind_addr;
     addr.sin_port = htons(config.port);
     if (::bind(m_socket, (const struct sockaddr*)&addr, sizeof(addr)) < 0) {
         ::close(m_socket);
@@ -92,13 +95,10 @@ recvmmsg::recvmmsg(const config& config) :
         }
     }
 
-    // User has overriden properties
+    // User has overridden properties - allocate frame pool
     if (config.msg_size > 0) {
         m_frame_size = std::bit_ceil(config.msg_size);
-        m_resource = std::make_unique<ring_resource>(
-            ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}
-        );
-        m_logger->trace("using user-provided msg_size of: {} bytes", config.msg_size);
+        m_frame_pool = std::make_shared<frame_pool>(m_frame_size, m_frame_count);
     }
 }
 
@@ -113,40 +113,70 @@ recvmmsg::~recvmmsg() {
 }
 
 auto recvmmsg::start_recv(output_port_t* port) -> void {
-    // User has not overriden properties
+    // User has not overriden properties (or requesting auto-discovery)
     if (m_frame_size == 0) {
+        // Minimum data packet size in an attempt to exclude context packets
+        static constexpr std::size_t MIN_DATA_PACKET_SIZE = 512;
+
+        // VITA 49 packet type identifiers
+        static constexpr uint8_t V49_CONTEXT_PACKET = 0x40;
+        static constexpr uint8_t V49_EXT_CONTEXT_PACKET = 0x50;
+
         // Discover the size of the incoming packets from the wire
         std::array<uint8_t, 9000> buffer{}; // Use a jumbo frame buffer
-        while (true) {
+        auto attempts = 0;
+        const auto max_attempts = static_cast<int>(m_autodiscovery_timeout);
+
+        while (attempts < max_attempts) {
             struct pollfd pfd{
                 .fd = m_socket,
                 .events = POLLIN,
                 .revents = 0
             };
             if (auto poll_res = ::poll(&pfd, 1, 1000/*ms*/); poll_res <= 0) {
-                m_logger->debug("waiting for data to know how to size internal buffers...");
+                ++attempts;
+                m_logger->debug(
+                    "waiting for data to know how to size internal buffers... (attempt {}/{})",
+                    attempts, max_attempts
+                );
                 continue;
             }
-            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
-                // Assume anything over 512 bytes is a valid data packet (either SDDS or V49)
-                if (recvd < 512) {
-                    continue;
-                }
-                if (auto pkt_type = buffer[0] & 0xF0; pkt_type == 0x40 || pkt_type == 0x50) { // ignore v49 context signatures
+            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > MIN_DATA_PACKET_SIZE) {
+                // Skip V49 context packets, wait for data packet
+                auto pkt_type = buffer[0] & 0xF0;
+                if (pkt_type == V49_CONTEXT_PACKET || pkt_type == V49_EXT_CONTEXT_PACKET) {
                     continue;
                 }
                 m_logger->trace("using discovered msg_size of: {} bytes", recvd);
                 m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
-                m_resource = std::make_unique<ring_resource>(
-                    ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}
-                );
+                m_frame_pool = std::make_shared<frame_pool>(m_frame_size, m_frame_count);
                 break;
             }
         }
+
+        if (m_frame_size == 0) {
+            throw std::runtime_error(
+                std::format(
+                    "failed to discover packet size after {} seconds - no valid data packets received. "
+                    "Consider setting 'overrides.msg_size' explicitly in the configuration.",
+                    m_autodiscovery_timeout
+                )
+            );
+        }
+    }
+    if (!m_frame_pool) {
+        m_frame_pool = std::make_shared<frame_pool>(m_frame_size, m_frame_count);
+    }
+    if (m_frame_count < m_batch_size) {
+        m_logger->warn("frame_count ({}) smaller than batch_size ({}); clamping batch_size to frame count",
+                       m_frame_count, m_batch_size);
+        m_batch_size = m_frame_count;
     }
     m_out_port = port;
     m_recv_thread = std::jthread(&recvmmsg::receive, this);
-    pthread_setname_np(m_recv_thread.native_handle(), "recvmmsg");
+    if (auto ret = pthread_setname_np(m_recv_thread.native_handle(), "recvmmsg"); ret != 0) {
+        m_logger->warn("failed to set thread name: {}", std::string{strerror(ret)});
+    }
 }
 
 auto recvmmsg::stop_recv() -> void {
@@ -158,78 +188,122 @@ auto recvmmsg::stop_recv() -> void {
 
 auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
     auto stats = std::map<std::string, std::string>{};
-    stats["pkts_recvd"] = std::to_string(m_pkts_recvd.exchange(0));
+    stats["pkts_recvd"] = std::to_string(m_pkts_recvd.load());
     return stats;
 }
 
+namespace {
+constexpr auto INVALID_SLOT = std::numeric_limits<std::size_t>::max();
+struct slot_release {
+    std::shared_ptr<frame_pool> pool;
+    std::size_t index{INVALID_SLOT};
+
+    auto operator()() const -> void {
+        if (pool && index != INVALID_SLOT) {
+            pool->release(index);
+        }
+    }
+};
+} // namespace
+
 auto recvmmsg::receive(std::stop_token token) -> void {
+    if (!m_frame_pool) {
+        m_logger->error("recvmmsg frame pool not initialized");
+        return;
+    }
+
     struct pollfd pfd{
         .fd = m_socket,
         .events = POLLIN,
         .revents = 0
     };
 
-    // Allocator for pmr vectors
-    auto allocator = std::pmr::polymorphic_allocator<std::uint8_t>(m_resource.get());
+    auto iovecs = std::vector<struct iovec>(m_batch_size);
+    auto msgs = std::vector<struct mmsghdr>(m_batch_size);
+    auto slot_indices = std::vector<std::size_t>(m_batch_size, INVALID_SLOT);
 
-    // Buffers
-    buffer_ptr_t buffers[m_batch_size];
-    struct mmsghdr msgs[m_batch_size]{};
-    struct iovec iovecs[m_batch_size]{};
+    auto acquire_slot = [&](std::size_t idx) -> bool {
+        constexpr auto ACQUIRE_BACKOFF = std::chrono::microseconds(50);
+        while (!token.stop_requested()) {
+            if (auto slot = m_frame_pool->try_acquire()) {
+                slot_indices[idx] = slot->index;
+                iovecs[idx].iov_base = slot->payload;
+                iovecs[idx].iov_len = m_frame_pool->frame_size();
+                msgs[idx].msg_hdr.msg_iov = &iovecs[idx];
+                msgs[idx].msg_hdr.msg_iovlen = 1;
+                msgs[idx].msg_hdr.msg_control = nullptr;
+                msgs[idx].msg_hdr.msg_controllen = 0;
+                msgs[idx].msg_hdr.msg_name = nullptr;
+                msgs[idx].msg_hdr.msg_namelen = 0;
+                msgs[idx].msg_len = 0;
+                return true;
+            }
+            std::this_thread::sleep_for(ACQUIRE_BACKOFF);
+        }
+        return false;
+    };
 
-    // Initialize buffers and iovecs
     for (std::size_t i = 0; i < m_batch_size; ++i) {
-        buffers[i] = std::make_shared<buffer_t>(allocator);
-        buffers[i]->resize(m_frame_size);
-        iovecs[i].iov_base = buffers[i]->data();
-        iovecs[i].iov_len = buffers[i]->size();
-        msgs[i].msg_hdr.msg_iov = &iovecs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
+        if (!acquire_slot(i)) {
+            // Release any slots acquired so far before returning
+            for (std::size_t j = 0; j < i; ++j) {
+                if (slot_indices[j] != INVALID_SLOT) {
+                    m_frame_pool->release(slot_indices[j]);
+                }
+            }
+            return;
+        }
     }
 
-    auto msgs_recvd = std::size_t{};
     while (!token.stop_requested()) {
-        if (auto poll_res = ::poll(&pfd, 1, 1/*ms*/); poll_res <= 0) {
+        if (auto poll_res = ::poll(&pfd, 1, 1); poll_res <= 0) {
             continue;
         }
 
         if (pfd.revents & POLLIN) [[likely]] {
-            // Call recvmmsg
-            struct timespec ts{.tv_sec=0, .tv_nsec=100'000}; // 100 us
-            if (auto recvd = ::recvmmsg(m_socket, &msgs[msgs_recvd], m_batch_size - msgs_recvd, 0, &ts); recvd > 0) {
-                msgs_recvd += recvd;
-                m_pkts_recvd.fetch_add(recvd, std::memory_order_relaxed);
+            struct timespec ts{.tv_sec=0, .tv_nsec=100'000};
+            auto recvd = ::recvmmsg(m_socket, msgs.data(), m_batch_size, 0, &ts);
+            if (recvd < 0) {
+                // Handle errors
+                if (errno == EINTR) { continue; }
+                // Critical error
+                m_logger->error("recvmmsg failed: {} (errno={})", std::string{strerror(errno)}, errno);
+                if (errno == EBADF || errno == EINVAL) { return; }
+                continue;
             }
-            if (msgs_recvd < m_batch_size) {
+            if (recvd == 0) {
                 continue;
             }
 
-            // Place onto queue
-            for (auto i=0u; i<msgs_recvd; ++i) {
-                buffers[i]->resize(msgs[i].msg_len); // trim to actual recvd size
-                m_out_port->send_data(std::move(buffers[i]), {});
+            auto msgs_recvd = static_cast<std::size_t>(recvd);
+            m_pkts_recvd.fetch_add(msgs_recvd, std::memory_order_relaxed);
 
-                // Reallocate for next loop
-                while (true) {
-                    try {
-                        buffers[i] = std::make_shared<buffer_t>(allocator);
-                        buffers[i]->resize(m_frame_size);
-                        iovecs[i].iov_base = buffers[i]->data();
-                        break;
-                    } catch (const std::bad_alloc& ex) {
-                        if (m_log_frame_warn) {
-                            m_logger->warn("ring_resource: no available frames; waiting for next available");
-                            m_log_frame_warn = false;
+            for (std::size_t i = 0; i < msgs_recvd; ++i) {
+                auto slot_idx = slot_indices[i];
+                if (slot_idx == INVALID_SLOT) {
+                    continue;
+                }
+                auto* data = static_cast<uint8_t*>(iovecs[i].iov_base);
+                auto len = msgs[i].msg_len;
+                auto buffer = std::make_shared<composite::external_buffer<uint8_t, slot_release>>(
+                    data,
+                    len,
+                    slot_release{m_frame_pool, slot_idx}
+                );
+                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
+                slot_indices[i] = INVALID_SLOT;
+                if (!acquire_slot(i)) {
+                    // Release any remaining slots before returning
+                    for (std::size_t j = i + 1; j < msgs_recvd; ++j) {
+                        if (slot_indices[j] != INVALID_SLOT) {
+                            m_frame_pool->release(slot_indices[j]);
                         }
-                        std::this_thread::yield();
-                        continue;
                     }
+                    return;
                 }
             }
-            msgs_recvd = 0;
         }
     }
-
 }
 
 } // namespace udp

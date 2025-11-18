@@ -29,31 +29,69 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
 set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_compile_options(-march=x86-64-v2 -mtune=generic)
 
-# Library
-add_library(udp_source MODULE
+# Check if DPDK is available from composite
+get_target_property(COMPOSITE_COMPILE_DEFS composite::composite INTERFACE_COMPILE_DEFINITIONS)
+if(COMPOSITE_COMPILE_DEFS MATCHES "COMPOSITE_USE_DPDK")
+    set(COMPOSITE_HAS_DPDK ON)
+    message(STATUS "udp_source: DPDK support enabled")
+else()
+    set(COMPOSITE_HAS_DPDK OFF)
+    message(STATUS "udp_source: DPDK support disabled")
+endif()
+
+# Library sources
+set(UDP_SOURCE_SRCS
     component.cpp
     socket/packet_mmap.cpp
     socket/recvmmsg.cpp
-    helpers.cpp
-    pmr/ring_resource.cpp
+    net/utils.cpp
 )
+
+# Add DPDK backend if available
+if(COMPOSITE_HAS_DPDK)
+    list(APPEND UDP_SOURCE_SRCS
+        socket/dpdk.cpp
+        socket/igmp.cpp
+    )
+endif()
+
+add_library(udp_source MODULE ${UDP_SOURCE_SRCS})
+
+# Compile definitions
+if(COMPOSITE_HAS_DPDK)
+    target_compile_definitions(udp_source PRIVATE COMPOSITE_HAS_DPDK=1)
+endif()
+
 # Includes
 target_include_directories(udp_source
     PRIVATE
     ${vrtgen_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
 # Link
 target_link_libraries(udp_source
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
 )
+
+# Add DPDK includes and linkage if available
+if(COMPOSITE_HAS_DPDK)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(DPDK REQUIRED libdpdk)
+    target_include_directories(udp_source PRIVATE ${DPDK_INCLUDE_DIRS})
+    target_link_libraries(udp_source PRIVATE ${DPDK_LIBRARIES})
+    target_link_directories(udp_source PRIVATE ${DPDK_LIBRARY_DIRS})
+endif()
 # Install
 install(TARGETS udp_source
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
