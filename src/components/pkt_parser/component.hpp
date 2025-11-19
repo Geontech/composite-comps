@@ -17,29 +17,22 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include <array>
-#include <composite/component.hpp>
+#include "config.hpp"
+#include "parsers/protocol_parser.hpp"
+
+#include <composite/core/component.hpp>
+#include <composite/buffers/buffer.hpp>
+
 #include <memory>
-#include <poll.h>
 #include <string>
 #include <string_view>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <sys/uio.h>
-
-enum class transport : uint8_t {
-    unknown,
-    sdds,
-    vita49
-}; // enum class transport
+#include <vector>
 
 class pkt_parser : public composite::component {
-    using input_t = std::pmr::vector<uint8_t>;
-    using input_port_t = composite::input_port<std::shared_ptr<input_t>>;
-    using output_t = input_t;
-    using output_port_t = composite::output_port<std::shared_ptr<output_t>>;
+    using input_port_t = composite::input_port<composite::immutable_buffer<uint8_t>>;
+    using output_port_t = composite::output_port<composite::immutable_buffer<uint8_t>>;
 public:
-    pkt_parser();
+    explicit pkt_parser(std::string_view id);
     ~pkt_parser() override = default;
     auto property_change_handler() -> void override;
     auto process() -> composite::retval override;
@@ -50,26 +43,13 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Properties
-    struct format {
-        std::optional<bool> is_complex;
-        std::string type;
-        uint32_t bit_width{};
-        std::string endianness;
-    }; // struct format
-    struct signal_overrides {
-        std::optional<double> center_frequency;
-        std::optional<double> bandwidth;
-        std::optional<double> sample_rate;
-        format data_format;
-        std::string transport;
-    }; // struct signal_overrides
-    signal_overrides m_signal_overrides;
+    ::signal_overrides m_signal_overrides;
 
     // Members
-    transport m_transport{};
+    std::vector<std::unique_ptr<parsers::protocol_parser>> m_parsers;
+    parsers::protocol_parser* m_active_parser{nullptr};
     composite::metadata m_metadata;
-    bool m_init_metadata{};
-    uint16_t m_pkt_count{};
-    bool m_tsf_warn{};
+    bool m_init_metadata{false};
+    bool m_unknown_protocol_warned{false};
 
 }; // class pkt_parser

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2024 Geon Technologies, LLC
+# Copyright (C) 2025 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -18,7 +18,7 @@
 #
 
 cmake_minimum_required(VERSION 3.15)
-project(stov VERSION 0.1.0 LANGUAGES CXX)
+project(framer VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -35,21 +35,26 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-march=x86-64-v2 -mtune=generic)
 
 # Library
-add_library(stov MODULE
+add_library(framer MODULE
     component.cpp
 )
 # Includes
-target_include_directories(stov
+target_include_directories(framer
     PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../include
 )
 # Link
-target_link_libraries(stov
+target_link_libraries(framer
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
 )
 # Install
-install(TARGETS stov
+install(TARGETS framer
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+
+# Tests
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

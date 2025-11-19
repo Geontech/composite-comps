@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -14,21 +14,32 @@
  * License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public License
- * along with this program.  If not, see http://www.gnu.org/licenses/.
+ * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "component.hpp"
+#pragma once
 
-#include <complex>
-#include <string_view>
+#include <cstdint>
+#include <optional>
+#include <string>
 
-extern "C" {
-    auto create(std::string_view type) -> std::shared_ptr<composite::component> {
-        if (type == "cf32") {
-            return std::make_shared<stov<std::complex<float>>>();
-        } else if (type == "ci16") {
-            return std::make_shared<stov<std::complex<int16_t>>>();
-        }
-        return std::make_shared<stov<std::complex<float>>>();
-    }
-}
+/**
+ * @brief Signal override configuration
+ *
+ * Allows manual override of protocol-extracted metadata
+ */
+struct signal_overrides {
+    std::optional<double> center_frequency;
+    std::optional<double> bandwidth;
+    std::optional<double> sample_rate;
+
+    struct format {
+        std::optional<bool> is_complex;
+        std::string type;
+        uint32_t bit_width{};
+        std::string endianness;
+    };
+
+    format data_format;
+    std::string transport;
+};

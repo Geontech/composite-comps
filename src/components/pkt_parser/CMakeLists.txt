@@ -37,7 +37,11 @@ add_compile_options(-march=x86-64-v2 -mtune=generic)
 # Library
 add_library(pkt_parser MODULE
     component.cpp
-    overlay.cpp
+    overlay/sdds.cpp
+    overlay/vita49.cpp
+    parsers/sdds_parser.cpp
+    parsers/vita49_parser.cpp
+    parsers/vita49dot1_parser.cpp
 )
 # Includes
 target_include_directories(pkt_parser
