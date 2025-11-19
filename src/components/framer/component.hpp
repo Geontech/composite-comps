@@ -87,7 +87,6 @@ private:
     uint32_t m_frame_size{};
     uint32_t m_overlap{};
     uint32_t m_frame_count{64};
-    bool m_byteswap{true};
 
     // Metadata tracking
     composite::metadata m_metadata{};
@@ -95,12 +94,12 @@ private:
     source_format m_source_format{source_format::unknown};
     std::size_t m_input_stride{};
 
-    // Type converter (AVX-optimized) - converts to scalar type (float or int16_t)
-    std::unique_ptr<converter_base<typename T::value_type>> m_converter;
-
     // Frame pool manages ring buffer and slot allocation
     std::shared_ptr<framer_pool<T>> m_pool;
     std::size_t m_next_frame_start{};  // Next frame start sample
+
+    // Type converter (AVX-optimized) - converts to scalar type (float or int16_t)
+    std::unique_ptr<converter_base<typename T::value_type>> m_converter;
 
     // Partial sample handling (when incoming buffers break sample boundaries)
     std::vector<uint8_t> m_partial_sample;

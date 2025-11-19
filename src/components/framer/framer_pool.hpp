@@ -41,14 +41,14 @@ public:
         std::size_t ring_offset{0};                 // Fixed offset in ring buffer
     };
 
-    framer_pool(std::size_t frame_size, std::size_t overlap, std::size_t frame_count)
-        : m_frame_size(frame_size)
-        , m_overlap(overlap)
-        , m_hop_size(frame_size - overlap)
-        , m_frame_count(frame_count)
-        , m_ring_size(frame_size * frame_count + overlap)
-        , m_ring(std::make_shared<composite::aligned_mem<T>>(64, m_ring_size))
-    {
+    framer_pool(std::size_t frame_size, std::size_t overlap, std::size_t frame_count) :
+      m_frame_size(frame_size),
+      m_overlap(overlap),
+      m_hop_size(frame_size - overlap),
+      m_frame_count(frame_count),
+      m_ring_size(frame_size * frame_count + overlap),
+      m_ring(std::make_shared<composite::aligned_mem<T>>(64, m_ring_size)),
+      m_slots(frame_count) {
         // Pre-compute ring offsets for all slots
         for (std::size_t i = 0; i < m_frame_count; ++i) {
             m_slots[i].ring_offset = (i * m_hop_size) % m_ring_size;
@@ -62,14 +62,16 @@ public:
     }
 
     // Write samples to ring using AVX converter
-    auto write_samples(const uint8_t* input, std::size_t sample_count,
-                       converter_base<typename T::value_type>* converter,
-                       std::size_t input_stride) -> bool {
+    auto write_samples(
+      const uint8_t* input, std::size_t sample_count,
+      converter_base<typename T::value_type>* converter,
+      std::size_t input_stride
+    ) -> bool {
         if (!converter) {
             return false;
         }
 
-        std::size_t head = m_head.load(std::memory_order_acquire);
+        auto head = m_head.load(std::memory_order_acquire);
 
         // Check for conflicts with inflight frames
         if (!can_write_range(head, sample_count)) {
@@ -158,7 +160,6 @@ private:
     };
 
     // Check if writing to [start, start+count) would conflict with any inflight frame
-    // NOTE: Must check ring buffer positions, not absolute positions, since ring wraps!
     auto can_write_range(std::size_t start, std::size_t count) -> bool {
         // Calculate ring buffer position for this write
         std::size_t write_ring_pos = start % m_ring_size;
@@ -200,12 +201,13 @@ private:
         return true;  // No conflicts
     }
 
-    std::size_t m_frame_size;
-    std::size_t m_overlap;
-    std::size_t m_hop_size;
-    std::size_t m_frame_count;
-    std::size_t m_ring_size;
-    std::shared_ptr<composite::aligned_mem<T>> m_ring;
+    std::size_t m_frame_size{};
+    std::size_t m_overlap{};
+    std::size_t m_hop_size{};
+    std::size_t m_frame_count{};
+    std::size_t m_ring_size{};
+    std::shared_ptr<composite::aligned_mem<T>> m_ring{nullptr};
     std::atomic<std::size_t> m_head{0};
-    std::array<frame_slot, 64> m_slots;
-};
+    std::vector<frame_slot> m_slots;
+
+}; // class framer_pool

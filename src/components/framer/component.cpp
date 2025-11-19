@@ -48,9 +48,6 @@ framer<T>::framer() : composite::component("framer") {
         .change_listener([this]() {
             return m_frame_count >= 2;
         });
-
-    add_property("byteswap", &m_byteswap)
-        .configurability(RUNTIME);
 }
 
 template <typename T>
@@ -135,18 +132,21 @@ template <typename T>
 auto framer<T>::create_converter() -> void {
     using scalar_t = typename T::value_type;  // float or int16_t from complex<T>
 
+    // Automatically determine if byte swapping is needed
+    bool needs_swap = (m_metadata.format.endianness != std::endian::native);
+
     // Create appropriate converter based on source format and output type
     if constexpr (std::is_same_v<scalar_t, float>) {
         switch (m_source_format) {
             case source_format::real_i8:
             case source_format::complex_i8:
-                m_converter = std::make_unique<converter<int8_t, float>>(m_byteswap);
+                m_converter = std::make_unique<converter<int8_t, float>>(needs_swap);
                 break;
             case source_format::complex_i16:
-                m_converter = std::make_unique<converter<int16_t, float>>(m_byteswap);
+                m_converter = std::make_unique<converter<int16_t, float>>(needs_swap);
                 break;
             case source_format::complex_cf32:
-                m_converter = std::make_unique<converter<uint32_t, float>>(m_byteswap);
+                m_converter = std::make_unique<converter<uint32_t, float>>(needs_swap);
                 break;
             default:
                 break;
@@ -155,10 +155,10 @@ auto framer<T>::create_converter() -> void {
         switch (m_source_format) {
             case source_format::real_i8:
             case source_format::complex_i8:
-                m_converter = std::make_unique<converter<int8_t, int16_t>>(m_byteswap);
+                m_converter = std::make_unique<converter<int8_t, int16_t>>(needs_swap);
                 break;
             case source_format::complex_i16:
-                m_converter = std::make_unique<converter<int16_t, int16_t>>(m_byteswap);
+                m_converter = std::make_unique<converter<int16_t, int16_t>>(needs_swap);
                 break;
             default:
                 break;
