@@ -54,6 +54,8 @@ constexpr auto IDLE_BACKOFF = std::chrono::microseconds(50);
 
 struct frame_release {
     tpacket2_hdr* hdr{nullptr};
+    udp::packet_mmap::ring_buffer_ptr ring{nullptr};
+
     void operator()() const {
         if (hdr) {
             std::atomic_ref<uint32_t>(hdr->tp_status).store(TP_STATUS_KERNEL, std::memory_order_release);
@@ -63,6 +65,12 @@ struct frame_release {
 }
 
 namespace udp {
+
+packet_mmap::ring_buffer::~ring_buffer() {
+    if (ring != nullptr) {
+        ::munmap(ring, block_size * block_nr);
+    }
+}
 
 packet_mmap::packet_mmap(const config& config) :
   interface(config.logger),
@@ -113,10 +121,10 @@ packet_mmap::packet_mmap(const config& config) :
 
     // Set socket ring properties
     auto blocks = (m_frame_count * m_frame_size) / block_size;
-    m_block_nr = std::max<uint32_t>(1, blocks);
+    auto block_nr = std::max<uint32_t>(1, blocks);
     struct tpacket_req req{
         .tp_block_size = block_size,
-        .tp_block_nr   = m_block_nr,
+        .tp_block_nr   = block_nr,
         .tp_frame_size = m_frame_size,
         .tp_frame_nr   = m_frame_count
     };
@@ -127,14 +135,19 @@ packet_mmap::packet_mmap(const config& config) :
 
     // Memory-map the ring buffer
     auto ring_size = req.tp_block_size * req.tp_block_nr;
-    m_ring = ::mmap(0, ring_size,  PROT_READ | PROT_WRITE, MAP_SHARED, m_socket, 0);
-    if (m_ring == MAP_FAILED) {
+    void* ring_ptr = ::mmap(0, ring_size,  PROT_READ | PROT_WRITE, MAP_SHARED, m_socket, 0);
+    if (ring_ptr == MAP_FAILED) {
         ::close(m_socket);
         throw std::runtime_error(std::format("failed to create mmap buffer: {}", std::string{strerror(errno)}));
     }
 
+    // Wrap in shared_ptr for automatic lifetime management
+    m_ring_buffer = std::make_shared<ring_buffer>();
+    m_ring_buffer->ring = ring_ptr;
+    m_ring_buffer->block_nr = block_nr;
+
     // Request Transparent Huge Pages
-    ::madvise(m_ring, ring_size, MADV_HUGEPAGE);
+    ::madvise(m_ring_buffer->ring, ring_size, MADV_HUGEPAGE);
 
     if (net::is_ipv4_multicast(config.ip_addr)) {
         // Enable multicast mode on the interface
@@ -170,9 +183,7 @@ packet_mmap::~packet_mmap() {
     if (m_socket != -1) {
         ::close(m_socket);
     }
-    if (m_ring != nullptr) {
-        ::munmap(m_ring, block_size * m_block_nr);
-    }
+    // Ring buffer automatically unmaps when last shared_ptr is destroyed
 }
 
 auto packet_mmap::start_recv(output_port_t* port) -> void {
@@ -208,7 +219,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
 
     while (!token.stop_requested()) {
         // Get pointer to current frame
-        auto* hdr = (struct tpacket2_hdr*)((uint8_t*)m_ring + (frame_idx * m_frame_size));
+        auto* hdr = (struct tpacket2_hdr*)((uint8_t*)m_ring_buffer->ring + (frame_idx * m_frame_size));
 
         auto status = std::atomic_ref<uint32_t>(hdr->tp_status).load(std::memory_order_acquire);
 
@@ -218,7 +229,8 @@ auto packet_mmap::receive(std::stop_token token) -> void {
             m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
 
             // Validate protocol
-            auto ip_hdr = (struct iphdr*)((uint8_t*)hdr + hdr->tp_mac);
+            // Note: With SOCK_DGRAM, tp_net points to IP header (no Ethernet header)
+            auto ip_hdr = (struct iphdr*)((uint8_t*)hdr + hdr->tp_net);
             if (ip_hdr->protocol == IPPROTO_UDP) [[likely]] {
                 // Extract UDP payload
                 auto* udp_hdr = (struct udphdr*)((uint8_t*)(ip_hdr) + ip_hdr->ihl * 4);
@@ -228,7 +240,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 auto buffer = std::make_shared<composite::external_buffer<uint8_t, frame_release>>(
                     payload,
                     payload_len,
-                    frame_release{hdr}
+                    frame_release{hdr, m_ring_buffer}
                 );
                 m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
             } else {

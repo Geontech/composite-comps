@@ -31,6 +31,14 @@ namespace udp {
 class packet_mmap final : public interface {
     static constexpr auto block_size = uint32_t{1 << 20};
 public:
+    struct ring_buffer {
+        void* ring{nullptr};
+        uint32_t block_nr{0};
+
+        ~ring_buffer();
+    };
+    using ring_buffer_ptr = std::shared_ptr<ring_buffer>;
+
     packet_mmap(const config& config);
     ~packet_mmap() final;
 
@@ -39,16 +47,16 @@ public:
     auto get_stats() -> std::map<std::string, std::string> override;
 
 private:
+
     auto receive(std::stop_token token) -> void;
 
     output_port_t* m_out_port{nullptr};
     int m_socket{-1};
     int m_join_socket{-1};
-    void* m_ring{nullptr};
+    ring_buffer_ptr m_ring_buffer;
     std::jthread m_recv_thread;
     uint32_t m_frame_size{};
     uint32_t m_frame_count{};
-    uint32_t m_block_nr{};
 
 }; // class packet_mmap
 
