@@ -68,7 +68,7 @@ namespace udp {
 
 packet_mmap::ring_buffer::~ring_buffer() {
     if (ring != nullptr) {
-        ::munmap(ring, block_size * block_nr);
+        ::munmap(ring, packet_mmap::block_size * block_nr);
     }
 }
 
@@ -237,7 +237,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 auto* payload = (uint8_t*)(udp_hdr) + sizeof(struct udphdr);
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
 
-                auto buffer = std::make_shared<composite::external_buffer<uint8_t, frame_release>>(
+                auto buffer = std::make_shared<composite::external_buffer<uint8_t>>(
                     payload,
                     payload_len,
                     frame_release{hdr, m_ring_buffer}

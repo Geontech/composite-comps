@@ -98,7 +98,7 @@ recvmmsg::recvmmsg(const config& config) :
     // User has overridden properties - allocate frame pool
     if (config.msg_size > 0) {
         m_frame_size = std::bit_ceil(config.msg_size);
-        m_frame_pool = std::make_shared<frame_pool>(m_frame_size, m_frame_count);
+        m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
     }
 }
 
@@ -149,7 +149,7 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
                 }
                 m_logger->trace("using discovered msg_size of: {} bytes", recvd);
                 m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
-                m_frame_pool = std::make_shared<frame_pool>(m_frame_size, m_frame_count);
+                m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
                 break;
             }
         }
@@ -164,8 +164,8 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
             );
         }
     }
-    if (!m_frame_pool) {
-        m_frame_pool = std::make_shared<frame_pool>(m_frame_size, m_frame_count);
+    if (!m_pool) {
+        m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
     }
     if (m_frame_count < m_batch_size) {
         m_logger->warn("frame_count ({}) smaller than batch_size ({}); clamping batch_size to frame count",
@@ -192,23 +192,9 @@ auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
     return stats;
 }
 
-namespace {
-constexpr auto INVALID_SLOT = std::numeric_limits<std::size_t>::max();
-struct slot_release {
-    std::shared_ptr<frame_pool> pool;
-    std::size_t index{INVALID_SLOT};
-
-    auto operator()() const -> void {
-        if (pool && index != INVALID_SLOT) {
-            pool->release(index);
-        }
-    }
-};
-} // namespace
-
 auto recvmmsg::receive(std::stop_token token) -> void {
-    if (!m_frame_pool) {
-        m_logger->error("recvmmsg frame pool not initialized");
+    if (!m_pool) {
+        m_logger->error("recvmmsg pool not initialized");
         return;
     }
 
@@ -218,17 +204,20 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         .revents = 0
     };
 
+    // Pre-allocate structures for batch operations
     auto iovecs = std::vector<struct iovec>(m_batch_size);
     auto msgs = std::vector<struct mmsghdr>(m_batch_size);
-    auto slot_indices = std::vector<std::size_t>(m_batch_size, INVALID_SLOT);
+    using buffer_opt_t = std::optional<composite::external_buffer<uint8_t>>;
+    auto buffers = std::vector<buffer_opt_t>(m_batch_size);
 
-    auto acquire_slot = [&](std::size_t idx) -> bool {
+    // Acquire buffers from pool and set up iovecs
+    auto acquire_buffer = [&](std::size_t idx) -> bool {
         constexpr auto ACQUIRE_BACKOFF = std::chrono::microseconds(50);
         while (!token.stop_requested()) {
-            if (auto slot = m_frame_pool->try_acquire()) {
-                slot_indices[idx] = slot->index;
-                iovecs[idx].iov_base = slot->payload;
-                iovecs[idx].iov_len = m_frame_pool->frame_size();
+            if (auto buf = m_pool->acquire()) {
+                buffers[idx] = std::move(buf);
+                iovecs[idx].iov_base = buffers[idx]->data();
+                iovecs[idx].iov_len = buffers[idx]->size();
                 msgs[idx].msg_hdr.msg_iov = &iovecs[idx];
                 msgs[idx].msg_hdr.msg_iovlen = 1;
                 msgs[idx].msg_hdr.msg_control = nullptr;
@@ -243,16 +232,9 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         return false;
     };
 
+    // Initial batch acquisition
     for (std::size_t i = 0; i < m_batch_size; ++i) {
-        if (!acquire_slot(i)) {
-            // Release any slots acquired so far before returning
-            for (std::size_t j = 0; j < i; ++j) {
-                if (slot_indices[j] != INVALID_SLOT) {
-                    m_frame_pool->release(slot_indices[j]);
-                }
-            }
-            return;
-        }
+        if (!acquire_buffer(i)) { return; }
     }
 
     while (!token.stop_requested()) {
@@ -264,9 +246,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
             struct timespec ts{.tv_sec=0, .tv_nsec=100'000};
             auto recvd = ::recvmmsg(m_socket, msgs.data(), m_batch_size, 0, &ts);
             if (recvd < 0) {
-                // Handle errors
                 if (errno == EINTR) { continue; }
-                // Critical error
                 m_logger->error("recvmmsg failed: {} (errno={})", std::string{strerror(errno)}, errno);
                 if (errno == EBADF || errno == EINVAL) { return; }
                 continue;
@@ -278,29 +258,24 @@ auto recvmmsg::receive(std::stop_token token) -> void {
             auto msgs_recvd = static_cast<std::size_t>(recvd);
             m_pkts_recvd.fetch_add(msgs_recvd, std::memory_order_relaxed);
 
+            // Process received messages
             for (std::size_t i = 0; i < msgs_recvd; ++i) {
-                auto slot_idx = slot_indices[i];
-                if (slot_idx == INVALID_SLOT) {
+                if (!buffers[i].has_value()) {
                     continue;
                 }
-                auto* data = static_cast<uint8_t*>(iovecs[i].iov_base);
+
+                // Create length-adjusted view using take()
                 auto len = msgs[i].msg_len;
-                auto buffer = std::make_shared<composite::external_buffer<uint8_t, slot_release>>(
-                    data,
-                    len,
-                    slot_release{m_frame_pool, slot_idx}
+                auto sized_buffer = std::make_shared<composite::external_buffer<uint8_t>>(
+                    std::move(buffers[i].value()).take(len)
                 );
-                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
-                slot_indices[i] = INVALID_SLOT;
-                if (!acquire_slot(i)) {
-                    // Release any remaining slots before returning
-                    for (std::size_t j = i + 1; j < msgs_recvd; ++j) {
-                        if (slot_indices[j] != INVALID_SLOT) {
-                            m_frame_pool->release(slot_indices[j]);
-                        }
-                    }
-                    return;
-                }
+
+                // Send data downstream
+                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(sized_buffer)), {});
+
+                // Acquire replacement buffer for next batch
+                buffers[i].reset();
+                if (!acquire_buffer(i)) { return; }
             }
         }
     }

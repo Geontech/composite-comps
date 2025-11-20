@@ -19,8 +19,9 @@
 
 #pragma once
 
-#include "frame_pool.hpp"
 #include "interface.hpp"
+
+#include <composite/buffers/slab_pool.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -52,7 +53,7 @@ private:
     std::size_t m_frame_size{};
     std::size_t m_frame_count{};
     std::size_t m_autodiscovery_timeout{};
-    std::shared_ptr<frame_pool> m_frame_pool;
+    std::shared_ptr<composite::slab_pool<uint8_t>> m_pool;
     std::size_t m_batch_size{128};
 
 }; // class recvmmsg
