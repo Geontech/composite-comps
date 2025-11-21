@@ -26,3 +26,8 @@ add_subdirectory(pkt_parser)
 add_subdirectory(psd)
 add_subdirectory(stov)
 add_subdirectory(udp_source)
+
+# Optional components
+if(COMPOSITE_BUILD_WS_SINK)
+    add_subdirectory(ws_sink)
+endif()
