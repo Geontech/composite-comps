@@ -19,6 +19,7 @@
 
 #include "component.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <climits>
 #include <complex>
@@ -49,10 +50,16 @@ auto histogram::initialize() -> void {
     for (auto i = SHRT_MIN; i <= SHRT_MAX; ++i) {
         if (i < 0) {
             m_sample_bits.push_back(-1 * static_cast<int8_t>(std::min(static_cast<double>(m_adc_bits), std::floor(std::log2(std::abs(i))) + 1)));
+        } else if (i == 0) {
+            // Zero samples have no magnitude, map to center bin (0 bits)
+            m_sample_bits.push_back(0);
         } else {
             m_sample_bits.push_back(static_cast<int8_t>(std::min(static_cast<double>(m_adc_bits), std::floor(std::log2(std::abs(i))) + 1)));
         }
     }
+
+    // Calculate skip threshold for percent_sampled
+    m_skip_threshold = static_cast<uint32_t>(1.0f / m_percent_sampled);
 }
 
 auto histogram::process() -> composite::retval {
@@ -61,36 +68,61 @@ auto histogram::process() -> composite::retval {
     if (data == nullptr) {
         return NOOP;
     }
-    // Process frames based on
-    if ((m_skip_counter++ % static_cast<uint32_t>((float{1} / m_percent_sampled))) == 0) {
-        // Histogram
-        auto payload = std::span<const std::complex<int16_t>>{
-            reinterpret_cast<const std::complex<int16_t>*>(data->data()),
-            data->size() / sizeof(std::complex<int16_t>)
-        };
-        for (const auto& sample : payload) {
-            auto sample_val = static_cast<int16_t>(m_byteswap ? std::byteswap(sample.real()) : sample.real());
-            auto histogram_val = static_cast<int32_t>(sample_val) + static_cast<int32_t>(std::numeric_limits<int16_t>::max() + 1);
+    // Extract sample rate from metadata if present
+    if (meta.has_value() && meta->sample_rate > 0.0) {
+        if (m_sample_rate != static_cast<float>(meta->sample_rate)) {
+            m_sample_rate = static_cast<float>(meta->sample_rate);
+            logger()->info("Updated sample_rate from metadata: {} sps", m_sample_rate);
+        }
+    }
+
+    // Don't process data until sample_rate is configured
+    if (m_sample_rate <= 0.0f) {
+        logger()->warn("Skipping data - sample_rate not configured (set property or wait for metadata)");
+        return NOOP;
+    }
+
+    // Process frames based on skip threshold (optimized from modulo)
+    if (++m_skip_counter >= m_skip_threshold) {
+        m_skip_counter = 0;
+
+        // Work directly with int16_t array for better performance
+        auto samples_ptr = reinterpret_cast<int16_t*>(data->data());
+        auto num_samples = data->size() / sizeof(std::complex<int16_t>);
+
+        // Byteswap only real components (even indices) if needed - hoist out of loop
+        if (m_byteswap) {
+            for (size_t i = 0; i < num_samples; ++i) {
+                samples_ptr[i * 2] = std::byteswap(samples_ptr[i * 2]);
+            }
+        }
+
+        // Hoist histogram size calculations out of loop
+        const auto hist_size = static_cast<int32_t>(m_histogram->size());
+
+        // Histogram loop - only process real components
+        for (size_t i = 0; i < num_samples; ++i) {
+            auto sample_val = samples_ptr[i * 2];  // Only read real (already swapped)
+            auto histogram_val = static_cast<int32_t>(sample_val) + 32768;  // Offset to positive range
+
             if (m_display_as_bits) {
-                histogram_val = m_sample_bits[histogram_val] + m_histogram->size() / 2;
+                histogram_val = m_sample_bits[histogram_val] + m_adc_bits;
             }
-            
-            if (histogram_val >= 0 && histogram_val < m_histogram->size()) {
-                m_histogram->at(histogram_val) += 1;
-            } else if (histogram_val < 0) {
-                m_histogram->front() += 1;
-            } else {
-                m_histogram->back() += 1;
-            }
+
+            // Clamp to valid range and increment
+            histogram_val = std::clamp(histogram_val, 0, hist_size - 1);
+            (*m_histogram)[histogram_val] += 1;
             ++m_histogram_samples;
         }
+
         // Send histogram data
         if (m_histogram_samples > static_cast<uint32_t>(m_sample_rate)) {
             m_out_port.send_data(std::move(m_histogram), ts);
+            // Reuse buffer instead of reallocating
             if (m_display_as_bits) {
-                m_histogram = std::make_unique<histogram_t>(m_adc_bits * 2 + 1, 0);
+                m_histogram = std::make_shared<histogram_t>(m_adc_bits * 2 + 1, 0);
             } else {
-                m_histogram = std::make_unique<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
+                m_histogram = std::make_shared<histogram_t>(static_cast<size_t>(pow(2, m_adc_bits)), 0);
             }
             m_histogram_samples = 0;
         }

@@ -53,5 +53,6 @@ private:
     std::vector<int8_t> m_sample_bits;
     uint32_t m_histogram_samples{};
     uint32_t m_skip_counter{};
+    uint32_t m_skip_threshold{1};
 
 }; // class histogram
