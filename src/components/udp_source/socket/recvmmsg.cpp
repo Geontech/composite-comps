@@ -127,20 +127,24 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
                 m_logger->debug("waiting for data to know how to size internal buffers...");
                 continue;
             }
-            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 0) {
-                // Assume anything over 512 bytes is a valid data packet (either SDDS or V49)
-                if (recvd < 512) {
-                    continue;
+            // Assume anything over 512 bytes is a valid data packet (either SDDS or V49)
+            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > 512) {
+                bool is_valid_data_packet = (recvd == 1080);  // SDDS
+
+                if (!is_valid_data_packet) {
+                    if (auto pkt_type = buffer[0] & 0xF0; pkt_type == 0x40 || pkt_type == 0x50) { // ignore v49 context signatures
+                        continue;
+                    }
+                    is_valid_data_packet = true;
                 }
-                if (auto pkt_type = buffer[0] & 0xF0; pkt_type == 0x40 || pkt_type == 0x50) { // ignore v49 context signatures
-                    continue;
+                if (is_valid_data_packet) {
+                    m_logger->trace("using discovered msg_size of: {} bytes", recvd);
+                    m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
+                    m_resource = std::make_unique<ring_resource>(
+                        ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}
+                    );
+                    break;
                 }
-                m_logger->trace("using discovered msg_size of: {} bytes", recvd);
-                m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
-                m_resource = std::make_unique<ring_resource>(
-                    ring_resource::ring_config{.frame_size=m_frame_size, .frame_count=m_frame_count, .alignment=64}
-                );
-                break;
             }
         }
     }
