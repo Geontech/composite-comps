@@ -22,6 +22,9 @@ project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Build options
+option(COMPOSITE_BUILD_WS_SINK "Build WebSocket sink component (requires IXWebSocket)" ON)
+
 # Use FetchContent for dependencies
 include(FetchContent)
 # composite dependency
