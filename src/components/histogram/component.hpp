@@ -54,5 +54,6 @@ private:
     uint32_t m_histogram_samples{};
     uint32_t m_skip_counter{};
     uint32_t m_skip_threshold{1};
+    uint32_t m_send_threshold{0};
 
 }; // class histogram
