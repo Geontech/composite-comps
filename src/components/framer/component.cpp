@@ -21,30 +21,30 @@
 
 #include <complex>
 #include <cstring>
+#include <format>
 #include <string_view>
 
 template <typename T>
 framer<T>::framer() : composite::component("framer") {
-    using enum composite::properties::config_type;
     add_port(&m_in_port);
     add_port(&m_out_port);
 
     add_property("frame_size", &m_frame_size)
         .units("samples")
-        .configurability(INITIALIZE)
+        .configurability(composite::properties::config_type::INITIALIZE)
         .change_listener([this]() {
             return m_frame_size > 0;
         });
 
     add_property("overlap", &m_overlap)
         .units("samples")
-        .configurability(INITIALIZE)
+        .configurability(composite::properties::config_type::INITIALIZE)
         .change_listener([this]() {
             return m_overlap < m_frame_size;
         });
 
     add_property("frame_count", &m_frame_count)
-        .configurability(INITIALIZE)
+        .configurability(composite::properties::config_type::INITIALIZE)
         .change_listener([this]() {
             return m_frame_count >= 2;
         });
@@ -54,21 +54,37 @@ template <typename T>
 auto framer<T>::reset_state() -> void {
     m_in_port.clear();
     m_metadata_ready = false;
-    m_source_format = source_format::unknown;
+    m_input_format = {};  // Reset to default
     m_input_stride = 0;
     m_next_frame_start = 0;
     m_timestamp_initialized = false;
-    m_partial_sample.clear();
 }
 
 template <typename T>
 auto framer<T>::initialize_pool() -> void {
     if (m_frame_size == 0) {
+        logger()->error("framer: frame_size must be > 0");
+        return;
+    }
+
+    if (m_overlap >= m_frame_size) {
+        logger()->error("framer: overlap ({}) must be < frame_size ({})", m_overlap, m_frame_size);
         return;
     }
 
     auto frames = std::max<uint32_t>(m_frame_count, 2);
-    m_pool = std::make_shared<framer_pool<T>>(m_frame_size, m_overlap, frames);
+
+    try {
+        m_pool = std::make_shared<framer_pool<T>>(m_frame_size, m_overlap, frames);
+        logger()->debug("framer: initialized pool with frame_size={}, overlap={}, frame_count={}, "
+                       "hop_size={}, ring_size={}",
+                       m_frame_size, m_overlap, frames,
+                       m_frame_size - m_overlap, frames * (m_frame_size - m_overlap) + m_overlap);
+    } catch (const std::exception& e) {
+        logger()->error("framer: failed to initialize pool: {}", e.what());
+        m_pool.reset();
+        return;
+    }
 
     reset_state();
 }
@@ -79,39 +95,59 @@ auto framer<T>::property_change_handler() -> void {
 }
 
 template <typename T>
-auto framer<T>::detect_source_format(const composite::metadata& meta) const -> source_format {
-    const auto bit_width = meta.format.bit_width;
-    const auto type = meta.format.type;
-    const auto is_complex = meta.format.is_complex;
+auto framer<T>::is_supported_input_format(const composite::data_format& fmt) const -> bool {
+    const auto bit_width = fmt.bit_width;
+    const auto type = fmt.type;
+    const auto is_complex = fmt.is_complex;
 
+    // Real i8
     if (!is_complex && bit_width == 8 && type == composite::data_type::signed_integer) {
-        return source_format::real_i8;
+        return true;
     }
 
+    // Complex i8
     if (is_complex && bit_width == 8 && type == composite::data_type::signed_integer) {
-        return source_format::complex_i8;
+        return true;
     }
 
+    // Complex i16
     if (is_complex && bit_width == 16 && type == composite::data_type::signed_integer) {
-        return source_format::complex_i16;
+        return true;
     }
 
+    // Complex cf32
     if (is_complex && bit_width == 32 && type == composite::data_type::floating_point) {
-        return source_format::complex_cf32;
+        return true;
     }
 
-    return source_format::unknown;
+    return false;
 }
 
 template <typename T>
 auto framer<T>::bytes_per_input_sample() const -> std::size_t {
-    switch (m_source_format) {
-        case source_format::real_i8: return 1;
-        case source_format::complex_i8: return 2;
-        case source_format::complex_i16: return 4;
-        case source_format::complex_cf32: return 8;
-        default: break;
+    const auto bit_width = m_input_format.bit_width;
+    const auto is_complex = m_input_format.is_complex;
+
+    // Real i8: 1 byte
+    if (!is_complex && bit_width == 8) {
+        return 1;
     }
+
+    // Complex i8: 2 bytes (I + Q)
+    if (is_complex && bit_width == 8) {
+        return 2;
+    }
+
+    // Complex i16: 4 bytes (I + Q)
+    if (is_complex && bit_width == 16) {
+        return 4;
+    }
+
+    // Complex cf32: 8 bytes (I + Q as floats)
+    if (is_complex && bit_width == 32) {
+        return 8;
+    }
+
     return 0;
 }
 
@@ -132,54 +168,58 @@ template <typename T>
 auto framer<T>::create_converter() -> void {
     using scalar_t = typename T::value_type;  // float or int16_t from complex<T>
 
-    // Automatically determine if byte swapping is needed
-    bool needs_swap = (m_metadata.format.endianness != std::endian::native);
+    // Automatically determine if byte swapping is needed based on INPUT endianness
+    bool needs_swap = (m_input_format.endianness != std::endian::native);
 
-    // Create appropriate converter based on source format and output type
+    const auto bit_width = m_input_format.bit_width;
+    const auto type = m_input_format.type;
+    const auto is_complex = m_input_format.is_complex;
+
+    // Create appropriate converter based on input format and output type
     if constexpr (std::is_same_v<scalar_t, float>) {
-        switch (m_source_format) {
-            case source_format::real_i8:
-            case source_format::complex_i8:
-                m_converter = std::make_unique<converter<int8_t, float>>(needs_swap);
-                break;
-            case source_format::complex_i16:
-                m_converter = std::make_unique<converter<int16_t, float>>(needs_swap);
-                break;
-            case source_format::complex_cf32:
-                m_converter = std::make_unique<converter<uint32_t, float>>(needs_swap);
-                break;
-            default:
-                break;
+        // Output type is float
+        if (bit_width == 8 && type == composite::data_type::signed_integer) {
+            // i8 -> float (handles both real and complex)
+            m_converter = converter<int8_t, float>(needs_swap);
+        } else if (is_complex && bit_width == 16 && type == composite::data_type::signed_integer) {
+            // complex i16 -> float
+            m_converter = converter<int16_t, float>(needs_swap);
+        } else if (is_complex && bit_width == 32 && type == composite::data_type::floating_point) {
+            // complex cf32 -> float (passthrough)
+            m_converter = converter<uint32_t, float>(needs_swap);
+        } else {
+            m_converter = std::nullopt;
         }
     } else if constexpr (std::is_same_v<scalar_t, int16_t>) {
-        switch (m_source_format) {
-            case source_format::real_i8:
-            case source_format::complex_i8:
-                m_converter = std::make_unique<converter<int8_t, int16_t>>(needs_swap);
-                break;
-            case source_format::complex_i16:
-                m_converter = std::make_unique<converter<int16_t, int16_t>>(needs_swap);
-                break;
-            default:
-                break;
+        // Output type is int16_t
+        if (bit_width == 8 && type == composite::data_type::signed_integer) {
+            // i8 -> int16_t (handles both real and complex)
+            m_converter = converter<int8_t, int16_t>(needs_swap);
+        } else if (is_complex && bit_width == 16 && type == composite::data_type::signed_integer) {
+            // complex i16 -> int16_t (passthrough)
+            m_converter = converter<int16_t, int16_t>(needs_swap);
+        } else {
+            m_converter = std::nullopt;
         }
     }
 }
 
 template <typename T>
 auto framer<T>::handle_metadata(const composite::metadata& meta) -> void {
-    auto fmt = detect_source_format(meta);
-    if (fmt == source_format::unknown) {
-        logger()->warn("framer: unsupported input format (bit_width={}, type={})",
-                       meta.format.bit_width, static_cast<int>(meta.format.type));
+    if (!is_supported_input_format(meta.format)) {
+        logger()->warn("framer: unsupported input format (bit_width={}, type={}, complex={})",
+                       meta.format.bit_width, static_cast<int>(meta.format.type), meta.format.is_complex);
         m_metadata_ready = false;
         return;
     }
 
-    auto changed = (!m_metadata_ready) || (fmt != m_source_format) || (meta != m_metadata);
+    auto changed = (!m_metadata_ready) || (meta.format != m_input_format) || (meta != m_metadata);
+
+    // Save input format before overwriting metadata
+    m_input_format = meta.format;
     m_metadata = meta;
-    m_source_format = fmt;
     m_metadata_ready = true;
+
     m_input_stride = bytes_per_input_sample();
     if (m_input_stride == 0) {
         logger()->error("framer: computed input stride is zero");
@@ -194,9 +234,7 @@ auto framer<T>::handle_metadata(const composite::metadata& meta) -> void {
         logger()->trace("framer: updated metadata:\n{}", m_metadata.to_string());
         m_out_port.send_metadata(m_metadata);
     }
-    m_partial_sample.clear();
 }
-
 
 template <typename T>
 auto framer<T>::process_buffer(const composite::immutable_buffer<uint8_t>& buffer, composite::timestamp ts) -> void {
@@ -213,40 +251,45 @@ auto framer<T>::process_buffer(const composite::immutable_buffer<uint8_t>& buffe
     auto span = buffer.as_span();
     const uint8_t* bytes = span.data();
     std::size_t byte_count = span.size();
-    std::size_t offset = 0;
-
-    // Handle partial sample from previous buffer
-    if (!m_partial_sample.empty()) {
-        auto needed = m_input_stride - m_partial_sample.size();
-        auto take = std::min<std::size_t>(needed, byte_count);
-        m_partial_sample.insert(m_partial_sample.end(), bytes, bytes + take);
-        offset += take;
-
-        if (m_partial_sample.size() == m_input_stride) {
-            if (!m_pool->write_samples(m_partial_sample.data(), 1, m_converter.get(), m_input_stride)) {
-                logger()->warn("framer: failed to write partial sample, dropping");
-            }
-            m_partial_sample.clear();
-        } else {
-            return; // Still incomplete, wait for more data
-        }
-    }
+    const bool is_complex = m_input_format.is_complex;
 
     // Process complete samples in batch
-    std::size_t remaining_bytes = byte_count - offset;
-    std::size_t complete_samples = remaining_bytes / m_input_stride;
+    std::size_t complete_samples = byte_count / m_input_stride;
 
     if (complete_samples > 0) {
-        const uint8_t* input_ptr = bytes + offset;
-        if (!m_pool->write_samples(input_ptr, complete_samples, m_converter.get(), m_input_stride)) {
-            logger()->warn("framer: failed to write {} samples, dropping", complete_samples);
+        if (!m_pool->write_samples(bytes, complete_samples, &m_converter.value(), m_input_stride, is_complex)) {
+            auto diag = m_pool->get_diagnostics();
+
+            m_samples_dropped += complete_samples;
+
+            switch (diag.last_drop_reason) {
+                case decltype(m_pool)::element_type::drop_reason::BATCH_TOO_LARGE:
+                    ++m_drops_batch_too_large;
+                    logger()->error("framer: failed to write {} samples (BATCH TOO LARGE) - "
+                                   "batch size exceeds ring_size ({}). Dropping samples.",
+                                   complete_samples, diag.ring_size);
+                    break;
+                case decltype(m_pool)::element_type::drop_reason::BACKPRESSURE_TIMEOUT:
+                    ++m_drops_backpressure;
+                    logger()->warn("framer: failed to write {} samples (BACKPRESSURE TIMEOUT) - "
+                                  "downstream holding frames. Dropping samples. "
+                                  "Slots in use: {}/{}, available space: {} samples, write_head: {}, "
+                                  "oldest protected: {}",
+                                  complete_samples, diag.slots_in_use, diag.total_slots,
+                                  diag.available_space, diag.write_head, diag.oldest_protected_sample);
+                    break;
+                default:
+                    logger()->warn("framer: failed to write {} samples (UNKNOWN), dropping", complete_samples);
+                    break;
+            }
         }
-        offset += complete_samples * m_input_stride;
     }
 
-    // Save partial sample for next buffer
-    if (offset < byte_count) {
-        m_partial_sample.assign(bytes + offset, bytes + byte_count);
+    // If there are leftover bytes, it indicates a non-sample-aligned buffer, which is now considered an error.
+    if (byte_count % m_input_stride != 0) {
+        logger()->warn("framer: received a buffer that is not aligned to sample boundaries ({} bytes, stride {}). "
+                       "Partial sample handling has been disabled, so leftover bytes will be discarded.",
+                       byte_count, m_input_stride);
     }
 }
 
@@ -275,6 +318,13 @@ auto framer<T>::try_emit_frames() -> void {
 template <typename T>
 auto framer<T>::compute_frame_timestamp(std::size_t start_sample) const -> composite::timestamp {
     if (!m_timestamp_initialized || m_metadata.sample_rate <= 0.0) {
+        return m_timestamp_origin;
+    }
+
+    // Handle potential underflow by checking if start_sample is less than origin
+    if (start_sample < m_timestamp_origin_sample) {
+        logger()->warn("framer: start_sample ({}) < origin_sample ({}), using origin timestamp",
+                       start_sample, m_timestamp_origin_sample);
         return m_timestamp_origin;
     }
 
@@ -324,6 +374,6 @@ extern "C" {
         } else if (type == "ci16") {
             return std::make_shared<framer<std::complex<int16_t>>>();
         }
-        return std::make_shared<framer<std::complex<float>>>();
+        throw std::runtime_error(std::format("unknown type '{}' for framer component", type));
     }
 }

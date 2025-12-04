@@ -3,10 +3,9 @@ if(NOT TARGET composite::composite)
     message(STATUS "composite not found, falling back to FetchContent")
     FetchContent_Declare(composite
         GIT_REPOSITORY https://github.com/geontech/composite.git
-        GIT_TAG 52-add-compile-time-feature-for-configuring-and-initializing-dpdk-environment
+        GIT_TAG develop
     )
     FetchContent_MakeAvailable(composite)
 else()
     message(STATUS "Using composite version: ${composite_VERSION}")
 endif()
-

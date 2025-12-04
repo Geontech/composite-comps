@@ -22,6 +22,8 @@ project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+enable_testing()
+
 # Use FetchContent for dependencies
 include(FetchContent)
 # composite dependency

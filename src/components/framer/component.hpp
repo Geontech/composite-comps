@@ -40,7 +40,7 @@
 #include <composite/buffers/external_buffer.hpp>
 #include <composite/composite.hpp>
 
-#include "convert.hpp"
+#include "convert_variant.hpp"
 #include "framer_pool.hpp"
 
 namespace framer_detail {
@@ -49,6 +49,8 @@ inline constexpr auto PS_PER_SEC = 1'000'000'000'000ULL;
 
 template <typename T>
 class framer : public composite::component {
+    friend struct FramerTestFixture;
+    friend class framer_integration_tests;
     using input_port_t = composite::input_port<composite::immutable_buffer<uint8_t>>;
     using output_port_t = composite::output_port<composite::immutable_buffer<T>>;
 
@@ -60,18 +62,10 @@ public:
     auto process() -> composite::retval override;
 
 private:
-    enum class source_format {
-        unknown,
-        real_i8,
-        complex_i8,
-        complex_i16,
-        complex_cf32
-    };
-
     auto reset_state() -> void;
     auto initialize_pool() -> void;
     auto handle_metadata(const composite::metadata& meta) -> void;
-    auto detect_source_format(const composite::metadata& meta) const -> source_format;
+    auto is_supported_input_format(const composite::data_format& fmt) const -> bool;
     auto bytes_per_input_sample() const -> std::size_t;
     auto configure_output_metadata() -> void;
     auto create_converter() -> void;
@@ -88,10 +82,15 @@ private:
     uint32_t m_overlap{};
     uint32_t m_frame_count{64};
 
+    // Statistics (read-only, updated at runtime)
+    uint64_t m_samples_dropped{0};
+    uint64_t m_drops_batch_too_large{0};
+    uint64_t m_drops_backpressure{0};
+
     // Metadata tracking
     composite::metadata m_metadata{};
     bool m_metadata_ready{false};
-    source_format m_source_format{source_format::unknown};
+    composite::data_format m_input_format{};
     std::size_t m_input_stride{};
 
     // Frame pool manages ring buffer and slot allocation
@@ -99,10 +98,11 @@ private:
     std::size_t m_next_frame_start{};  // Next frame start sample
 
     // Type converter (AVX-optimized) - converts to scalar type (float or int16_t)
-    std::unique_ptr<converter_base<typename T::value_type>> m_converter;
+    std::optional<converter_variant<typename T::value_type>> m_converter;
 
     // Partial sample handling (when incoming buffers break sample boundaries)
-    std::vector<uint8_t> m_partial_sample;
+    // Max input stride is 8 bytes (for complex_cf32)
+    static constexpr std::size_t MAX_INPUT_STRIDE_BYTES = 8;
 
     // Timestamp tracking
     composite::timestamp m_timestamp_origin{};
