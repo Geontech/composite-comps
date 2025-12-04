@@ -46,6 +46,7 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Properties
+    bool m_active{false};
     std::string m_socket_type{RECVMMSG};
     std::string m_interface;
     std::string m_ip_addr;

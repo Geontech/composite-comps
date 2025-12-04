@@ -38,6 +38,7 @@
 udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_port(&m_out_port);
     using enum composite::properties::config_type;
+    add_property("active", &m_active).configurability(RUNTIME);
     add_property("socket_type", &m_socket_type).change_listener([this]() {
         return m_socket_type == RECVMMSG
             || m_socket_type == PACKET_MMAP
@@ -51,8 +52,8 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_property("frame_count", &m_frame_count).configurability(RUNTIME);
     add_property("autodiscovery_timeout", &m_autodiscovery_timeout).units("seconds");
     add_struct_property("overrides", &m_overrides, [this](auto& set, auto* prop) {
-        set.add_property("msg_size", &prop->msg_size).units("bytes");
-    });
+        set.add_property("msg_size", &prop->msg_size).configurability(RUNTIME).units("bytes");
+    }).configurability(RUNTIME);
     add_struct_property("dpdk", &m_dpdk, [this](auto& set, auto* prop) {
         set.add_property("port_id", &prop->port_id);
         set.add_property("queue_id", &prop->queue_id);
@@ -65,6 +66,21 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
 
 auto udp_source::property_change_handler() -> void {
     logger()->trace(std::source_location::current().function_name());
+
+    // If we're transitioning to inactive, just stop the receiver
+    if (!m_active) {
+        std::scoped_lock lock(m_receiver_mtx);
+        stop_receiver_locked();
+        return;
+    }
+
+    // Skip receiver creation if configuration is incomplete
+    if (m_ip_addr.empty() || m_port == 0) {
+        logger()->debug("Skipping receiver creation: incomplete configuration (ip_addr='{}', port={})",
+                       m_ip_addr, m_port);
+        return;
+    }
+
     auto config = udp::config{
         .logger = logger(),
         .interface = m_interface,
@@ -174,7 +190,7 @@ auto udp_source::process() -> composite::retval {
 }
 
 auto udp_source::start_receiver_locked() -> void {
-    if (!m_receiver || m_receiver_running) {
+    if (!m_active || !m_receiver || m_receiver_running) {
         return;
     }
     m_receiver->start_recv(&m_out_port);
