@@ -55,7 +55,7 @@ class framer : public composite::component {
     using output_port_t = composite::output_port<composite::immutable_buffer<T>>;
 
 public:
-    framer();
+    explicit framer(std::string_view);
     ~framer() override = default;
 
     auto property_change_handler() -> void override;

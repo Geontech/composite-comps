@@ -25,7 +25,7 @@
 #include <string_view>
 
 template <typename T>
-framer<T>::framer() : composite::component("framer") {
+framer<T>::framer(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
 
@@ -368,11 +368,11 @@ auto framer<T>::process() -> composite::retval {
 }
 
 extern "C" {
-    auto create(std::string_view type) -> std::shared_ptr<composite::component> {
+    auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
         if (type == "cf32") {
-            return std::make_shared<framer<std::complex<float>>>();
+            return std::make_shared<framer<std::complex<float>>>(id);
         } else if (type == "ci16") {
-            return std::make_shared<framer<std::complex<int16_t>>>();
+            return std::make_shared<framer<std::complex<int16_t>>>(id);
         }
         throw std::runtime_error(std::format("unknown type '{}' for framer component", type));
     }
