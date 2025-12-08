@@ -266,12 +266,14 @@ auto recvmmsg::receive(std::stop_token token) -> void {
 
                 // Create length-adjusted view using take()
                 auto len = msgs[i].msg_len;
-                auto sized_buffer = std::make_shared<composite::external_buffer<uint8_t>>(
-                    std::move(buffers[i].value()).take(len)
-                );
+                auto sized_buffer = composite::immutable_buffer<uint8_t>(
+                    std::make_shared<composite::external_buffer<uint8_t>>(
+                        std::move(buffers[i].value())
+                    )
+                ).slice(0, len);
 
                 // Send data downstream
-                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(sized_buffer)), {});
+                m_out_port->send_data(sized_buffer, {});
 
                 // Acquire replacement buffer for next batch
                 buffers[i].reset();
