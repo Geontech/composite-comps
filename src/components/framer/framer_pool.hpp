@@ -19,14 +19,16 @@
 
 #pragma once
 
-#include <chrono>
-#include <condition_variable>
+#include <atomic>
 #include <cstring>
+#include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <vector>
+
+#include <immintrin.h>
 
 #include <composite/buffers/aligned_mem.hpp>
 #include <composite/buffers/buffer.hpp>
@@ -55,8 +57,8 @@ public:
     };
 
     struct frame_slot {
-        bool in_use{false};
-        std::size_t start_sample{0};
+        std::atomic<bool> in_use{false};
+        std::atomic<std::size_t> start_sample{0};
     };
 
     framer_pool(std::size_t frame_size, std::size_t overlap, std::size_t frame_count) :
@@ -82,9 +84,12 @@ public:
 
         // Allocate ring buffer (still use aligned_mem for better cache performance)
         m_ring = std::make_shared<composite::aligned_mem<T>>(64, m_ring_capacity);
+
+        // Initialize oldest protected to max (no slots in use initially)
+        m_oldest_protected.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
     }
 
-    // Write samples to ring - blocks until space available
+    // Write samples to ring - lock-free on hot path, spins/yields on backpressure
     auto write_samples(
       const uint8_t* input, std::size_t sample_count,
       converter_variant<typename T::value_type>* converter,
@@ -99,29 +104,43 @@ public:
         }
 
         if (sample_count > m_ring_size) {
-            m_drop_reason = drop_reason::BATCH_TOO_LARGE;
-            m_last_drop_sample_count = sample_count;
+            m_drop_reason.store(drop_reason::BATCH_TOO_LARGE, std::memory_order_relaxed);
+            m_last_drop_sample_count.store(sample_count, std::memory_order_relaxed);
             return false;
         }
 
-        std::unique_lock lock(m_mutex);
+        // Lock-free backpressure check with spin + yield
+        auto write_head = m_write_head.load(std::memory_order_relaxed);
 
-        // Block until space available (backpressure), with timeout
-        bool space_available = m_space_available.wait_for(
-            lock,
-            std::chrono::seconds(1),
-            [&]() { return can_write_unlocked(sample_count); }
-        );
+        if (!can_write_fast(write_head, sample_count)) {
+            // Spin briefly with pause
+            constexpr int SPIN_COUNT = 1000;
+            for (int i = 0; i < SPIN_COUNT; ++i) {
+                _mm_pause();
+                if (can_write_fast(write_head, sample_count)) {
+                    goto do_write;
+                }
+            }
 
-        if (!space_available) {
-            m_drop_reason = drop_reason::BACKPRESSURE_TIMEOUT;
-            m_last_drop_sample_count = sample_count;
-            return false;  // Timeout - likely deadlock or backpressure issue
+            // Yield and retry
+            constexpr int MAX_YIELDS = 100;
+            for (int i = 0; i < MAX_YIELDS; ++i) {
+                std::this_thread::yield();
+                if (can_write_fast(write_head, sample_count)) {
+                    goto do_write;
+                }
+            }
+
+            // Still blocked - timeout
+            m_drop_reason.store(drop_reason::BACKPRESSURE_TIMEOUT, std::memory_order_relaxed);
+            m_last_drop_sample_count.store(sample_count, std::memory_order_relaxed);
+            return false;
         }
 
+    do_write:
         using scalar_t = typename T::value_type;
         auto* ring_base = m_ring->data();
-        std::size_t ring_pos = m_write_head % m_ring_size;
+        std::size_t ring_pos = write_head % m_ring_size;
 
         auto write_complex = [&](std::size_t dst_offset, const uint8_t* src, std::size_t samples) {
             std::size_t component_count = samples * 2;
@@ -171,25 +190,25 @@ public:
             std::memcpy(ring_base + m_ring_size, ring_base, second_chunk * sizeof(T));
         }
 
-        m_write_head += sample_count;
+        // Update write head - release so readers see the written data
+        m_write_head.store(write_head + sample_count, std::memory_order_release);
         return true;
     }
 
-    // Try to emit a frame
+    // Try to emit a frame - lock-free
     auto try_emit_frame(std::size_t absolute_start) -> std::optional<composite::immutable_buffer<T>> {
-        std::unique_lock lock(m_mutex);
-
         // Validate frame alignment - absolute_start MUST be aligned to hop boundaries
         if (absolute_start % m_hop_size != 0) {
-            // This indicates a logic error in the caller
             throw std::logic_error(std::format(
                 "framer_pool::try_emit_frame: absolute_start ({}) is not aligned to hop_size ({})",
                 absolute_start, m_hop_size
             ));
         }
 
+        auto write_head = m_write_head.load(std::memory_order_acquire);
+
         // Check if frame data is available
-        if (absolute_start + m_frame_size > m_write_head) {
+        if (absolute_start + m_frame_size > write_head) {
             return std::nullopt;
         }
 
@@ -197,14 +216,22 @@ public:
         auto slot_idx = frame_num % m_frame_count;
         auto& slot = m_slots[slot_idx];
 
-        // Check if slot available
-        if (slot.in_use) {
+        // Try to acquire slot atomically
+        bool expected = false;
+        if (!slot.in_use.compare_exchange_strong(expected, true,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            // Slot busy - downstream still holding previous frame
             return std::nullopt;
         }
 
-        // Acquire slot
-        slot.in_use = true;
-        slot.start_sample = absolute_start;
+        // Slot acquired - store start sample
+        slot.start_sample.store(absolute_start, std::memory_order_relaxed);
+
+        // Update oldest protected - this slot might be the new oldest
+        update_oldest_protected_on_acquire(absolute_start);
+
+        // Increment slots in use counter
+        m_slots_in_use.fetch_add(1, std::memory_order_relaxed);
 
         // Calculate ring position (contiguous even on wrap due to tail)
         const auto ring_offset = absolute_start % m_ring_size;
@@ -231,39 +258,37 @@ public:
         return m_hop_size;
     }
 
-    auto head() const -> std::size_t {
-        std::lock_guard lock(m_mutex);
-        return m_write_head;
+    // Lock-free read of write head
+    auto head() const noexcept -> std::size_t {
+        return m_write_head.load(std::memory_order_acquire);
     }
 
     auto get_diagnostics() const -> diagnostics {
-        std::lock_guard lock(m_mutex);
+        auto write_head = m_write_head.load(std::memory_order_acquire);
+        auto slots_in_use = m_slots_in_use.load(std::memory_order_relaxed);
+        auto oldest = m_oldest_protected.load(std::memory_order_relaxed);
 
-        // Count slots in use
-        std::size_t slots_in_use = 0;
-        std::size_t oldest_protected = m_write_head;
-
-        for (const auto& slot : m_slots) {
-            if (slot.in_use) {
-                ++slots_in_use;
-                oldest_protected = std::min(oldest_protected, slot.start_sample);
-            }
+        // If no slots in use, oldest_protected is meaningless
+        if (slots_in_use == 0) {
+            oldest = write_head;
         }
 
         std::size_t available_space = 0;
-        if (m_write_head >= oldest_protected) {
-            available_space = m_ring_size - (m_write_head - oldest_protected);
+        if (oldest == std::numeric_limits<std::size_t>::max()) {
+            available_space = m_ring_size;
+        } else if (write_head >= oldest) {
+            available_space = m_ring_size - (write_head - oldest);
         }
 
         return diagnostics{
             .slots_in_use = slots_in_use,
             .total_slots = m_frame_count,
-            .write_head = m_write_head,
+            .write_head = write_head,
             .ring_size = m_ring_size,
-            .oldest_protected_sample = oldest_protected,
+            .oldest_protected_sample = oldest,
             .available_space = available_space,
-            .last_drop_reason = m_drop_reason,
-            .last_drop_sample_count = m_last_drop_sample_count
+            .last_drop_reason = m_drop_reason.load(std::memory_order_relaxed),
+            .last_drop_sample_count = m_last_drop_sample_count.load(std::memory_order_relaxed)
         };
     }
 
@@ -272,31 +297,65 @@ private:
         std::shared_ptr<framer_pool<T>> pool;
         std::size_t slot_index;
 
-        auto operator()() const -> void {
-            std::lock_guard lock(pool->m_mutex);
-            pool->m_slots[slot_index].in_use = false;
-            // Wake any blocked writers
-            pool->m_space_available.notify_all();
+        auto operator()() const noexcept -> void {
+            // Get the start sample before releasing
+            auto released_start = pool->m_slots[slot_index].start_sample.load(std::memory_order_relaxed);
+
+            // Release slot
+            pool->m_slots[slot_index].in_use.store(false, std::memory_order_release);
+
+            // Decrement counter
+            auto prev_count = pool->m_slots_in_use.fetch_sub(1, std::memory_order_relaxed);
+
+            // Update oldest protected if this was the oldest slot
+            if (prev_count == 1) {
+                // We were the last slot - no protection needed
+                pool->m_oldest_protected.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
+            } else if (released_start == pool->m_oldest_protected.load(std::memory_order_relaxed)) {
+                // We might have been the oldest - need to rescan
+                pool->recalculate_oldest_protected();
+            }
         }
     };
 
-    // Check if writing count samples would overwrite in-use frames
-    // Must be called with mutex held
-    auto can_write_unlocked(std::size_t count) -> bool {
+    // Fast O(1) check - just compare against cached oldest
+    auto can_write_fast(std::size_t write_head, std::size_t count) const noexcept -> bool {
         if (count == 0) {
             return true;
         }
 
-        // Find the oldest sample we need to protect
-        std::size_t min_protected_sample = m_write_head;
-        for (const auto& slot : m_slots) {
-            if (slot.in_use) {
-                min_protected_sample = std::min(min_protected_sample, slot.start_sample);
-            }
+        auto oldest = m_oldest_protected.load(std::memory_order_relaxed);
+
+        // No slots in use - always can write
+        if (oldest == std::numeric_limits<std::size_t>::max()) {
+            return true;
         }
 
         // Simple watermark check: don't overwrite protected region
-        return (m_write_head - min_protected_sample + count) <= m_ring_size;
+        return (write_head - oldest + count) <= m_ring_size;
+    }
+
+    // Update oldest when acquiring a new slot
+    auto update_oldest_protected_on_acquire(std::size_t new_start) noexcept -> void {
+        auto current = m_oldest_protected.load(std::memory_order_relaxed);
+        while (new_start < current) {
+            if (m_oldest_protected.compare_exchange_weak(current, new_start,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+
+    // Rescan all slots to find true oldest (called on release when needed)
+    auto recalculate_oldest_protected() noexcept -> void {
+        std::size_t min_start = std::numeric_limits<std::size_t>::max();
+        for (const auto& slot : m_slots) {
+            if (slot.in_use.load(std::memory_order_relaxed)) {
+                auto start = slot.start_sample.load(std::memory_order_relaxed);
+                min_start = std::min(min_start, start);
+            }
+        }
+        m_oldest_protected.store(min_start, std::memory_order_relaxed);
     }
 
     std::size_t m_frame_size{};
@@ -307,15 +366,14 @@ private:
     std::size_t m_hop_size{};
     std::shared_ptr<composite::aligned_mem<T>> m_ring{nullptr};
 
-    // Synchronization (replaces atomics)
-    mutable std::mutex m_mutex;
-    std::condition_variable m_space_available;
-    std::size_t m_write_head{};
-
+    // Lock-free synchronization
+    std::atomic<std::size_t> m_write_head{0};
+    std::atomic<std::size_t> m_oldest_protected{std::numeric_limits<std::size_t>::max()};
+    std::atomic<std::size_t> m_slots_in_use{0};
     std::vector<frame_slot> m_slots;
 
-    // Diagnostics
-    drop_reason m_drop_reason{drop_reason::NONE};
-    std::size_t m_last_drop_sample_count{0};
+    // Diagnostics (relaxed atomics - not critical path)
+    std::atomic<drop_reason> m_drop_reason{drop_reason::NONE};
+    std::atomic<std::size_t> m_last_drop_sample_count{0};
 
 }; // class framer_pool
