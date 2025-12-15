@@ -312,8 +312,8 @@ private:
                 // We were the last slot - no protection needed
                 pool->m_oldest_protected.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
             } else if (released_start == pool->m_oldest_protected.load(std::memory_order_relaxed)) {
-                // We might have been the oldest - need to rescan
-                pool->recalculate_oldest_protected();
+                // We were the oldest - scan forward to find next oldest
+                pool->advance_oldest_protected_from_slot(slot_index);
             }
         }
     };
@@ -335,27 +335,29 @@ private:
         return (write_head - oldest + count) <= m_ring_size;
     }
 
-    // Update oldest when acquiring a new slot
+    // Update oldest when acquiring a new slot - only needed when first slot acquired
     auto update_oldest_protected_on_acquire(std::size_t new_start) noexcept -> void {
+        // Slots are acquired in strict order, so a new slot is always >= existing slots.
+        // Only update if this is the first slot (no protection currently).
         auto current = m_oldest_protected.load(std::memory_order_relaxed);
-        while (new_start < current) {
-            if (m_oldest_protected.compare_exchange_weak(current, new_start,
-                    std::memory_order_relaxed, std::memory_order_relaxed)) {
-                break;
-            }
+        if (current == std::numeric_limits<std::size_t>::max()) {
+            m_oldest_protected.store(new_start, std::memory_order_relaxed);
         }
     }
 
-    // Rescan all slots to find true oldest (called on release when needed)
-    auto recalculate_oldest_protected() noexcept -> void {
-        std::size_t min_start = std::numeric_limits<std::size_t>::max();
-        for (const auto& slot : m_slots) {
-            if (slot.in_use.load(std::memory_order_relaxed)) {
-                auto start = slot.start_sample.load(std::memory_order_relaxed);
-                min_start = std::min(min_start, start);
+    // Advance oldest protected by scanning forward from released slot
+    // Slots are acquired/released in circular order, so next in-use slot is the new oldest
+    auto advance_oldest_protected_from_slot(std::size_t released_slot_idx) noexcept -> void {
+        for (std::size_t i = 1; i < m_frame_count; ++i) {
+            auto slot_idx = (released_slot_idx + i) % m_frame_count;
+            if (m_slots[slot_idx].in_use.load(std::memory_order_relaxed)) {
+                auto start = m_slots[slot_idx].start_sample.load(std::memory_order_relaxed);
+                m_oldest_protected.store(start, std::memory_order_relaxed);
+                return;
             }
         }
-        m_oldest_protected.store(min_start, std::memory_order_relaxed);
+        // No slots in use - shouldn't happen since we checked prev_count > 1
+        m_oldest_protected.store(std::numeric_limits<std::size_t>::max(), std::memory_order_relaxed);
     }
 
     std::size_t m_frame_size{};
