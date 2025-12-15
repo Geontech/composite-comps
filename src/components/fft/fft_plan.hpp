@@ -19,8 +19,7 @@
 
 #pragma once
 
-#include "aligned_mem.hpp"
-#include "windows.hpp"
+#include <composite/buffers/aligned_mem.hpp>
 
 #include <algorithm>
 #include <complex>
@@ -37,7 +36,7 @@ public:
         static std::mutex plan_mtx;
         auto lock = std::scoped_lock{plan_mtx};
         fftwf_plan_with_nthreads(fftw_threads);
-        auto plan_buf = aligned::make_aligned<std::complex<float>>(64, fft_size);
+        auto plan_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
         m_plan = fftwf_plan_dft_1d(
             fft_size,
             reinterpret_cast<fftwf_complex*>(plan_buf->data()),
@@ -59,11 +58,11 @@ public:
         return m_size;
     }
 
-    auto execute(aligned::aligned_mem<std::complex<float>>* in, aligned::aligned_mem<std::complex<float>>* out) -> void {
+    auto execute(std::complex<float>* in, std::complex<float>* out) -> void {
         fftwf_execute_dft(
             m_plan,
-            reinterpret_cast<fftwf_complex*>(in->data()),
-            reinterpret_cast<fftwf_complex*>(out->data())
+            reinterpret_cast<fftwf_complex*>(in),
+            reinterpret_cast<fftwf_complex*>(out)
         );
     }
 
@@ -80,8 +79,8 @@ public:
         static std::mutex plan_mtx;
         auto lock = std::scoped_lock{plan_mtx};
         fftwf_plan_with_nthreads(fftw_threads);
-        auto in_buf = aligned::make_aligned<float>(64, fft_size);
-        auto out_buf = aligned::make_aligned<std::complex<float>>(64, fft_size);
+        auto in_buf = composite::make_aligned<float>(64, fft_size);
+        auto out_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
         m_plan = fftwf_plan_dft_r2c_1d(
             fft_size,
             in_buf->data(),
@@ -102,11 +101,11 @@ public:
         return m_size;
     }
 
-    auto execute(aligned::aligned_mem<float>* in, aligned::aligned_mem<std::complex<float>>* out) -> void {
+    auto execute(float* in, std::complex<float>* out) -> void {
         fftwf_execute_dft_r2c(
             m_plan,
-            in->data(),
-            reinterpret_cast<fftwf_complex*>(out->data())
+            in,
+            reinterpret_cast<fftwf_complex*>(out)
         );
     }
 
@@ -123,7 +122,7 @@ public:
         static std::mutex plan_mtx;
         auto lock = std::scoped_lock{plan_mtx};
         fftw_plan_with_nthreads(fftw_threads);
-        auto plan_buf = aligned::make_aligned<std::complex<double>>(64, fft_size);
+        auto plan_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
         m_plan = fftw_plan_dft_1d(
             fft_size,
             reinterpret_cast<fftw_complex*>(plan_buf->data()),
@@ -145,11 +144,11 @@ public:
         return m_size;
     }
 
-    auto execute(aligned::aligned_mem<std::complex<double>>* in, aligned::aligned_mem<std::complex<double>>* out) -> void {
+    auto execute(std::complex<double>* in, std::complex<double>* out) -> void {
         fftw_execute_dft(
             m_plan,
-            reinterpret_cast<fftw_complex*>(in->data()),
-            reinterpret_cast<fftw_complex*>(out->data())
+            reinterpret_cast<fftw_complex*>(in),
+            reinterpret_cast<fftw_complex*>(out)
         );
     }
 
@@ -166,8 +165,8 @@ public:
         static std::mutex plan_mtx;
         auto lock = std::scoped_lock{plan_mtx};
         fftw_plan_with_nthreads(fftw_threads);
-        auto in_buf = aligned::make_aligned<double>(64, fft_size);
-        auto out_buf = aligned::make_aligned<std::complex<double>>(64, fft_size);
+        auto in_buf = composite::make_aligned<double>(64, fft_size);
+        auto out_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
         m_plan = fftw_plan_dft_r2c_1d(
             fft_size,
             in_buf->data(),
@@ -188,11 +187,11 @@ public:
         return m_size;
     }
 
-    auto execute(aligned::aligned_mem<double>* in, aligned::aligned_mem<std::complex<double>>* out) -> void {
+    auto execute(double* in, std::complex<double>* out) -> void {
         fftw_execute_dft_r2c(
             m_plan,
-            in->data(),
-            reinterpret_cast<fftw_complex*>(out->data())
+            in,
+            reinterpret_cast<fftw_complex*>(out)
         );
     }
 

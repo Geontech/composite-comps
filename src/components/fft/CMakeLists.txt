@@ -22,7 +22,7 @@ project(fft VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Set compile flags
@@ -35,6 +35,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Custom compile options
 add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
 
+# Find FFTW via pkg-config
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFTW3F REQUIRED fftw3f)
+pkg_check_modules(FFTW3 REQUIRED fftw3)
+
 # Library
 add_library(fft MODULE
     component.cpp
@@ -43,14 +48,16 @@ add_library(fft MODULE
 target_include_directories(fft
     PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../include
+    ${FFTW3F_INCLUDE_DIRS}
+    ${FFTW3_INCLUDE_DIRS}
 )
 target_link_libraries(fft
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
-    fftw3f
+    ${FFTW3F_LIBRARIES}
+    ${FFTW3_LIBRARIES}
     fftw3f_threads
-    fftw3
     fftw3_threads
 )
 # Install

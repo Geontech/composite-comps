@@ -17,13 +17,16 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "aligned_mem.hpp"
+#pragma once
+
 #include "fft_plan.hpp"
 #include "task_queue.hpp"
 #include "windows.hpp"
 
 #include <bit>
-#include <composite/component.hpp>
+#include <composite/composite.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/buffers/aligned_mem.hpp>
 #include <complex>
 #include <deque>
 #include <fftw3.h>
@@ -33,20 +36,20 @@
 
 template <typename T>
 class fft : public composite::component {
+    using complex_t = std::complex<T>;
     using plan_t = fft_plan<T, true>;
-    using fft_t = aligned::aligned_mem<std::complex<T>>;
-    using window_t = aligned::aligned_mem<T>;
-    using input_t = std::unique_ptr<fft_t>;
-    using input_port_t = composite::input_port<input_t>;
-    using output_port_t = composite::output_port<std::unique_ptr<fft_t>>;
-    using input_tuple_t = std::tuple<input_t, composite::timestamp, std::optional<composite::metadata>>;
+    using window_t = composite::aligned_mem<T>;
+    using input_port_t = composite::input_port<composite::mutable_buffer<complex_t>>;
+    using output_port_t = composite::output_port<composite::mutable_buffer<complex_t>>;
+    using input_tuple_t = std::tuple<composite::mutable_buffer<complex_t>, composite::timestamp, std::optional<composite::metadata>>;
     using enum composite::properties::config_type;
+
 public:
     fft() : composite::component("fft") {
         add_port(&m_in_port);
         add_port(&m_out_port);
         add_property("window", &m_window_type).change_listener([this]() {
-            return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
+            return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING") || m_window_type.empty();
         });
         add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
             return std::has_single_bit(m_fft_size);
@@ -76,6 +79,8 @@ public:
             m_window = windows::blackman_harris<T>(m_fft_size);
         } else if (m_window_type == "HAMMING") {
             m_window = windows::hamming<T>(m_fft_size);
+        } else {
+            m_window.reset();
         }
         if (m_task_queue.thread_name_prefix() != id()) {
             m_task_queue.thread_name_prefix(id());
@@ -86,42 +91,38 @@ public:
     auto start() -> void override {
         m_input_thread = std::jthread([&](std::stop_token stoken) {
             while (!stoken.stop_requested()) {
-                // Get data buffer
                 auto [data, ts, meta] = m_in_port.get_data();
-                if (data == nullptr) {
+                if (!data) {
                     std::this_thread::yield();
                     continue;
                 }
-                // Submit FFT task to pool
+
                 auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> input_tuple_t {
-                    // Create a thread_local plan
-                    static thread_local std::unique_ptr<plan_t> fft_plan;
+                    thread_local std::unique_ptr<plan_t> fft_plan;
                     if (!fft_plan || fft_plan->size() != m_fft_size) {
                         fft_plan = std::make_unique<plan_t>(m_fft_size, m_fftw_threads);
                     }
 
-                    // Apply window
+                    // Apply window if configured
                     if (m_window) {
-                        apply_window(data.get(), m_window.get());
+                        apply_window(data, m_window.get());
                     }
 
-                    // Execute the fft
-                    // In-place for complex
-                    fft_plan->execute(data.get(), data.get());
+                    // Execute FFT in-place
+                    fft_plan->execute(data.data(), data.data());
 
-                    // Shift based on property
+                    // Apply fftshift if configured
                     if (m_shift) {
                         std::rotate(
-                            data->data(),
-                            data->data() + (data->size() / 2),
-                            data->data() + data->size()
+                            data.begin(),
+                            data.begin() + (data.size() / 2),
+                            data.end()
                         );
                     }
 
-                    // Return modified data and original ts/meta
                     return std::make_tuple(std::move(data), ts, std::move(meta));
                 });
-                // Push future onto queue
+
                 {
                     auto lock = std::scoped_lock{m_mtx};
                     m_futures.push_back(std::move(fut));
@@ -141,8 +142,8 @@ public:
 
     auto process() -> composite::retval override {
         using enum composite::retval;
-        // Pop a future from the queue
         using namespace std::chrono_literals;
+
         auto lock = std::unique_lock{m_mtx};
         m_cv.wait_for(lock, 1s, [this]{ return !m_futures.empty(); });
         if (m_futures.empty()) {
@@ -152,7 +153,6 @@ public:
         m_futures.pop_front();
         lock.unlock();
 
-        // Get result data from future
         auto [data, ts, meta] = fut.get();
         if (meta.has_value()) {
             logger()->trace("received metadata:\n{}", meta->to_string());
@@ -162,72 +162,79 @@ public:
             m_out_port.send_metadata(meta.value());
         }
 
-        // Send data
         m_out_port.send_data(std::move(data), ts);
         return NORMAL;
     }
 
 private:
+    // Window application with SIMD - uses unaligned loads/stores for data
     [[gnu::target("default")]]
-    auto apply_window(fft_t* data, const window_t* window) -> void {
-        for (auto i=0u; i< data->size(); ++i) {
-            data->at(i) = data->at(i) * window->at(i);
+    auto apply_window(composite::mutable_buffer<complex_t>& data, const window_t* window) -> void {
+        auto* d = reinterpret_cast<T*>(data.data());
+        const auto* w = window->data();
+        const auto count = data.size() * 2;  // real + imag components
+        for (std::size_t i = 0; i < count; ++i) {
+            d[i] *= w[i];
         }
     }
 
     [[gnu::target("avx512f")]]
-    auto apply_window(fft_t* data, const window_t* window) -> void {
-        // Logic for both types:
-        // - load payload data
-        // - load window data
-        // - multiply payload by window
-        // - store payload data
-        auto stride = 512u / 8u / sizeof(double) / 2u/*complex*/;
+    auto apply_window(composite::mutable_buffer<complex_t>& data, const window_t* window) -> void {
+        auto* d = reinterpret_cast<T*>(data.data());
+        const auto* w = window->data();
+        const auto count = data.size() * 2;
+
+        std::size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
-            stride = 512u / 8u / sizeof(float) / 2u/*complex*/;
-        }
-        for (auto i=0u; i < data->size(); i += stride) {
-            if constexpr (std::is_same_v<T, float>) {
-                auto data_ptr = reinterpret_cast<float*>(data->data() + i);
-                auto payload = _mm512_load_ps(data_ptr);
-                auto window_ps = _mm512_load_ps(window->data() + i * 2);
-                payload = _mm512_mul_ps(payload, window_ps);
-                _mm512_store_ps(data_ptr, payload);
-            } else {
-                auto data_ptr = reinterpret_cast<double*>(data->data() + i);
-                auto payload = _mm512_load_pd(data_ptr);
-                auto window_pd = _mm512_load_pd(window->data() + i * 2);
-                payload = _mm512_mul_pd(payload, window_pd);
-                _mm512_store_pd(data_ptr, payload);
+            constexpr std::size_t stride = 16;  // 512 bits / 32 bits
+            for (; i + stride <= count; i += stride) {
+                auto payload = _mm512_loadu_ps(d + i);
+                auto window_v = _mm512_loadu_ps(w + i);
+                payload = _mm512_mul_ps(payload, window_v);
+                _mm512_storeu_ps(d + i, payload);
             }
+        } else {
+            constexpr std::size_t stride = 8;  // 512 bits / 64 bits
+            for (; i + stride <= count; i += stride) {
+                auto payload = _mm512_loadu_pd(d + i);
+                auto window_v = _mm512_loadu_pd(w + i);
+                payload = _mm512_mul_pd(payload, window_v);
+                _mm512_storeu_pd(d + i, payload);
+            }
+        }
+        // Scalar remainder
+        for (; i < count; ++i) {
+            d[i] *= w[i];
         }
     }
 
     [[gnu::target("avx2")]]
-    auto apply_window(fft_t* data, const window_t* window) -> void {
-        // Logic for both types:
-        // - load payload data
-        // - load window data
-        // - multiply payload by window
-        // - store payload data
-        auto stride = 256u / 8u / sizeof(double) / 2u/*complex*/;
+    auto apply_window(composite::mutable_buffer<complex_t>& data, const window_t* window) -> void {
+        auto* d = reinterpret_cast<T*>(data.data());
+        const auto* w = window->data();
+        const auto count = data.size() * 2;
+
+        std::size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
-            stride = 256u / 8u / sizeof(float) / 2u/*complex*/;
-        }
-        for (auto i=0u; i < data->size(); i += stride) {
-            if constexpr (std::is_same_v<T, float>) {
-                auto data_ptr = reinterpret_cast<float*>(data->data() + i);
-                auto payload = _mm256_load_ps(data_ptr);
-                auto window_ps = _mm256_load_ps(window->data() + i * 2);
-                payload = _mm256_mul_ps(payload, window_ps);
-                _mm256_store_ps(data_ptr, payload);
-            } else {
-                auto data_ptr = reinterpret_cast<double*>(data->data() + i);
-                auto payload = _mm256_load_pd(data_ptr);
-                auto window_pd = _mm256_load_pd(window->data() + i * 2);
-                payload = _mm256_mul_pd(payload, window_pd);
-                _mm256_store_pd(data_ptr, payload);
+            constexpr std::size_t stride = 8;  // 256 bits / 32 bits
+            for (; i + stride <= count; i += stride) {
+                auto payload = _mm256_loadu_ps(d + i);
+                auto window_v = _mm256_loadu_ps(w + i);
+                payload = _mm256_mul_ps(payload, window_v);
+                _mm256_storeu_ps(d + i, payload);
             }
+        } else {
+            constexpr std::size_t stride = 4;  // 256 bits / 64 bits
+            for (; i + stride <= count; i += stride) {
+                auto payload = _mm256_loadu_pd(d + i);
+                auto window_v = _mm256_loadu_pd(w + i);
+                payload = _mm256_mul_pd(payload, window_v);
+                _mm256_storeu_pd(d + i, payload);
+            }
+        }
+        // Scalar remainder
+        for (; i < count; ++i) {
+            d[i] *= w[i];
         }
     }
 
