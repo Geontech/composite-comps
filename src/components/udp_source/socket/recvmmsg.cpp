@@ -52,6 +52,12 @@ recvmmsg::recvmmsg(const config& config) :
         throw std::runtime_error(std::format("failed to create socket: {}", std::string{strerror(errno)}));
     }
 
+    // Allow rapid rebind (avoids "address already in use" during reconfiguration)
+    int reuse = 1;
+    if (::setsockopt(m_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+        m_logger->warn("failed to set SO_REUSEADDR: {}", std::string{strerror(errno)});
+    }
+
     // Set receive buffer size
     if (config.recv_buf_size > 0) {
         m_logger->trace("setting socket receive buffer size to {}", config.recv_buf_size);

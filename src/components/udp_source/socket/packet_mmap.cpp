@@ -162,6 +162,11 @@ packet_mmap::packet_mmap(const config& config) :
         if (m_join_socket < 0) {
             throw std::runtime_error(std::format("failed to create join socket: {}", std::string{strerror(errno)}));
         }
+        // Allow rapid rebind during reconfiguration
+        int reuse = 1;
+        if (::setsockopt(m_join_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+            m_logger->warn("failed to set SO_REUSEADDR on join socket: {}", std::string{strerror(errno)});
+        }
         // Join multicast group
         auto ip_mreq = net::create_ip_mreq(m_join_socket, config.interface, config.ip_addr);
         if (::setsockopt(m_join_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &ip_mreq, sizeof(ip_mreq)) < 0) {
