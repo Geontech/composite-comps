@@ -36,11 +36,13 @@ public:
         static std::mutex plan_mtx;
         auto lock = std::scoped_lock{plan_mtx};
         fftwf_plan_with_nthreads(fftw_threads);
-        auto plan_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
+        // Create separate buffers for out-of-place planning
+        auto in_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
+        auto out_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
         m_plan = fftwf_plan_dft_1d(
             fft_size,
-            reinterpret_cast<fftwf_complex*>(plan_buf->data()),
-            reinterpret_cast<fftwf_complex*>(plan_buf->data()),
+            reinterpret_cast<fftwf_complex*>(in_buf->data()),
+            reinterpret_cast<fftwf_complex*>(out_buf->data()),
             FFTW_FORWARD,
             FFTW_MEASURE
         );
@@ -58,10 +60,10 @@ public:
         return m_size;
     }
 
-    auto execute(std::complex<float>* in, std::complex<float>* out) -> void {
+    auto execute(const std::complex<float>* in, std::complex<float>* out) -> void {
         fftwf_execute_dft(
             m_plan,
-            reinterpret_cast<fftwf_complex*>(in),
+            const_cast<fftwf_complex*>(reinterpret_cast<const fftwf_complex*>(in)),
             reinterpret_cast<fftwf_complex*>(out)
         );
     }
@@ -101,10 +103,10 @@ public:
         return m_size;
     }
 
-    auto execute(float* in, std::complex<float>* out) -> void {
+    auto execute(const float* in, std::complex<float>* out) -> void {
         fftwf_execute_dft_r2c(
             m_plan,
-            in,
+            const_cast<float*>(in),
             reinterpret_cast<fftwf_complex*>(out)
         );
     }
@@ -122,11 +124,13 @@ public:
         static std::mutex plan_mtx;
         auto lock = std::scoped_lock{plan_mtx};
         fftw_plan_with_nthreads(fftw_threads);
-        auto plan_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
+        // Create separate buffers for out-of-place planning
+        auto in_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
+        auto out_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
         m_plan = fftw_plan_dft_1d(
             fft_size,
-            reinterpret_cast<fftw_complex*>(plan_buf->data()),
-            reinterpret_cast<fftw_complex*>(plan_buf->data()),
+            reinterpret_cast<fftw_complex*>(in_buf->data()),
+            reinterpret_cast<fftw_complex*>(out_buf->data()),
             FFTW_FORWARD,
             FFTW_MEASURE
         );
@@ -144,10 +148,10 @@ public:
         return m_size;
     }
 
-    auto execute(std::complex<double>* in, std::complex<double>* out) -> void {
+    auto execute(const std::complex<double>* in, std::complex<double>* out) -> void {
         fftw_execute_dft(
             m_plan,
-            reinterpret_cast<fftw_complex*>(in),
+            const_cast<fftw_complex*>(reinterpret_cast<const fftw_complex*>(in)),
             reinterpret_cast<fftw_complex*>(out)
         );
     }
@@ -187,10 +191,10 @@ public:
         return m_size;
     }
 
-    auto execute(double* in, std::complex<double>* out) -> void {
+    auto execute(const double* in, std::complex<double>* out) -> void {
         fftw_execute_dft_r2c(
             m_plan,
-            in,
+            const_cast<double*>(in),
             reinterpret_cast<fftw_complex*>(out)
         );
     }

@@ -39,10 +39,12 @@ class fft : public composite::component {
     using complex_t = std::complex<T>;
     using plan_t = fft_plan<T, true>;
     using window_t = composite::aligned_mem<T>;
-    using input_port_t = composite::input_port<composite::mutable_buffer<complex_t>>;
-    using output_port_t = composite::output_port<composite::mutable_buffer<complex_t>>;
-    using input_tuple_t = std::tuple<composite::mutable_buffer<complex_t>, composite::timestamp, std::optional<composite::metadata>>;
+    using input_port_t = composite::input_port<composite::immutable_buffer<complex_t>>;
+    using output_port_t = composite::output_port<composite::immutable_buffer<complex_t>>;
+    using output_tuple_t = std::tuple<composite::immutable_buffer<complex_t>, composite::timestamp, std::optional<composite::metadata>>;
     using enum composite::properties::config_type;
+
+    static constexpr std::size_t ALIGNMENT = 64;
 
 public:
     fft() : composite::component("fft") {
@@ -97,30 +99,39 @@ public:
                     continue;
                 }
 
-                auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> input_tuple_t {
+                auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> output_tuple_t {
                     thread_local std::unique_ptr<plan_t> fft_plan;
                     if (!fft_plan || fft_plan->size() != m_fft_size) {
                         fft_plan = std::make_unique<plan_t>(m_fft_size, m_fftw_threads);
                     }
 
-                    // Apply window if configured
+                    // Allocate working buffer for windowed input data
+                    auto working_buf = composite::make_aligned_buffer<complex_t>(ALIGNMENT, data.size());
+
+                    // Fused copy + window (or just copy if no window)
                     if (m_window) {
-                        apply_window(data, m_window.get());
+                        copy_and_window(data, working_buf, m_window.get());
+                    } else {
+                        std::copy(data.begin(), data.end(), working_buf.begin());
                     }
 
-                    // Execute FFT in-place
-                    fft_plan->execute(data.data(), data.data());
+                    // Allocate output buffer for FFT result
+                    auto output_buf = composite::make_aligned_buffer<complex_t>(ALIGNMENT, data.size());
+
+                    // Execute out-of-place FFT: working -> output
+                    fft_plan->execute(working_buf.data(), output_buf.data());
 
                     // Apply fftshift if configured
                     if (m_shift) {
                         std::rotate(
-                            data.begin(),
-                            data.begin() + (data.size() / 2),
-                            data.end()
+                            output_buf.begin(),
+                            output_buf.begin() + (output_buf.size() / 2),
+                            output_buf.end()
                         );
                     }
 
-                    return std::make_tuple(std::move(data), ts, std::move(meta));
+                    // Convert to immutable for output
+                    return std::make_tuple(std::move(output_buf).to_immutable(), ts, std::move(meta));
                 });
 
                 {
@@ -167,74 +178,89 @@ public:
     }
 
 private:
-    // Window application with SIMD - uses unaligned loads/stores for data
+    // Fused copy + window: reads from immutable input, writes windowed data to mutable output
     [[gnu::target("default")]]
-    auto apply_window(composite::mutable_buffer<complex_t>& data, const window_t* window) -> void {
-        auto* d = reinterpret_cast<T*>(data.data());
+    auto copy_and_window(
+        const composite::immutable_buffer<complex_t>& input,
+        composite::mutable_buffer<complex_t>& output,
+        const window_t* window
+    ) -> void {
+        const auto* in = reinterpret_cast<const T*>(input.data());
+        auto* out = reinterpret_cast<T*>(output.data());
         const auto* w = window->data();
-        const auto count = data.size() * 2;  // real + imag components
+        const auto count = input.size() * 2;  // real + imag components
         for (std::size_t i = 0; i < count; ++i) {
-            d[i] *= w[i];
+            out[i] = in[i] * w[i];
         }
     }
 
     [[gnu::target("avx512f")]]
-    auto apply_window(composite::mutable_buffer<complex_t>& data, const window_t* window) -> void {
-        auto* d = reinterpret_cast<T*>(data.data());
+    auto copy_and_window(
+        const composite::immutable_buffer<complex_t>& input,
+        composite::mutable_buffer<complex_t>& output,
+        const window_t* window
+    ) -> void {
+        const auto* in = reinterpret_cast<const T*>(input.data());
+        auto* out = reinterpret_cast<T*>(output.data());
         const auto* w = window->data();
-        const auto count = data.size() * 2;
+        const auto count = input.size() * 2;
 
         std::size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
             constexpr std::size_t stride = 16;  // 512 bits / 32 bits
             for (; i + stride <= count; i += stride) {
-                auto payload = _mm512_loadu_ps(d + i);
+                auto input_v = _mm512_loadu_ps(in + i);
                 auto window_v = _mm512_loadu_ps(w + i);
-                payload = _mm512_mul_ps(payload, window_v);
-                _mm512_storeu_ps(d + i, payload);
+                auto result = _mm512_mul_ps(input_v, window_v);
+                _mm512_storeu_ps(out + i, result);
             }
         } else {
             constexpr std::size_t stride = 8;  // 512 bits / 64 bits
             for (; i + stride <= count; i += stride) {
-                auto payload = _mm512_loadu_pd(d + i);
+                auto input_v = _mm512_loadu_pd(in + i);
                 auto window_v = _mm512_loadu_pd(w + i);
-                payload = _mm512_mul_pd(payload, window_v);
-                _mm512_storeu_pd(d + i, payload);
+                auto result = _mm512_mul_pd(input_v, window_v);
+                _mm512_storeu_pd(out + i, result);
             }
         }
         // Scalar remainder
         for (; i < count; ++i) {
-            d[i] *= w[i];
+            out[i] = in[i] * w[i];
         }
     }
 
     [[gnu::target("avx2")]]
-    auto apply_window(composite::mutable_buffer<complex_t>& data, const window_t* window) -> void {
-        auto* d = reinterpret_cast<T*>(data.data());
+    auto copy_and_window(
+        const composite::immutable_buffer<complex_t>& input,
+        composite::mutable_buffer<complex_t>& output,
+        const window_t* window
+    ) -> void {
+        const auto* in = reinterpret_cast<const T*>(input.data());
+        auto* out = reinterpret_cast<T*>(output.data());
         const auto* w = window->data();
-        const auto count = data.size() * 2;
+        const auto count = input.size() * 2;
 
         std::size_t i = 0;
         if constexpr (std::is_same_v<T, float>) {
             constexpr std::size_t stride = 8;  // 256 bits / 32 bits
             for (; i + stride <= count; i += stride) {
-                auto payload = _mm256_loadu_ps(d + i);
+                auto input_v = _mm256_loadu_ps(in + i);
                 auto window_v = _mm256_loadu_ps(w + i);
-                payload = _mm256_mul_ps(payload, window_v);
-                _mm256_storeu_ps(d + i, payload);
+                auto result = _mm256_mul_ps(input_v, window_v);
+                _mm256_storeu_ps(out + i, result);
             }
         } else {
             constexpr std::size_t stride = 4;  // 256 bits / 64 bits
             for (; i + stride <= count; i += stride) {
-                auto payload = _mm256_loadu_pd(d + i);
+                auto input_v = _mm256_loadu_pd(in + i);
                 auto window_v = _mm256_loadu_pd(w + i);
-                payload = _mm256_mul_pd(payload, window_v);
-                _mm256_storeu_pd(d + i, payload);
+                auto result = _mm256_mul_pd(input_v, window_v);
+                _mm256_storeu_pd(out + i, result);
             }
         }
         // Scalar remainder
         for (; i < count; ++i) {
-            d[i] *= w[i];
+            out[i] = in[i] * w[i];
         }
     }
 
@@ -251,7 +277,7 @@ private:
 
     // Members
     std::unique_ptr<window_t> m_window{nullptr};
-    std::deque<std::future<input_tuple_t>> m_futures;
+    std::deque<std::future<output_tuple_t>> m_futures;
     std::mutex m_mtx;
     std::condition_variable m_cv;
     std::jthread m_input_thread;
