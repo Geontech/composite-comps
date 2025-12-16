@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -18,11 +18,16 @@
  */
 
 #include "component.hpp"
+#include "windows.hpp"
 
+#include <algorithm>
+#include <format>
+#include <numeric>
+#include <pthread.h>
 #include <string_view>
 
 template <typename T>
-psd<T>::psd() : composite::component("psd") {
+psd<T>::psd(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
     using enum composite::properties::config_type;
@@ -58,7 +63,7 @@ auto psd<T>::start() -> void {
         while (!stoken.stop_requested()) {
             // Get data buffer
             auto [data, ts, meta] = m_in_port.get_data();
-            if (data == nullptr) {
+            if (!data) {
                 std::this_thread::yield();
                 continue;
             }
@@ -96,6 +101,8 @@ auto psd<T>::start() -> void {
                             m_window = windows::blackman_harris<T>(meta_fft_size, false);
                         } else if (meta_fft_window == "HAMMING") {
                             m_window = windows::hamming<T>(meta_fft_size, false);
+                        } else {
+                            m_window.reset();
                         }
                         // Calculate new normalization constant
                         m_work.norm_const(calculate_norm_const());
@@ -107,7 +114,7 @@ auto psd<T>::start() -> void {
             // Submit PSD task to pool
             auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> output_tuple_t {
                 // Perform PSD
-                auto psd = m_work.process(data.get());
+                auto psd = m_work.process(data);
                 // Return modified data, meta, and original ts
                 return std::make_tuple(std::move(psd), ts, std::move(meta));
             });
@@ -165,21 +172,18 @@ auto psd<T>::calculate_norm_const() const -> T {
     // Calculate window normalization constant
     auto window_norm_const = T{1};
     if (m_window) {
-        // Square all values in the window vector
-        std::transform(
+        // Calculate sum of squared window values without modifying the window
+        auto window_sum_sq = std::transform_reduce(
             m_window->data(),
             m_window->data() + m_window->size(),
-            m_window->data(),
-            [](float val) {
-                return val * val;
-            }
+            T{0},
+            std::plus<>{},
+            [](T val) { return val * val; }
         );
-        // Calculate the sum of the squared window
-        auto window_sum = std::accumulate(m_window->data(), m_window->data() + m_window->size(), T{});
         // Window normalization constant
-        window_norm_const = window_sum;
+        window_norm_const = window_sum_sq;
         if (m_power_based_normalization) {
-            window_norm_const = window_norm_const / m_window->size();
+            window_norm_const = window_norm_const / static_cast<T>(m_window->size());
         }
         logger()->trace("calculated window norm constant of: {}", window_norm_const);
     }
@@ -187,14 +191,17 @@ auto psd<T>::calculate_norm_const() const -> T {
     return T{1} / (m_sample_rate * window_norm_const);
 }
 
-// --- Factory Function ---
+// Explicit template instantiations
+template class psd<float>;
+template class psd<double>;
+
 extern "C" {
-    auto create(std::string_view type) -> std::shared_ptr<composite::component> {
+    auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
         if (type == "f32") {
-            return std::make_shared<psd<float>>();
+            return std::make_shared<psd<float>>(id);
         } else if (type == "f64") {
-            return std::make_shared<psd<double>>();
+            return std::make_shared<psd<double>>(id);
         }
-        return std::make_shared<psd<float>>();
+        throw std::runtime_error(std::format("unknown type '{}' for psd component", type));
     }
 }

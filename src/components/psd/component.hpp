@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -17,29 +17,30 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
+#pragma once
+
 #include "work.hpp"
+#include "task_queue.hpp"
 
-#include <aligned_mem.hpp>
-#include <task_queue.hpp>
-#include <windows.hpp>
-
-#include <composite/component.hpp>
+#include <composite/composite.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/buffers/aligned_mem.hpp>
 #include <complex>
-#include <immintrin.h>
+#include <deque>
+#include <future>
 #include <memory>
 
 template <typename T>
 class psd : public composite::component {
-    using fft_t = aligned::aligned_mem<std::complex<T>>;
-    using psd_t = aligned::aligned_mem<T>;
-    using window_t = aligned::aligned_mem<T>;
-    using input_t = std::unique_ptr<fft_t>;
-    using input_port_t = composite::input_port<input_t>;
-    using output_t = std::unique_ptr<psd_t>;
-    using output_port_t = composite::output_port<output_t>;
-    using output_tuple_t = std::tuple<output_t, composite::timestamp, std::optional<composite::metadata>>;
+    using input_port_t = composite::input_port<composite::mutable_buffer<std::complex<T>>>;
+    using output_port_t = composite::output_port<composite::mutable_buffer<T>>;
+    using output_tuple_t = std::tuple<composite::mutable_buffer<T>, composite::timestamp, std::optional<composite::metadata>>;
+    using window_t = composite::aligned_mem<T>;
+
+    static constexpr std::size_t ALIGNMENT = 64;
+
 public:
-    psd();
+    explicit psd(std::string_view id);
     ~psd() override = default;
 
     auto property_change_handler() -> void override;
@@ -50,7 +51,6 @@ public:
 
 private:
     auto calculate_norm_const() const -> T;
-    auto create_worker(T norm_const) -> void;
 
     // Ports
     input_port_t m_in_port{"data_in"};
@@ -72,3 +72,7 @@ private:
     task_queue m_task_queue;
 
 }; // class psd
+
+// Explicit template instantiations (defined in component.cpp)
+extern template class psd<float>;
+extern template class psd<double>;
