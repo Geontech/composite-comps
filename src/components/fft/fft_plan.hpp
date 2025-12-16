@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -21,16 +21,15 @@
 
 #include <composite/buffers/aligned_mem.hpp>
 
-#include <algorithm>
 #include <complex>
 #include <fftw3.h>
 #include <mutex>
 
-template <typename T, bool complex>
-class fft_plan{};
+template <typename T>
+class fft_plan;
 
 template <>
-class fft_plan<float, true> {
+class fft_plan<std::complex<float>> {
 public:
     fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
         static std::mutex plan_mtx;
@@ -72,53 +71,10 @@ private:
     fftwf_plan m_plan;
     std::size_t m_size;
 
-}; // class fft_plan<float, true>
+}; // class fft_plan<std::complex<float>>
 
 template <>
-class fft_plan<float, false> {
-public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
-        static std::mutex plan_mtx;
-        auto lock = std::scoped_lock{plan_mtx};
-        fftwf_plan_with_nthreads(fftw_threads);
-        auto in_buf = composite::make_aligned<float>(64, fft_size);
-        auto out_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
-        m_plan = fftwf_plan_dft_r2c_1d(
-            fft_size,
-            in_buf->data(),
-            reinterpret_cast<fftwf_complex*>(out_buf->data()),
-            FFTW_MEASURE
-        );
-    }
-
-    ~fft_plan() {
-        fftwf_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftwf_plan {
-        return m_plan;
-    }
-
-    auto size() const noexcept -> std::size_t {
-        return m_size;
-    }
-
-    auto execute(const float* in, std::complex<float>* out) -> void {
-        fftwf_execute_dft_r2c(
-            m_plan,
-            const_cast<float*>(in),
-            reinterpret_cast<fftwf_complex*>(out)
-        );
-    }
-
-private:
-    fftwf_plan m_plan;
-    std::size_t m_size;
-
-}; // class fft_plan<float, false>
-
-template <>
-class fft_plan<double, true> {
+class fft_plan<std::complex<double>> {
 public:
     fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
         static std::mutex plan_mtx;
@@ -160,47 +116,4 @@ private:
     fftw_plan m_plan;
     std::size_t m_size;
 
-}; // class fft_plan<double, true>
-
-template <>
-class fft_plan<double, false> {
-public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
-        static std::mutex plan_mtx;
-        auto lock = std::scoped_lock{plan_mtx};
-        fftw_plan_with_nthreads(fftw_threads);
-        auto in_buf = composite::make_aligned<double>(64, fft_size);
-        auto out_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
-        m_plan = fftw_plan_dft_r2c_1d(
-            fft_size,
-            in_buf->data(),
-            reinterpret_cast<fftw_complex*>(out_buf->data()),
-            FFTW_MEASURE
-        );
-    }
-
-    ~fft_plan() {
-        fftw_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftw_plan {
-        return m_plan;
-    }
-
-    auto size() const noexcept -> std::size_t {
-        return m_size;
-    }
-
-    auto execute(const double* in, std::complex<double>* out) -> void {
-        fftw_execute_dft_r2c(
-            m_plan,
-            const_cast<double*>(in),
-            reinterpret_cast<fftw_complex*>(out)
-        );
-    }
-
-private:
-    fftw_plan m_plan;
-    std::size_t m_size;
-
-}; // class fft_plan<double, false>
+}; // class fft_plan<std::complex<double>>
