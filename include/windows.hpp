@@ -41,7 +41,7 @@ auto blackman_harris(const std::size_t length, bool complex=true) {
     constexpr T a2 = 0.14128;
     constexpr T a3 = 0.01168;
 
-    const T N = length;
+    const T N = length - 1;
     for (std::size_t n = 0; n < length; ++n) {
         const auto tn = static_cast<T>(n);
         auto val = a0
