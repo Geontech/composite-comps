@@ -320,3 +320,46 @@ TEST_CASE("halfrate component - zero input", "[halfrate][integration]") {
         CHECK_THAT(sample.imag(), WithinAbs(0.0f, 1e-6f));
     }
 }
+
+TEST_CASE("halfrate component - metadata propagation and sample rate update", "[halfrate][integration][metadata]") {
+    HalfrateTestFixture fixture;
+    fixture.uut->property_change_handler();
+
+    // Create test data
+    constexpr std::size_t n_in = 1024;
+    auto input_data = std::vector<sample_t>(n_in, {1.0f, 0.0f});
+    auto data_vec = std::make_shared<std::vector<sample_t>>(input_data);
+    composite::immutable_buffer<sample_t> buf(data_vec);
+
+    // Create metadata with input sample rate
+    composite::metadata input_metadata;
+    input_metadata.sample_rate = 10e6;  // 10 MHz input sample rate
+    input_metadata.format.is_complex = true;
+    input_metadata.format.type = composite::data_type::floating_point;
+    input_metadata.format.bit_width = 32;
+
+    // Send metadata and data
+    fixture.source_port->send_metadata(input_metadata);
+    fixture.source_port->send_data(buf, composite::timestamp{});
+
+    // Process
+    REQUIRE(fixture.uut->process() == composite::retval::NORMAL);
+
+    // Get output with metadata
+    REQUIRE(fixture.sink_port->size() > 0);
+    auto [output_data, output_ts, output_meta] = fixture.sink_port->get_data();
+
+    // Verify data size
+    REQUIRE(output_data.size() == n_in / 2);
+
+    // Verify metadata was propagated
+    REQUIRE(output_meta.has_value());
+
+    // Verify sample rate was halved (decimation by 2)
+    CHECK_THAT(output_meta->sample_rate, WithinAbs(5e6, 1.0));  // Should be 5 MHz
+
+    // Verify other metadata fields were preserved
+    CHECK(output_meta->format.is_complex == true);
+    CHECK(output_meta->format.type == composite::data_type::floating_point);
+    CHECK(output_meta->format.bit_width == 32);
+}

@@ -90,8 +90,14 @@ auto halfrate::process() -> composite::retval {
         std::memcpy(m_odd_lane.data(), src_odd, m_history_len * sizeof(cf32_t));
     }
 
-    // Send data
+    // Send data (with updated metadata if present)
     data.resize(n_out);
+    if (meta) {
+        // Update metadata for decimation: sample rate is halved
+        auto updated_meta = *meta;
+        updated_meta.sample_rate = updated_meta.sample_rate / 2.0;
+        m_out_port.send_metadata(updated_meta);
+    }
     m_out_port.send_data(std::move(data).to_immutable(), ts);
 
     return NORMAL;
