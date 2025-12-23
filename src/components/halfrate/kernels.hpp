@@ -20,29 +20,50 @@ namespace kernels {
 [[gnu::target("avx512f")]]
 inline
 auto deinterleave_block(
-  const std::complex<float>* src,
-  std::complex<float>* dst_even,
-  std::complex<float>* dst_odd,
+  const std::complex<float>* __restrict__ src,
+  std::complex<float>* __restrict__ dst_even,
+  std::complex<float>* __restrict__ dst_odd,
   std::size_t num_pairs
 ) -> void {
     // Indices for shuffling 64-bit blocks (treating complex<float> as double)
     const auto idx_even = _mm512_set_epi64(14, 12, 10, 8, 6, 4, 2, 0);
     const auto idx_odd  = _mm512_set_epi64(15, 13, 11, 9, 7, 5, 3, 1);
 
-    // Process 8 output pairs per loop (16 input complex samples)
+    // Process 16 output pairs per loop (32 input complex samples)
     // For pair i: dst_even[i] = src[2*i], dst_odd[i] = src[2*i+1]
     std::size_t i = 0;
-    for (; i + 8 <= num_pairs; i += 8) {
-        // Load 16 interleaved complex samples (8 pairs)
+    for (; i + 16 <= num_pairs; i += 16) {
+        // Load first 16 interleaved complex samples (8 pairs)
+        auto a0 = _mm512_loadu_pd(reinterpret_cast<const double*>(src + 2*i));
+        auto b0 = _mm512_loadu_pd(reinterpret_cast<const double*>(src + 2*i + 8));
+        // Load second 16 interleaved complex samples (8 pairs)
+        auto a1 = _mm512_loadu_pd(reinterpret_cast<const double*>(src + 2*i + 16));
+        auto b1 = _mm512_loadu_pd(reinterpret_cast<const double*>(src + 2*i + 24));
+
+        // Permute to separate even and odd for first 8 pairs
+        auto evens0 = _mm512_permutex2var_pd(a0, idx_even, b0);
+        auto odds0  = _mm512_permutex2var_pd(a0, idx_odd, b0);
+        // Permute to separate even and odd for second 8 pairs
+        auto evens1 = _mm512_permutex2var_pd(a1, idx_even, b1);
+        auto odds1  = _mm512_permutex2var_pd(a1, idx_odd, b1);
+
+        _mm512_storeu_pd(reinterpret_cast<double*>(dst_even + i), evens0);
+        _mm512_storeu_pd(reinterpret_cast<double*>(dst_odd + i), odds0);
+        _mm512_storeu_pd(reinterpret_cast<double*>(dst_even + i + 8), evens1);
+        _mm512_storeu_pd(reinterpret_cast<double*>(dst_odd + i + 8), odds1);
+    }
+
+    // Process remaining 8 pairs if needed
+    if (i + 8 <= num_pairs) {
         auto a = _mm512_loadu_pd(reinterpret_cast<const double*>(src + 2*i));
         auto b = _mm512_loadu_pd(reinterpret_cast<const double*>(src + 2*i + 8));
 
-        // Permute to separate even and odd
         auto evens = _mm512_permutex2var_pd(a, idx_even, b);
         auto odds  = _mm512_permutex2var_pd(a, idx_odd, b);
 
         _mm512_storeu_pd(reinterpret_cast<double*>(dst_even + i), evens);
         _mm512_storeu_pd(reinterpret_cast<double*>(dst_odd + i), odds);
+        i += 8;
     }
 
     // Scalar tail handling
@@ -58,9 +79,9 @@ auto deinterleave_block(
 [[gnu::target("avx2,fma")]]
 inline
 auto deinterleave_block(
-  const std::complex<float>* src,
-  std::complex<float>* dst_even,
-  std::complex<float>* dst_odd,
+  const std::complex<float>* __restrict__ src,
+  std::complex<float>* __restrict__ dst_even,
+  std::complex<float>* __restrict__ dst_odd,
   std::size_t num_pairs
 ) -> void {
     // Process 4 output pairs per loop (8 input complex samples)
@@ -98,9 +119,9 @@ auto deinterleave_block(
 [[gnu::target("default")]]
 inline
 auto deinterleave_block(
-  const std::complex<float>* src,
-  std::complex<float>* dst_even,
-  std::complex<float>* dst_odd,
+  const std::complex<float>* __restrict__ src,
+  std::complex<float>* __restrict__ dst_even,
+  std::complex<float>* __restrict__ dst_odd,
   std::size_t num_pairs
 ) -> void {
     for (std::size_t i = 0; i < num_pairs; ++i) {
@@ -121,13 +142,13 @@ auto deinterleave_block(
 [[gnu::target("avx512f")]]
 inline
 auto halfband_filter_vertical(
-  const std::complex<float>* even_hist,
-  const std::complex<float>* odd_hist,
-  const float* coeffs,
+  const std::complex<float>* __restrict__ even_hist,
+  const std::complex<float>* __restrict__ odd_hist,
+  const float* __restrict__ coeffs,
   std::size_t num_taps,
   float center_tap,
   std::size_t delay_offset,
-  std::complex<float>* output,
+  std::complex<float>* __restrict__ output,
   std::size_t num_outputs
 ) -> void {
     auto center_reg = _mm512_set1_ps(center_tap);
@@ -203,13 +224,13 @@ auto halfband_filter_vertical(
 [[gnu::target("avx2,fma")]]
 inline
 auto halfband_filter_vertical(
-  const std::complex<float>* even_hist,
-  const std::complex<float>* odd_hist,
-  const float* coeffs,
+  const std::complex<float>* __restrict__ even_hist,
+  const std::complex<float>* __restrict__ odd_hist,
+  const float* __restrict__ coeffs,
   std::size_t num_taps,
   float center_tap,
   std::size_t delay_offset,
-  std::complex<float>* output,
+  std::complex<float>* __restrict__ output,
   std::size_t num_outputs
 ) -> void {
     auto center_reg = _mm256_set1_ps(center_tap);
@@ -285,13 +306,13 @@ auto halfband_filter_vertical(
 [[gnu::target("default")]]
 inline
 auto halfband_filter_vertical(
-  const std::complex<float>* even_hist,
-  const std::complex<float>* odd_hist,
-  const float* coeffs,
+  const std::complex<float>* __restrict__ even_hist,
+  const std::complex<float>* __restrict__ odd_hist,
+  const float* __restrict__ coeffs,
   std::size_t num_taps,
   float center_tap,
   std::size_t delay_offset,
-  std::complex<float>* output,
+  std::complex<float>* __restrict__ output,
   std::size_t num_outputs
 ) -> void {
     for (std::size_t i = 0; i < num_outputs; ++i) {

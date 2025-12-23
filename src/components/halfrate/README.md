@@ -6,7 +6,6 @@ High-performance polyphase half-band decimating filter optimized for single-core
 
 The `halfrate` component implements a polyphase half-band FIR filter that decimates complex input samples by a factor of 2. It features:
 
-- **High throughput**: 130+ MSPS sustained on a single core
 - **Multi-platform SIMD**: AVX-512, AVX2, and scalar implementations via Multi-Function Versioning (MFV)
 - **Configurable filter design**: Adjustable filter length and window function
 - **Zero-copy architecture**: Efficient buffer management using composite framework
@@ -29,10 +28,10 @@ The output combines both branches: `output[n] = FIR(even[n]) + center_tap * odd[
 ### Filter Design Parameters
 
 Configured via properties:
-- `filter_length`: Total FIR taps (must be odd, e.g., 15, 31, 63)
-- `window_type`: Window function for coefficient generation
-  - `"blackman_harris"` (default) - Superior stopband rejection (~92 dB)
-  - `"hamming"` - Good passband flatness, moderate rejection (~53 dB)
+- `filter_semi_length`: Number of non-zero taps on one side (e.g., 3, 7, 15). Total filter length = `2 × filter_semi_length + 1`
+- `window`: Window function for coefficient generation
+  - `"HAMMING"` (default) - Good passband flatness, moderate rejection (~53 dB)
+  - `"BLACKMAN_HARRIS"` - Better stopband rejection (~92 dB)
 
 The component automatically:
 1. Generates coefficients using windowed-sinc method: `h[k] = sinc(0.5π·k) · window[k]`
@@ -72,20 +71,20 @@ Two high-performance kernels with MFV support:
 #### 1. `deinterleave_block`
 Separates interleaved complex samples into contiguous buffers.
 
-| ISA     | Width | Throughput       |
-|---------|-------|------------------|
-| AVX-512 | 8 pairs/iter | 872-5,403 MSPS |
-| AVX2    | 4 pairs/iter | ~400-2,500 MSPS |
-| Scalar  | 1 pair/iter  | ~100-200 MSPS |
+| ISA     | Width |
+|---------|-------|
+| AVX-512 | 16 pairs/iter |
+| AVX2    | 4 pairs/iter |
+| Scalar  | 1 pair/iter  |
 
 #### 2. `halfband_filter_vertical`
 Computes FIR filter on even branch + delayed odd branch in a single pass.
 
-| ISA     | Width | Throughput       |
-|---------|-------|------------------|
-| AVX-512 | 32 outputs/iter | 537-877 MSPS |
-| AVX2    | 16 outputs/iter | ~250-400 MSPS |
-| Scalar  | 1 output/iter   | ~50-100 MSPS |
+| ISA     | Width |
+|---------|-------|
+| AVX-512 | 32 outputs/iter |
+| AVX2    | 16 outputs/iter |
+| Scalar  | 1 output/iter   |
 
 **Multi-Function Versioning**: The compiler generates all three versions. At runtime, the CPU automatically dispatches to the best available implementation based on feature flags.
 
@@ -98,60 +97,19 @@ Computes FIR filter on even branch + delayed odd branch in a single pass.
 
 ### Properties
 
-```cpp
-// Filter configuration
-filter_length: unsigned int = 15     // Total FIR taps (odd number)
-window_type: string = "blackman_harris"  // Window function
-
-// Runtime info (read-only)
-num_coefficients: unsigned int       // Polyphase FIR taps
-center_tap: float                    // Polyphase center tap value
-delay_offset: unsigned int           // Group delay samples
-```
-
-### Example Configuration
-
-```cpp
-auto decimator = std::make_shared<halfrate>("my_decimator");
-
-// Configure filter
-decimator->set_property("filter_length", 31);
-decimator->set_property("window_type", "blackman_harris");
-
-// Apply configuration
-decimator->property_change_handler();
-
-// Connect ports and process...
-```
-
-### Typical Filter Lengths
-
-| Length | Polyphase Taps | Stopband (BH) | Use Case |
-|--------|----------------|---------------|----------|
-| 15     | 7              | ~60 dB        | Low latency, moderate rejection |
-| 31     | 15             | ~80 dB        | Balanced performance |
-| 63     | 31             | ~100 dB       | High rejection, more compute |
-| 127    | 63             | ~120 dB       | Extreme specs |
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `filter_semi_length` | `uint32_t` | `3` | Half-band filter semi-length (number of non-zero taps on one side). Total filter length = `2 × filter_semi_length + 1`. Example: semi_length=3 → 7 taps total |
+| `window` | `string` | `"HAMMING"` | Window function for coefficient generation. Valid values: `"HAMMING"` or `"BLACKMAN_HARRIS"` |
 
 ## Performance Characteristics
-
-### Throughput Benchmarks
-
-Measured on single core (Intel Xeon with AVX-512):
-
-| Block Size | End-to-End Throughput |
-|------------|-----------------------|
-| 1K         | 168 MSPS              |
-| 16K        | 142 MSPS              |
-| 256K       | 131 MSPS (sustained)  |
-| 1M         | 134 MSPS              |
 
 ### Scaling Considerations
 
 **Best performance when**:
 - Block size ≥ 16K samples (amortizes overhead)
 - Data fits in L3 cache (reduces memory bandwidth pressure)
-- Input rate allows sustained processing (avoid bursty traffic)
+- Input rate allows sustained processing
 
 **Bottlenecks**:
 - Memory bandwidth (large blocks)
@@ -162,8 +120,7 @@ Measured on single core (Intel Xeon with AVX-512):
 
 1. **Use larger block sizes**: 64K-256K samples optimal for throughput
 2. **Pre-allocate buffers**: Avoid malloc in hot path
-3. **Enable AVX-512**: Ensure `-mavx512f` compile flag
-4. **Pin thread to core**: Reduces context switch overhead
+3. **Pin thread to core**: Reduces context switch overhead
 
 ## Building
 
@@ -180,7 +137,7 @@ The component builds as `build/src/components/halfrate/libhalfrate.so`
 
 ```bash
 # Build tests
-cmake --build build --target kernel_tests halfrate_integration_tests performance_benchmarks
+cmake --build build --target kernel_tests halfrate_integration_tests kernel_benchmarks
 
 # Run unit tests
 ./build/src/components/halfrate/tests/kernel_tests
@@ -188,17 +145,9 @@ cmake --build build --target kernel_tests halfrate_integration_tests performance
 # Run integration tests
 ./build/src/components/halfrate/tests/halfrate_integration_tests
 
-# Run performance benchmarks
-./build/src/components/halfrate/tests/performance_benchmarks
+# Run performance benchmarks (Google Benchmark)
+./build/src/components/halfrate/tests/kernel_benchmarks
 ```
-
-### Compile Requirements
-
-- **C++23**: Uses `std::expected`, trailing return types
-- **SIMD flags**: `-mavx512f -mavx512bw -mavx512vl -mavx512dq` (for AVX-512 support)
-- **Optimization**: `-O3 -march=native` recommended for benchmarks
-
-The component will work without AVX-512 (falls back to AVX2 or scalar), but compile with SIMD flags for best performance.
 
 ## Testing
 
@@ -217,10 +166,11 @@ Three comprehensive test suites:
    - Streaming tests with history management
    - Edge cases (DC, impulse, Nyquist)
 
-3. **`performance_benchmarks.cpp`**
-   - Throughput measurements (kernel and component level)
-   - Cache behavior analysis
-   - Scaling tests (1K → 1M samples)
+3. **`kernel_benchmarks.cpp`** (Google Benchmark)
+   - Throughput measurements (deinterleave and filter kernels)
+   - Parameterized size/tap count sweeps
+   - Cache behavior analysis (L1/L2/L3/DRAM)
+   - Statistical reporting with repetitions
 
 ### Running Tests
 
@@ -232,8 +182,14 @@ cd build && ctest
 ./build/src/components/halfrate/tests/kernel_tests
 ./build/src/components/halfrate/tests/halfrate_integration_tests
 
-# Benchmarks (run with high sample count for stable results)
-./build/src/components/halfrate/tests/performance_benchmarks --benchmark-samples 100
+# Performance benchmarks (Google Benchmark)
+./build/src/components/halfrate/tests/kernel_benchmarks
+
+# Run specific benchmarks with repetitions
+./build/src/components/halfrate/tests/kernel_benchmarks --benchmark_filter="Deinterleave" --benchmark_repetitions=10
+
+# Export results to JSON
+./build/src/components/halfrate/tests/kernel_benchmarks --benchmark_format=json --benchmark_out=results.json
 ```
 
 ## Implementation Details
@@ -247,10 +203,9 @@ halfrate/
 ├── kernels.hpp            # SIMD kernels with MFV (header-only)
 ├── CMakeLists.txt         # Build configuration
 └── tests/
-    ├── kernel_tests.cpp
-    ├── halfrate_integration_tests.cpp
-    ├── performance_benchmarks.cpp
-    ├── mfv_test.cpp       # MFV verification utility
+    ├── kernel_tests.cpp               # Catch2 unit tests for SIMD kernels
+    ├── halfrate_integration_tests.cpp # Catch2 integration tests
+    ├── kernel_benchmarks.cpp          # Google Benchmark performance tests
     └── CMakeLists.txt
 ```
 
@@ -273,34 +228,6 @@ On each `process()` call:
 2. Append new samples
 3. Run filter kernel over extended buffer
 4. Output is always `input_size / 2` samples
-
-## Correctness Validation
-
-### Frequency Response
-
-The filter achieves:
-- **Passband** (0 to Fs/8): <1 dB ripple, >90% energy preservation
-- **Transition** (Fs/8 to 3Fs/8): Smooth rolloff
-- **Stopband** (3Fs/8 to Fs/2): >50 dB rejection (Hamming), >80 dB (Blackman-Harris)
-
-Verified via tone injection tests in `halfrate_integration_tests.cpp`:
-- Low-frequency tone (Fs/8): Energy preserved
-- High-frequency tone (0.4·Fs): Attenuated to <5%
-
-### Edge Cases Tested
-
-- DC signal (f=0): Passes through with correct gain
-- Impulse response: Verifies FIR coefficients
-- Nyquist tone (f=0.5·Fs): Heavily attenuated
-- Zero input: Produces zero output
-- Streaming: No discontinuities across block boundaries
-
-## References
-
-- **Half-band filters**: Multirate Signal Processing, Crochiere & Rabiner
-- **Polyphase decomposition**: Chapter 11, "Multirate Digital Signal Processing"
-- **SIMD optimization**: Intel Intrinsics Guide (software.intel.com/intrinsics)
-- **Window functions**: Harris, F.J. "On the Use of Windows for Harmonic Analysis with the DFT"
 
 ## License
 
