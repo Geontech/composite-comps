@@ -15,6 +15,8 @@
 #include <cmath>
 #include <numbers>
 
+#include <windows.hpp>
+
 using sample_t = std::complex<float>;
 using Catch::Matchers::WithinAbs;
 
@@ -136,13 +138,15 @@ TEST_CASE("halfrate component - passband tone preservation", "[halfrate][integra
     auto output = fixture.get_output();
     REQUIRE(output.size() == n_in / 2);
 
-    // Check that energy is preserved (allowing some filter loss)
+    // Check that average power per sample is preserved (allowing some filter ripple)
     auto input_power = compute_power(input);
     auto output_power = compute_power(output);
 
-    // Power should be roughly preserved (within 40% loss for filter + decimation)
-    CHECK(output_power > input_power * 0.4f);
-    CHECK(output_power < input_power * 1.5f);
+    // Measure filter gain in dB (comparing per-sample power, not total energy)
+    // For a decimator, output samples have same amplitude as input, so gain should be near 0 dB
+    float gain_db = 10.0f * std::log10(output_power / input_power);
+    CHECK(gain_db > -1.0f);
+    CHECK(gain_db < 1.0f);
 }
 
 TEST_CASE("halfrate component - stopband attenuation", "[halfrate][integration]") {
@@ -164,49 +168,52 @@ TEST_CASE("halfrate component - stopband attenuation", "[halfrate][integration]"
     auto input_power = compute_power(input);
     auto output_power = compute_power(output);
 
-    CHECK(output_power < input_power * 0.05f); // Less than 5% of input power
+    // For M=3 halfband, expect ~40 dB stopband attenuation (reasonable for 13-tap filter)
+    float attenuation_db = 10.0f * std::log10(output_power / input_power);
+    CHECK(attenuation_db < -35.0f);
 }
 
 TEST_CASE("halfrate component - multiple process calls (streaming)", "[halfrate][integration]") {
-    HalfrateTestFixture fixture;
-    fixture.uut->property_change_handler();
+    HalfrateTestFixture fixture_stream;
+    fixture_stream.uut->property_change_handler();
 
-    // Process multiple small blocks to verify history handling
+    // Reference fixture processes the entire stream in one shot
+    HalfrateTestFixture fixture_ref;
+    fixture_ref.uut->property_change_handler();
+
     constexpr std::size_t block_size = 128;
     constexpr std::size_t num_blocks = 8;
 
-    std::vector<sample_t> all_outputs;
-
-    for (std::size_t b = 0; b < num_blocks; ++b) {
-        // Generate ramping signal
-        auto input = std::vector<sample_t>(block_size);
-        for (std::size_t i = 0; i < block_size; ++i) {
-            auto idx = b * block_size + i;
-            input[i] = {static_cast<float>(idx), static_cast<float>(idx * 2)};
-        }
-
-        fixture.send_data(input);
-        auto ret = fixture.uut->process();
-        REQUIRE(ret == composite::retval::NORMAL);
-
-        auto output = fixture.get_output();
-        REQUIRE(output.size() == block_size / 2);
-
-        // Collect outputs
-        all_outputs.insert(all_outputs.end(), output.begin(), output.end());
+    std::vector<sample_t> full_input(block_size * num_blocks);
+    for (std::size_t i = 0; i < full_input.size(); ++i) {
+        full_input[i] = {static_cast<float>(i), static_cast<float>(i * 2)};
     }
 
-    // Should have produced num_blocks * (block_size/2) outputs
-    REQUIRE(all_outputs.size() == num_blocks * (block_size / 2));
+    // Streamed processing
+    std::vector<sample_t> streamed_outputs;
+    for (std::size_t b = 0; b < num_blocks; ++b) {
+        auto begin = full_input.begin() + b * block_size;
+        auto end = begin + block_size;
+        std::vector<sample_t> block(begin, end);
 
-    // Verify continuity (no discontinuities from history errors)
-    for (std::size_t i = 1; i < all_outputs.size(); ++i) {
-        auto diff_real = std::abs(all_outputs[i].real() - all_outputs[i-1].real());
-        auto diff_imag = std::abs(all_outputs[i].imag() - all_outputs[i-1].imag());
+        fixture_stream.send_data(block);
+        auto ret = fixture_stream.uut->process();
+        REQUIRE(ret == composite::retval::NORMAL);
 
-        // Differences should be smooth (not huge jumps)
-        CHECK(diff_real < 100.0f);
-        CHECK(diff_imag < 200.0f);
+        auto output = fixture_stream.get_output();
+        REQUIRE(output.size() == block_size / 2);
+        streamed_outputs.insert(streamed_outputs.end(), output.begin(), output.end());
+    }
+
+    // Reference single-block processing
+    fixture_ref.send_data(full_input);
+    REQUIRE(fixture_ref.uut->process() == composite::retval::NORMAL);
+    auto reference_output = fixture_ref.get_output();
+
+    REQUIRE(streamed_outputs.size() == reference_output.size());
+    for (std::size_t i = 0; i < streamed_outputs.size(); ++i) {
+        CHECK_THAT(streamed_outputs[i].real(), WithinAbs(reference_output[i].real(), 1e-4f));
+        CHECK_THAT(streamed_outputs[i].imag(), WithinAbs(reference_output[i].imag(), 1e-4f));
     }
 }
 
@@ -234,11 +241,18 @@ TEST_CASE("halfrate component - impulse response", "[halfrate][integration]") {
     auto output = fixture.get_output();
     REQUIRE(output.size() == n_in / 2);
 
-    // Output should be the impulse response of the filter
-    // Check that it's non-zero near the beginning and decays
-    CHECK(std::abs(output[0]) > 0.005f); // Non-trivial output
+    // Output should be the impulse response of the filter; peak near group delay (M outputs)
+    constexpr std::size_t semi_len = 3; // default property value
+    auto peak_it = std::max_element(
+        output.begin(), output.end(),
+        [](const sample_t& a, const sample_t& b) { return std::norm(a) < std::norm(b); });
+    auto peak_idx = static_cast<std::size_t>(std::distance(output.begin(), peak_it));
+    CHECK(peak_idx >= semi_len - 1);
+    CHECK(peak_idx <= semi_len + 1);
+    CHECK_THAT(peak_it->real(), WithinAbs(0.5f, 5e-2f));
+    CHECK_THAT(peak_it->imag(), WithinAbs(0.0f, 5e-2f));
 
-    // Most of the energy should be in the first few taps
+    // Most of the energy should be in the first few taps after the peak
     float early_energy = 0.0f;
     for (std::size_t i = 0; i < 20 && i < output.size(); ++i) {
         early_energy += std::norm(output[i]);
@@ -246,9 +260,48 @@ TEST_CASE("halfrate component - impulse response", "[halfrate][integration]") {
 
     float total_energy = compute_power(output) * output.size();
 
-    // At least 90% of energy should be in first 20 samples
-    CHECK(early_energy > total_energy * 0.9f);
+    // At least 95% of energy should be in first 20 samples
+    CHECK(early_energy > total_energy * 0.95f);
 }
+
+TEST_CASE("halfrate component - impulse parity", "[halfrate][integration]") {
+    HalfrateTestFixture fixture;
+    fixture.uut->property_change_handler();
+
+    constexpr std::size_t n_in = 512;
+    constexpr std::size_t semi_len = 3; // default property
+
+    // Impulse at index 0
+    auto input0 = std::vector<sample_t>(n_in, {0.0f, 0.0f});
+    input0[0] = {1.0f, 0.0f};
+    fixture.send_data(input0);
+    REQUIRE(fixture.uut->process() == composite::retval::NORMAL);
+    auto out0 = fixture.get_output();
+
+    // Expect center-only response at m = M
+    CHECK_THAT(out0[semi_len].real(), WithinAbs(0.5f, 5e-2f));
+
+    // Impulse at index 1
+    auto input1 = std::vector<sample_t>(n_in, {0.0f, 0.0f});
+    input1[1] = {1.0f, 0.0f};
+    fixture.send_data(input1);
+    REQUIRE(fixture.uut->process() == composite::retval::NORMAL);
+    auto out1 = fixture.get_output();
+
+    // Expect odd-tap response at k=-1 (index center-1 in the prototype).
+    // This matches the odd-lane impulse response at output index M.
+    constexpr std::size_t L = 4 * semi_len + 1;
+    constexpr std::size_t center = L / 2;
+    constexpr int k = -1;
+    auto window = windows::hamming<float>(L, false);
+    auto sinc_val = std::sin(0.5f * std::numbers::pi_v<float> * k)
+        / (std::numbers::pi_v<float> * k);
+    float expected_tap = sinc_val * window->at(center - 1);
+
+    CHECK_THAT(out1[semi_len].real(), WithinAbs(expected_tap, 5e-2f));
+    CHECK_THAT(out1[semi_len].imag(), WithinAbs(0.0f, 5e-2f));
+}
+
 
 TEST_CASE("halfrate component - DC signal", "[halfrate][integration]") {
     HalfrateTestFixture fixture;
@@ -297,7 +350,9 @@ TEST_CASE("halfrate component - alternating signal", "[halfrate][integration]") 
     auto input_power = compute_power(input);
     auto output_power = compute_power(output);
 
-    CHECK(output_power < input_power * 0.05f); // Less than 5% power
+    // For M=3 halfband, expect ~40 dB stopband attenuation
+    float attenuation_db = 10.0f * std::log10(output_power / input_power);
+    CHECK(attenuation_db < -35.0f);
 }
 
 TEST_CASE("halfrate component - zero input", "[halfrate][integration]") {
@@ -362,4 +417,42 @@ TEST_CASE("halfrate component - metadata propagation and sample rate update", "[
     CHECK(output_meta->format.is_complex == true);
     CHECK(output_meta->format.type == composite::data_type::floating_point);
     CHECK(output_meta->format.bit_width == 32);
+}
+
+TEST_CASE("halfrate component - window and tap configurations", "[halfrate][integration][properties]") {
+    struct config {
+        uint32_t semi_length;
+        const char* window;
+        float stopband_db_limit;
+    };
+
+    std::vector<config> configs = {
+        {6, "HAMMING", -40.0f},
+        {6, "BLACKMAN_HARRIS", -40.0f}
+    };
+
+    for (const auto& cfg : configs) {
+        HalfrateTestFixture fixture;
+        fixture.uut->set_properties({
+            {"filter_semi_length", std::to_string(cfg.semi_length)},
+            {"window", cfg.window}
+        });
+        fixture.uut->property_change_handler();
+
+        constexpr double stopband_tone = 0.4;
+        constexpr std::size_t n_in = 4096;
+        auto input = generate_tone(n_in, stopband_tone);
+
+        fixture.send_data(input);
+        REQUIRE(fixture.uut->process() == composite::retval::NORMAL);
+
+        auto output = fixture.get_output();
+        REQUIRE(output.size() == n_in / 2);
+
+        auto input_power = compute_power(input);
+        auto output_power = compute_power(output);
+        float attenuation_db = 10.0f * std::log10(output_power / input_power);
+
+        CHECK(attenuation_db < cfg.stopband_db_limit);
+    }
 }

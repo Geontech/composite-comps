@@ -180,15 +180,15 @@ inline auto halfband_filter_vertical(
     for (; i + 32 <= num_outputs; i += 32) {
         // --- 1. Initialize Accumulators (Split A/B) ---
         // 'A' accumulators start with the Center Tap contribution
-        auto odd_0 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset));
-        auto odd_1 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset) + 16);
-        auto odd_2 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset) + 32);
-        auto odd_3 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset) + 48);
+        auto even_0 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset));
+        auto even_1 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset) + 16);
+        auto even_2 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset) + 32);
+        auto even_3 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset) + 48);
 
-        auto acc_0a = _mm512_mul_ps(odd_0, center_reg);
-        auto acc_1a = _mm512_mul_ps(odd_1, center_reg);
-        auto acc_2a = _mm512_mul_ps(odd_2, center_reg);
-        auto acc_3a = _mm512_mul_ps(odd_3, center_reg);
+        auto acc_0a = _mm512_mul_ps(even_0, center_reg);
+        auto acc_1a = _mm512_mul_ps(even_1, center_reg);
+        auto acc_2a = _mm512_mul_ps(even_2, center_reg);
+        auto acc_3a = _mm512_mul_ps(even_3, center_reg);
 
         // 'B' accumulators start at zero
         auto acc_0b = _mm512_setzero_ps();
@@ -201,15 +201,15 @@ inline auto halfband_filter_vertical(
             // Tap K -> Set A
             auto h_even = _mm512_set1_ps(coeffs[k]);
 
-            auto ev_0a = _mm512_loadu_ps(even_hist_f + 2*(i + k));
-            auto ev_1a = _mm512_loadu_ps(even_hist_f + 2*(i + k) + 16);
-            auto ev_2a = _mm512_loadu_ps(even_hist_f + 2*(i + k) + 32);
-            auto ev_3a = _mm512_loadu_ps(even_hist_f + 2*(i + k) + 48);
+            auto od_0a = _mm512_loadu_ps(odd_hist_f + 2*(i + k));
+            auto od_1a = _mm512_loadu_ps(odd_hist_f + 2*(i + k) + 16);
+            auto od_2a = _mm512_loadu_ps(odd_hist_f + 2*(i + k) + 32);
+            auto od_3a = _mm512_loadu_ps(odd_hist_f + 2*(i + k) + 48);
 
-            acc_0a = _mm512_fmadd_ps(ev_0a, h_even, acc_0a);
-            acc_1a = _mm512_fmadd_ps(ev_1a, h_even, acc_1a);
-            acc_2a = _mm512_fmadd_ps(ev_2a, h_even, acc_2a);
-            acc_3a = _mm512_fmadd_ps(ev_3a, h_even, acc_3a);
+            acc_0a = _mm512_fmadd_ps(od_0a, h_even, acc_0a);
+            acc_1a = _mm512_fmadd_ps(od_1a, h_even, acc_1a);
+            acc_2a = _mm512_fmadd_ps(od_2a, h_even, acc_2a);
+            acc_3a = _mm512_fmadd_ps(od_3a, h_even, acc_3a);
 
             // Tap K+1 -> Set B
             // These FMAs are independent of the 'A' set above.
@@ -217,15 +217,15 @@ inline auto halfband_filter_vertical(
             if (k + 1 < num_taps) {
                 auto h_odd = _mm512_set1_ps(coeffs[k+1]);
 
-                auto ev_0b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1));
-                auto ev_1b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1) + 16);
-                auto ev_2b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1) + 32);
-                auto ev_3b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1) + 48);
+                auto od_0b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1));
+                auto od_1b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1) + 16);
+                auto od_2b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1) + 32);
+                auto od_3b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1) + 48);
 
-                acc_0b = _mm512_fmadd_ps(ev_0b, h_odd, acc_0b);
-                acc_1b = _mm512_fmadd_ps(ev_1b, h_odd, acc_1b);
-                acc_2b = _mm512_fmadd_ps(ev_2b, h_odd, acc_2b);
-                acc_3b = _mm512_fmadd_ps(ev_3b, h_odd, acc_3b);
+                acc_0b = _mm512_fmadd_ps(od_0b, h_odd, acc_0b);
+                acc_1b = _mm512_fmadd_ps(od_1b, h_odd, acc_1b);
+                acc_2b = _mm512_fmadd_ps(od_2b, h_odd, acc_2b);
+                acc_3b = _mm512_fmadd_ps(od_3b, h_odd, acc_3b);
             }
         }
 
@@ -238,27 +238,27 @@ inline auto halfband_filter_vertical(
 
     // 2. Tail: 16 outputs (2 ZMMs)
     if (i + 16 <= num_outputs) {
-        auto odd_0 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset));
-        auto odd_1 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset) + 16);
+        auto even_0 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset));
+        auto even_1 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset) + 16);
 
-        auto acc_0a = _mm512_mul_ps(odd_0, center_reg);
-        auto acc_1a = _mm512_mul_ps(odd_1, center_reg);
+        auto acc_0a = _mm512_mul_ps(even_0, center_reg);
+        auto acc_1a = _mm512_mul_ps(even_1, center_reg);
         auto acc_0b = _mm512_setzero_ps();
         auto acc_1b = _mm512_setzero_ps();
 
         for (std::size_t k = 0; k < num_taps; k += 2) {
             auto h_even = _mm512_set1_ps(coeffs[k]);
-            auto ev_0a = _mm512_loadu_ps(even_hist_f + 2*(i + k));
-            auto ev_1a = _mm512_loadu_ps(even_hist_f + 2*(i + k) + 16);
-            acc_0a = _mm512_fmadd_ps(ev_0a, h_even, acc_0a);
-            acc_1a = _mm512_fmadd_ps(ev_1a, h_even, acc_1a);
+            auto od_0a = _mm512_loadu_ps(odd_hist_f + 2*(i + k));
+            auto od_1a = _mm512_loadu_ps(odd_hist_f + 2*(i + k) + 16);
+            acc_0a = _mm512_fmadd_ps(od_0a, h_even, acc_0a);
+            acc_1a = _mm512_fmadd_ps(od_1a, h_even, acc_1a);
 
             if (k + 1 < num_taps) {
                 auto h_odd = _mm512_set1_ps(coeffs[k+1]);
-                auto ev_0b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1));
-                auto ev_1b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1) + 16);
-                acc_0b = _mm512_fmadd_ps(ev_0b, h_odd, acc_0b);
-                acc_1b = _mm512_fmadd_ps(ev_1b, h_odd, acc_1b);
+                auto od_0b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1));
+                auto od_1b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1) + 16);
+                acc_0b = _mm512_fmadd_ps(od_0b, h_odd, acc_0b);
+                acc_1b = _mm512_fmadd_ps(od_1b, h_odd, acc_1b);
             }
         }
         _mm512_storeu_ps(output_f + 2*i,      _mm512_add_ps(acc_0a, acc_0b));
@@ -268,19 +268,19 @@ inline auto halfband_filter_vertical(
 
     // 3. Tail: 8 outputs (1 ZMM)
     if (i + 8 <= num_outputs) {
-        auto odd_0 = _mm512_loadu_ps(odd_hist_f + 2*(i + delay_offset));
-        auto acc_0a = _mm512_mul_ps(odd_0, center_reg);
+        auto even_0 = _mm512_loadu_ps(even_hist_f + 2*(i + delay_offset));
+        auto acc_0a = _mm512_mul_ps(even_0, center_reg);
         auto acc_0b = _mm512_setzero_ps();
 
         for (std::size_t k = 0; k < num_taps; k += 2) {
             auto h_even = _mm512_set1_ps(coeffs[k]);
-            auto ev_0a = _mm512_loadu_ps(even_hist_f + 2*(i + k));
-            acc_0a = _mm512_fmadd_ps(ev_0a, h_even, acc_0a);
+            auto od_0a = _mm512_loadu_ps(odd_hist_f + 2*(i + k));
+            acc_0a = _mm512_fmadd_ps(od_0a, h_even, acc_0a);
 
             if (k + 1 < num_taps) {
                 auto h_odd = _mm512_set1_ps(coeffs[k+1]);
-                auto ev_0b = _mm512_loadu_ps(even_hist_f + 2*(i + k + 1));
-                acc_0b = _mm512_fmadd_ps(ev_0b, h_odd, acc_0b);
+                auto od_0b = _mm512_loadu_ps(odd_hist_f + 2*(i + k + 1));
+                acc_0b = _mm512_fmadd_ps(od_0b, h_odd, acc_0b);
             }
         }
         _mm512_storeu_ps(output_f + 2*i, _mm512_add_ps(acc_0a, acc_0b));
@@ -289,9 +289,9 @@ inline auto halfband_filter_vertical(
 
     // 4. Scalar tail
     for (; i < num_outputs; ++i) {
-        auto sum = odd_hist[i + delay_offset] * center_tap;
+        auto sum = even_hist[i + delay_offset] * center_tap;
         for (std::size_t k = 0; k < num_taps; ++k) {
-            sum += even_hist[i + k] * coeffs[k];
+            sum += odd_hist[i + k] * coeffs[k];
         }
         output[i] = sum;
     }
@@ -318,15 +318,15 @@ auto halfband_filter_vertical(
     // Primary loop: 16 outputs (4 YMM registers) per iteration
     for (; i + 16 <= num_outputs; i += 16) {
         // Init accum A
-        auto odd_0 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + delay_offset));
-        auto odd_1 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + delay_offset + 4));
-        auto odd_2 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + delay_offset + 8));
-        auto odd_3 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + delay_offset + 12));
+        auto even_0 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + delay_offset));
+        auto even_1 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + delay_offset + 4));
+        auto even_2 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + delay_offset + 8));
+        auto even_3 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + delay_offset + 12));
 
-        auto acc_0a = _mm256_mul_ps(odd_0, center_reg);
-        auto acc_1a = _mm256_mul_ps(odd_1, center_reg);
-        auto acc_2a = _mm256_mul_ps(odd_2, center_reg);
-        auto acc_3a = _mm256_mul_ps(odd_3, center_reg);
+        auto acc_0a = _mm256_mul_ps(even_0, center_reg);
+        auto acc_1a = _mm256_mul_ps(even_1, center_reg);
+        auto acc_2a = _mm256_mul_ps(even_2, center_reg);
+        auto acc_3a = _mm256_mul_ps(even_3, center_reg);
 
         // Init accum B
         auto acc_0b = _mm256_setzero_ps();
@@ -337,28 +337,28 @@ auto halfband_filter_vertical(
         for (std::size_t k = 0; k < num_taps; k += 2) {
             // Tap K -> A
             auto h_even = _mm256_set1_ps(coeffs[k]);
-            auto ev_0a = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k));
-            auto ev_1a = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 4));
-            auto ev_2a = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 8));
-            auto ev_3a = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 12));
+            auto od_0a = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k));
+            auto od_1a = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 4));
+            auto od_2a = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 8));
+            auto od_3a = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 12));
 
-            acc_0a = _mm256_fmadd_ps(ev_0a, h_even, acc_0a);
-            acc_1a = _mm256_fmadd_ps(ev_1a, h_even, acc_1a);
-            acc_2a = _mm256_fmadd_ps(ev_2a, h_even, acc_2a);
-            acc_3a = _mm256_fmadd_ps(ev_3a, h_even, acc_3a);
+            acc_0a = _mm256_fmadd_ps(od_0a, h_even, acc_0a);
+            acc_1a = _mm256_fmadd_ps(od_1a, h_even, acc_1a);
+            acc_2a = _mm256_fmadd_ps(od_2a, h_even, acc_2a);
+            acc_3a = _mm256_fmadd_ps(od_3a, h_even, acc_3a);
 
             // Tap K+1 -> B
             if (k + 1 < num_taps) {
                 auto h_odd = _mm256_set1_ps(coeffs[k+1]);
-                auto ev_0b = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 1));
-                auto ev_1b = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 5));
-                auto ev_2b = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 9));
-                auto ev_3b = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 13));
+                auto od_0b = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 1));
+                auto od_1b = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 5));
+                auto od_2b = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 9));
+                auto od_3b = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 13));
 
-                acc_0b = _mm256_fmadd_ps(ev_0b, h_odd, acc_0b);
-                acc_1b = _mm256_fmadd_ps(ev_1b, h_odd, acc_1b);
-                acc_2b = _mm256_fmadd_ps(ev_2b, h_odd, acc_2b);
-                acc_3b = _mm256_fmadd_ps(ev_3b, h_odd, acc_3b);
+                acc_0b = _mm256_fmadd_ps(od_0b, h_odd, acc_0b);
+                acc_1b = _mm256_fmadd_ps(od_1b, h_odd, acc_1b);
+                acc_2b = _mm256_fmadd_ps(od_2b, h_odd, acc_2b);
+                acc_3b = _mm256_fmadd_ps(od_3b, h_odd, acc_3b);
             }
         }
 
@@ -371,27 +371,27 @@ auto halfband_filter_vertical(
 
     // Tail loop: 8 outputs
     if (i + 8 <= num_outputs) {
-        auto odd_0 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + delay_offset));
-        auto odd_1 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + delay_offset + 4));
+        auto even_0 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + delay_offset));
+        auto even_1 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + delay_offset + 4));
 
-        auto acc_0a = _mm256_mul_ps(odd_0, center_reg);
-        auto acc_1a = _mm256_mul_ps(odd_1, center_reg);
+        auto acc_0a = _mm256_mul_ps(even_0, center_reg);
+        auto acc_1a = _mm256_mul_ps(even_1, center_reg);
         auto acc_0b = _mm256_setzero_ps();
         auto acc_1b = _mm256_setzero_ps();
 
         for (std::size_t k = 0; k < num_taps; k += 2) {
             auto h_reg = _mm256_set1_ps(coeffs[k]);
-            auto ev_0 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k));
-            auto ev_1 = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 4));
-            acc_0a = _mm256_fmadd_ps(ev_0, h_reg, acc_0a);
-            acc_1a = _mm256_fmadd_ps(ev_1, h_reg, acc_1a);
+            auto od_0 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k));
+            auto od_1 = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 4));
+            acc_0a = _mm256_fmadd_ps(od_0, h_reg, acc_0a);
+            acc_1a = _mm256_fmadd_ps(od_1, h_reg, acc_1a);
 
             if (k + 1 < num_taps) {
                 auto h_odd = _mm256_set1_ps(coeffs[k+1]);
-                auto ev_0b = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 1));
-                auto ev_1b = _mm256_loadu_ps(reinterpret_cast<const float*>(even_hist + i + k + 5));
-                acc_0b = _mm256_fmadd_ps(ev_0b, h_odd, acc_0b);
-                acc_1b = _mm256_fmadd_ps(ev_1b, h_odd, acc_1b);
+                auto od_0b = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 1));
+                auto od_1b = _mm256_loadu_ps(reinterpret_cast<const float*>(odd_hist + i + k + 5));
+                acc_0b = _mm256_fmadd_ps(od_0b, h_odd, acc_0b);
+                acc_1b = _mm256_fmadd_ps(od_1b, h_odd, acc_1b);
             }
         }
 
@@ -402,9 +402,9 @@ auto halfband_filter_vertical(
 
     // 4. Scalar tail
     for (; i < num_outputs; ++i) {
-        auto sum = odd_hist[i + delay_offset] * center_tap;
+        auto sum = even_hist[i + delay_offset] * center_tap;
         for (std::size_t k = 0; k < num_taps; ++k) {
-            sum += even_hist[i + k] * coeffs[k];
+            sum += odd_hist[i + k] * coeffs[k];
         }
         output[i] = sum;
     }
@@ -426,9 +426,9 @@ auto halfband_filter_vertical(
   std::size_t num_outputs
 ) -> void {
     for (std::size_t i = 0; i < num_outputs; ++i) {
-        auto sum = odd_hist[i + delay_offset] * center_tap;
+        auto sum = even_hist[i + delay_offset] * center_tap;
         for (std::size_t k = 0; k < num_taps; ++k) {
-            sum += even_hist[i + k] * coeffs[k];
+            sum += odd_hist[i + k] * coeffs[k];
         }
         output[i] = sum;
     }

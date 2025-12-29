@@ -20,10 +20,10 @@ A half-band filter has:
 - **Symmetric impulse response**: Every other coefficient is zero (except center tap)
 
 This component uses a **polyphase decomposition** that exploits the zero-valued coefficients:
-- **Even branch**: Non-zero FIR taps applied to even-indexed input samples
-- **Odd branch**: Center tap (typically 0.5) applied to odd-indexed samples with group delay compensation
+- **Even branch**: Center tap (typically 0.5) applied to even-indexed input samples with group delay compensation
+- **Odd branch**: Non-zero FIR taps applied to odd-indexed input samples
 
-The output combines both branches: `output[n] = FIR(even[n]) + center_tap * odd[n - delay]`
+The output combines both branches: `output[n] = FIR(odd[n]) + center_tap * even[n - delay]`
 
 ### Filter Design Parameters
 
@@ -35,8 +35,8 @@ Configured via properties:
 
 The component automatically:
 1. Generates coefficients using windowed-sinc method: `h[k] = sinc(0.5π·k) · window[k]`
-2. Extracts polyphase branches (even taps become FIR coefficients, center tap becomes scalar)
-3. Computes group delay offset for odd branch alignment
+2. Extracts polyphase branches (odd-offset taps become FIR coefficients, center tap becomes scalar)
+3. Computes group delay offset for even branch alignment
 
 ## Architecture
 
@@ -57,7 +57,7 @@ Input (interleaved I/Q)
 └─────────┘ └─────────┘
     ↓           ↓
 ┌─────────────────────┐
-│ Vertical Half-band  │  FIR on even + delayed odd
+│ Vertical Half-band  │  FIR on odd + delayed even
 │ Filter (SIMD)       │  Single fused kernel
 └─────────────────────┘
     ↓
@@ -78,7 +78,7 @@ Separates interleaved complex samples into contiguous buffers.
 | Scalar  | 1 pair/iter  |
 
 #### 2. `halfband_filter_vertical`
-Computes FIR filter on even branch + delayed odd branch in a single pass.
+Computes FIR filter on odd branch + delayed even branch in a single pass.
 
 | ISA     | Width |
 |---------|-------|
@@ -101,26 +101,6 @@ Computes FIR filter on even branch + delayed odd branch in a single pass.
 |----------|------|---------|-------------|
 | `filter_semi_length` | `uint32_t` | `3` | Half-band filter semi-length (number of non-zero taps on one side). Total filter length = `2 × filter_semi_length + 1`. Example: semi_length=3 → 7 taps total |
 | `window` | `string` | `"HAMMING"` | Window function for coefficient generation. Valid values: `"HAMMING"` or `"BLACKMAN_HARRIS"` |
-
-## Performance Characteristics
-
-### Scaling Considerations
-
-**Best performance when**:
-- Block size ≥ 16K samples (amortizes overhead)
-- Data fits in L3 cache (reduces memory bandwidth pressure)
-- Input rate allows sustained processing
-
-**Bottlenecks**:
-- Memory bandwidth (large blocks)
-- Buffer allocation overhead (small blocks)
-- History management (memcpy ~10-15% overhead)
-
-### Optimization Tips
-
-1. **Use larger block sizes**: 64K-256K samples optimal for throughput
-2. **Pre-allocate buffers**: Avoid malloc in hot path
-3. **Pin thread to core**: Reduces context switch overhead
 
 ## Building
 
@@ -219,9 +199,9 @@ halfrate/
 
 ### History Management
 
-The component maintains circular history buffers:
-- **Even history**: Size = `num_outputs + num_taps`
-- **Odd history**: Size = `num_outputs + delay_offset`
+The component maintains history buffers for both polyphase branches:
+- **History size**: `max(num_taps, filter_semi_length)` samples per lane
+- Both even and odd lanes use the same history length
 
 On each `process()` call:
 1. Copy tail of previous block to head of history buffer (maintains FIR state)

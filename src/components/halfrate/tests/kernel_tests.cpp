@@ -67,9 +67,9 @@ auto reference_halfband_filter(
     std::size_t num_outputs
 ) -> void {
     for (std::size_t i = 0; i < num_outputs; ++i) {
-        auto sum = odd_hist[i + delay_offset] * center_tap;
+        auto sum = even_hist[i + delay_offset] * center_tap;
         for (std::size_t k = 0; k < num_taps; ++k) {
-            sum += even_hist[i + k] * coeffs[k];
+            sum += odd_hist[i + k] * coeffs[k];
         }
         output[i] = sum;
     }
@@ -203,8 +203,8 @@ TEST_CASE("halfband_filter_vertical - basic operation", "[kernels][filter]") {
     constexpr float center_tap = 1.0f;
 
     // Create test data
-    std::vector<sample_t> even_hist(num_outputs + num_taps, {1.0f, 0.0f});
-    std::vector<sample_t> odd_hist(num_outputs + delay_offset, {1.0f, 0.0f});
+    std::vector<sample_t> even_hist(num_outputs + delay_offset, {1.0f, 0.0f});
+    std::vector<sample_t> odd_hist(num_outputs + num_taps, {1.0f, 0.0f});
     std::vector<float> coeffs = {0.5f, 0.3f, 0.2f};
 
     std::vector<sample_t> output_ref(num_outputs);
@@ -239,8 +239,8 @@ TEST_CASE("halfband_filter_vertical - 32-sample boundary", "[kernels][filter]") 
     constexpr std::size_t delay_offset = 2;
     constexpr float center_tap = 1.0f;
 
-    std::vector<sample_t> even_hist(num_outputs + num_taps);
-    std::vector<sample_t> odd_hist(num_outputs + delay_offset);
+    std::vector<sample_t> even_hist(num_outputs + delay_offset);
+    std::vector<sample_t> odd_hist(num_outputs + num_taps);
 
     // Initialize with varying data
     for (std::size_t i = 0; i < even_hist.size(); ++i) {
@@ -270,8 +270,80 @@ TEST_CASE("halfband_filter_vertical - 32-sample boundary", "[kernels][filter]") 
     );
 
     for (std::size_t i = 0; i < num_outputs; ++i) {
-        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-4f));
-        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-4f));
+        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-5f));
+        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-5f));
+    }
+}
+
+TEST_CASE("halfband_filter_vertical - center tap only hits even lane", "[kernels][filter][parity]") {
+    constexpr std::size_t num_outputs = 8;
+    constexpr std::size_t num_taps = 3;
+    constexpr std::size_t delay_offset = 2;
+    constexpr float center_tap = 0.5f;
+
+    // Impulse on even lane; odd lane zeros
+    std::vector<sample_t> even_hist(num_outputs + delay_offset, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(num_outputs + num_taps, {0.0f, 0.0f});
+    even_hist.at(delay_offset) = {1.0f, 0.0f};
+    std::vector<float> coeffs = {0.3f, 0.2f, 0.1f};
+
+    std::vector<sample_t> output_ref(num_outputs);
+    std::vector<sample_t> output_simd(num_outputs);
+
+    reference_halfband_filter(
+        even_hist.data(), odd_hist.data(),
+        coeffs.data(), num_taps,
+        center_tap, delay_offset,
+        output_ref.data(), num_outputs
+    );
+
+    kernels::halfband_filter_vertical(
+        even_hist.data(), odd_hist.data(),
+        coeffs.data(), num_taps,
+        center_tap, delay_offset,
+        output_simd.data(), num_outputs
+    );
+
+    CHECK_THAT(output_simd[0].real(), WithinAbs(0.5f, 1e-5f));
+    CHECK_THAT(output_simd[0].imag(), WithinAbs(0.0f, 1e-5f));
+    for (std::size_t i = 1; i < num_outputs; ++i) {
+        CHECK_THAT(output_simd[i].real(), WithinAbs(0.0f, 1e-5f));
+        CHECK_THAT(output_simd[i].imag(), WithinAbs(0.0f, 1e-5f));
+    }
+}
+
+TEST_CASE("halfband_filter_vertical - sidelobes only hit odd lane", "[kernels][filter][parity]") {
+    constexpr std::size_t num_outputs = 8;
+    constexpr std::size_t num_taps = 4;
+    constexpr std::size_t delay_offset = 3;
+    constexpr float center_tap = 0.5f;
+
+    // Impulse on odd lane; even lane zeros
+    std::vector<sample_t> even_hist(num_outputs + delay_offset, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(num_outputs + num_taps, {0.0f, 0.0f});
+    odd_hist.at(0) = {1.0f, 0.0f};
+    std::vector<float> coeffs = {0.4f, 0.3f, 0.2f, 0.1f};
+
+    std::vector<sample_t> output_ref(num_outputs);
+    std::vector<sample_t> output_simd(num_outputs);
+
+    reference_halfband_filter(
+        even_hist.data(), odd_hist.data(),
+        coeffs.data(), num_taps,
+        center_tap, delay_offset,
+        output_ref.data(), num_outputs
+    );
+
+    kernels::halfband_filter_vertical(
+        even_hist.data(), odd_hist.data(),
+        coeffs.data(), num_taps,
+        center_tap, delay_offset,
+        output_simd.data(), num_outputs
+    );
+
+    for (std::size_t i = 0; i < num_outputs; ++i) {
+        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-5f));
+        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-5f));
     }
 }
 
@@ -281,8 +353,8 @@ TEST_CASE("halfband_filter_vertical - 16-sample tail", "[kernels][filter]") {
     constexpr std::size_t delay_offset = 1;
     constexpr float center_tap = 0.5f;
 
-    std::vector<sample_t> even_hist(num_outputs + num_taps);
-    std::vector<sample_t> odd_hist(num_outputs + delay_offset);
+    std::vector<sample_t> even_hist(num_outputs + delay_offset);
+    std::vector<sample_t> odd_hist(num_outputs + num_taps);
 
     std::mt19937 gen(98765);
     std::uniform_real_distribution<float> dist(-10.0f, 10.0f);
@@ -310,8 +382,8 @@ TEST_CASE("halfband_filter_vertical - 16-sample tail", "[kernels][filter]") {
     );
 
     for (std::size_t i = 0; i < num_outputs; ++i) {
-        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-4f));
-        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-4f));
+        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-5f));
+        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-5f));
     }
 }
 
@@ -321,8 +393,8 @@ TEST_CASE("halfband_filter_vertical - unaligned size", "[kernels][filter]") {
     constexpr std::size_t delay_offset = 3;
     constexpr float center_tap = 1.0f;
 
-    std::vector<sample_t> even_hist(num_outputs + num_taps);
-    std::vector<sample_t> odd_hist(num_outputs + delay_offset);
+    std::vector<sample_t> even_hist(num_outputs + delay_offset);
+    std::vector<sample_t> odd_hist(num_outputs + num_taps);
 
     std::mt19937 gen(11111);
     std::uniform_real_distribution<float> dist(-100.0f, 100.0f);
@@ -351,8 +423,8 @@ TEST_CASE("halfband_filter_vertical - unaligned size", "[kernels][filter]") {
     );
 
     for (std::size_t i = 0; i < num_outputs; ++i) {
-        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-3f));
-        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-3f));
+        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 5e-4f));
+        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 5e-4f));
     }
 }
 
@@ -362,8 +434,8 @@ TEST_CASE("halfband_filter_vertical - large block", "[kernels][filter]") {
     constexpr std::size_t delay_offset = 5;
     constexpr float center_tap = 1.0f;
 
-    std::vector<sample_t> even_hist(num_outputs + num_taps);
-    std::vector<sample_t> odd_hist(num_outputs + delay_offset);
+    std::vector<sample_t> even_hist(num_outputs + delay_offset);
+    std::vector<sample_t> odd_hist(num_outputs + num_taps);
 
     std::mt19937 gen(22222);
     std::uniform_real_distribution<float> dist(-1000.0f, 1000.0f);
@@ -392,8 +464,8 @@ TEST_CASE("halfband_filter_vertical - large block", "[kernels][filter]") {
     );
 
     for (std::size_t i = 0; i < num_outputs; ++i) {
-        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-2f));
-        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-2f));
+        CHECK_THAT(output_simd[i].real(), WithinAbs(output_ref[i].real(), 1e-3f));
+        CHECK_THAT(output_simd[i].imag(), WithinAbs(output_ref[i].imag(), 1e-3f));
     }
 }
 
@@ -403,8 +475,8 @@ TEST_CASE("halfband_filter_vertical - zero coefficients", "[kernels][filter]") {
     constexpr std::size_t delay_offset = 1;
     constexpr float center_tap = 2.0f;
 
-    std::vector<sample_t> even_hist(num_outputs + num_taps, {1.0f, 1.0f});
-    std::vector<sample_t> odd_hist(num_outputs + delay_offset, {3.0f, 2.0f});
+    std::vector<sample_t> even_hist(num_outputs + delay_offset, {1.0f, 1.0f});
+    std::vector<sample_t> odd_hist(num_outputs + num_taps, {3.0f, 2.0f});
     std::vector<float> coeffs(num_taps, 0.0f); // All zero
 
     std::vector<sample_t> output_ref(num_outputs);

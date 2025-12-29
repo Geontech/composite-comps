@@ -15,7 +15,9 @@ halfrate::halfrate(std::string_view id) :
   m_odd_lane(ALIGNMENT, 0) {
     add_port(&m_in_port);
     add_port(&m_out_port);
-    add_property("filter_semi_length", m_filter_semi_length);
+    add_property("filter_semi_length", m_filter_semi_length).change_listener([this]() {
+        return m_filter_semi_length >= 1;
+    });
     add_property("window", m_window_type).change_listener([this]() {
         return m_window_type.empty() || (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
     });
@@ -26,14 +28,7 @@ auto halfrate::property_change_handler() -> void {
     generate_coeffs();
 
     // 1. Calculate history requirements
-    m_taps_needed = m_coeffs.size();
-
-    // Ensure semi_length is at least 1 to prevent underflow in delay calc
-    std::size_t safe_semi = (m_filter_semi_length > 0) ? m_filter_semi_length : 1;
-
-    std::size_t fir_req = m_taps_needed > 0 ? m_taps_needed - 1 : 0;
-    std::size_t delay_req = safe_semi - 1;
-    m_history_len = std::max(fir_req, delay_req);
+    m_history_len = std::max(m_coeffs.size(), std::size_t{m_filter_semi_length - 1});
 
     // 2. Pre-allocate memory
     constexpr size_t RESERVE_CAPACITY = 8192;
@@ -79,7 +74,7 @@ auto halfrate::process() -> composite::retval {
     kernels::deinterleave_block(data.data(), even_ptr, odd_ptr, n_out);
 
     // 3. Process vertical filter kernel
-    auto delay_offset = (m_filter_semi_length > 0) ? m_filter_semi_length - 1 : 0;
+    auto delay_offset = m_filter_semi_length;
     kernels::halfband_filter_vertical(
         m_even_lane.data(),
         m_odd_lane.data(),
