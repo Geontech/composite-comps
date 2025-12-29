@@ -32,12 +32,12 @@ private:
     std::string m_window_type{"HAMMING"};
 
     // Members
-    std::vector<float> m_coeffs;
+    composite::aligned_mem<float> m_coeffs;
     float m_center_tap{};
     std::size_t m_taps_needed{};
 
-    std::vector<cf32_t> m_even_lane;
-    std::vector<cf32_t> m_odd_lane;
+    composite::aligned_mem<cf32_t> m_even_lane;
+    composite::aligned_mem<cf32_t> m_odd_lane;
     std::size_t m_history_len{};
 
 }; // class halfrate

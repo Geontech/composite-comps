@@ -250,12 +250,18 @@ static void BM_HalfbandFilter_Parameterized(benchmark::State& state) {
 // Test different combinations of output sizes and tap counts
 BENCHMARK(BM_HalfbandFilter_Parameterized)
     ->Args({1024, 6})
+    ->Args({1024, 8})
     ->Args({1024, 12})
+    ->Args({1024, 16})
     ->Args({16384, 6})
+    ->Args({16384, 8})
     ->Args({16384, 12})
+    ->Args({16384, 16})
     ->Args({16384, 24})
     ->Args({262144, 6})
+    ->Args({262144, 8})
     ->Args({262144, 12})
+    ->Args({262144, 16})
     ->Unit(benchmark::kMicrosecond);
 
 // =============================================================================

@@ -15,6 +15,30 @@ using sample_t = std::complex<float>;
 using Catch::Matchers::WithinAbs;
 
 // =============================================================================
+// ISA Test Configuration
+// =============================================================================
+// These defines are set by CMake to indicate which ISA version is being tested
+#ifndef KERNEL_TEST_ISA
+    #define KERNEL_TEST_ISA "unknown"
+#endif
+
+// Helper to print ISA info (called from within Catch2 context to avoid polluting test discovery)
+inline auto print_isa_info() -> void {
+    static bool printed = false;
+    if (!printed) {
+        printed = true;
+        WARN("==> Testing ISA version: " << KERNEL_TEST_ISA);
+#ifdef KERNEL_TEST_SCALAR
+        WARN("    Expected: Scalar (x86-64 baseline)");
+#elif defined(KERNEL_TEST_AVX2)
+        WARN("    Expected: AVX2 + FMA");
+#elif defined(KERNEL_TEST_AVX512)
+        WARN("    Expected: AVX-512F/BW/VL/DQ");
+#endif
+    }
+}
+
+// =============================================================================
 // Reference Scalar Implementations
 // =============================================================================
 
@@ -56,6 +80,8 @@ auto reference_halfband_filter(
 // =============================================================================
 
 TEST_CASE("deinterleave_block - basic operation", "[kernels][deinterleave]") {
+    print_isa_info(); // Print ISA version info once
+
     constexpr std::size_t num_pairs = 8;
 
     // Create test input: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]

@@ -5,7 +5,14 @@
 #include "kernels.hpp"
 #include <windows.hpp>
 
-halfrate::halfrate(std::string_view id) : composite::component(id) {
+// AVX-512 requires 64-byte alignment
+static constexpr std::size_t ALIGNMENT = 64;
+
+halfrate::halfrate(std::string_view id) :
+  composite::component(id),
+  m_coeffs(ALIGNMENT, 0),
+  m_even_lane(ALIGNMENT, 0),
+  m_odd_lane(ALIGNMENT, 0) {
     add_port(&m_in_port);
     add_port(&m_out_port);
     add_property("filter_semi_length", m_filter_semi_length);
@@ -19,15 +26,16 @@ auto halfrate::property_change_handler() -> void {
     generate_coeffs();
 
     // 1. Calculate history requirements
-    // Defensive max: ensure we satisfy both FIR history (taps-1) and delay history (offset)
     m_taps_needed = m_coeffs.size();
+
+    // Ensure semi_length is at least 1 to prevent underflow in delay calc
+    std::size_t safe_semi = (m_filter_semi_length > 0) ? m_filter_semi_length : 1;
+
     std::size_t fir_req = m_taps_needed > 0 ? m_taps_needed - 1 : 0;
-    std::size_t delay_req = (m_filter_semi_length > 0) ? m_filter_semi_length - 1 : 0;
+    std::size_t delay_req = safe_semi - 1;
     m_history_len = std::max(fir_req, delay_req);
 
     // 2. Pre-allocate memory
-    // Reserve space for history + 8192 samples
-    // This prevents .resize() in the hot path from triggering malloc.
     constexpr size_t RESERVE_CAPACITY = 8192;
     std::size_t total_capacity = m_history_len + RESERVE_CAPACITY;
 
@@ -41,9 +49,9 @@ auto halfrate::property_change_handler() -> void {
         m_odd_lane.reserve(total_capacity);
     }
 
-    // Set initial size to just history (zeroed out)
-    m_even_lane.assign(m_history_len, {0.0f, 0.0f});
-    m_odd_lane.assign(m_history_len, {0.0f, 0.0f});
+    // Efficient zeroing
+    std::memset(m_even_lane.data(), 0, m_history_len * sizeof(cf32_t));
+    std::memset(m_odd_lane.data(), 0, m_history_len * sizeof(cf32_t));
 }
 
 auto halfrate::process() -> composite::retval {
@@ -58,13 +66,14 @@ auto halfrate::process() -> composite::retval {
     const auto n_out = n_in / 2;
 
     // 1. Buffer management
-    // Resize lanes if needed
+    // aligned_mem::resize is smart; it won't realloc if capacity is sufficient.
     if (m_even_lane.size() < m_history_len + n_out) {
         m_even_lane.resize(m_history_len + n_out);
         m_odd_lane.resize(m_history_len + n_out);
     }
 
-    // 2. De-Interleave with avx-enabled kernel
+    // 2. De-Interleave with AVX-enabled kernel
+    // Note: We write *after* the history
     auto* even_ptr = m_even_lane.data() + m_history_len;
     auto* odd_ptr = m_odd_lane.data() + m_history_len;
     kernels::deinterleave_block(data.data(), even_ptr, odd_ptr, n_out);
@@ -76,7 +85,7 @@ auto halfrate::process() -> composite::retval {
         m_odd_lane.data(),
         m_coeffs.data(), m_coeffs.size(),
         m_center_tap, delay_offset,
-        data.data(), // destination
+        data.data(), // Write output directly back to input buffer (in-place safe for decimation)
         n_out
     );
 
@@ -106,35 +115,44 @@ auto halfrate::process() -> composite::retval {
 auto halfrate::generate_coeffs() -> void {
     auto L = 4 * m_filter_semi_length + 1; // full length
     auto center = L / 2;
-    auto h = std::vector<float>(L);
+
+    // 1. Pre-calculate the exact number of coefficients we will store.
+    // We only store the non-zero odd taps.
+    // Taps are at indices [0 ... 4*M]. Center is 2*M.
+    // We skip center. We skip evens.
+    // Indices i != center where (i - center) is odd.
+    std::size_t num_coeffs = 0;
+    for (int i = 0; i < L; ++i) {
+        int k = i - center;
+        if (k == 0) { continue; }
+        if (std::abs(k) % 2 == 1) { num_coeffs++; }
+    }
+
+    // 2. Resize aligned memory once (avoids push_back)
+    m_coeffs.resize(num_coeffs);
 
     auto window = (m_window_type == "BLACKMAN_HARRIS")
         ? windows::blackman_harris<float>(L, false)
         : windows::hamming<float>(L, false);
 
-    for (int n = 0; n < L; ++n) {
-        int k = n - center;
-        if (k == 0) {
-            h[n] = 0.5;  // half-band filter: center tap is always 0.5
-            m_center_tap = h[n];
-        } else if (k % 2 != 0) {
-            auto sinc_val = std::sin(0.5f * std::numbers::pi_v<float> * k) / (std::numbers::pi_v<float> * k);
-            h[n] = sinc_val * window->at(n);
-        } else {
-            h[n] = 0.0f;
-        }
-    }
-
-    m_coeffs.clear();
-    // Pack the non-zero coefficients into the dense vector
+    // 3. Fill coefficients
     // Iterate backwards to match convolution order
-    // Extract odd taps
-    for (int i = h.size() - 1; i >= 0; --i) {
+    std::size_t write_idx = 0;
+
+    for (int i = L - 1; i >= 0; --i) {
         int k = i - center;
-        if (k == 0) { continue; } // skip center tap
-        // keep non-zero odd-offset taps (even offsets are zeroed)
+        if (k == 0) {
+            m_center_tap = 0.5f; // Center tap is implicit
+            continue;
+        }
+
+        // Calculate and store only if it's an odd offset
         if (std::abs(k) % 2 == 1) {
-            m_coeffs.push_back(h[i]);
+            auto sinc_val = std::sin(0.5f * std::numbers::pi_v<float> * k) / (std::numbers::pi_v<float> * k);
+            float val = sinc_val * window->at(i);
+
+            // Direct access - no push_back
+            m_coeffs[write_idx++] = val;
         }
     }
 }
