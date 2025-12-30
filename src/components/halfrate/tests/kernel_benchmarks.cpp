@@ -26,109 +26,30 @@ auto generate_random_data(std::size_t count) -> std::vector<sample_t> {
 }
 
 // =============================================================================
-// Deinterleave Kernel Benchmarks
+// Fused Halfband Filter Benchmarks
 // =============================================================================
 
-static void BM_Deinterleave_1K(benchmark::State& state) {
-    constexpr std::size_t num_pairs = 512;  // 1024 input samples
-    auto src = generate_random_data(num_pairs * 2);
-    std::vector<sample_t> dst_even(num_pairs);
-    std::vector<sample_t> dst_odd(num_pairs);
-
-    for (auto _ : state) {
-        kernels::deinterleave_block(src.data(), dst_even.data(), dst_odd.data(), num_pairs);
-        benchmark::DoNotOptimize(dst_even.data());
-        benchmark::DoNotOptimize(dst_odd.data());
-        benchmark::ClobberMemory();
-    }
-
-    // Report throughput
-    state.SetBytesProcessed(state.iterations() * num_pairs * 2 * sizeof(sample_t));
-    state.SetItemsProcessed(state.iterations() * num_pairs * 2); // input samples processed
-}
-BENCHMARK(BM_Deinterleave_1K);
-
-static void BM_Deinterleave_16K(benchmark::State& state) {
-    constexpr std::size_t num_pairs = 8192;  // 16K input samples
-    auto src = generate_random_data(num_pairs * 2);
-    std::vector<sample_t> dst_even(num_pairs);
-    std::vector<sample_t> dst_odd(num_pairs);
-
-    for (auto _ : state) {
-        kernels::deinterleave_block(src.data(), dst_even.data(), dst_odd.data(), num_pairs);
-        benchmark::DoNotOptimize(dst_even.data());
-        benchmark::DoNotOptimize(dst_odd.data());
-        benchmark::ClobberMemory();
-    }
-
-    state.SetBytesProcessed(state.iterations() * num_pairs * 2 * sizeof(sample_t));
-    state.SetItemsProcessed(state.iterations() * num_pairs * 2);
-}
-BENCHMARK(BM_Deinterleave_16K);
-
-static void BM_Deinterleave_256K(benchmark::State& state) {
-    constexpr std::size_t num_pairs = 131072;  // 256K input samples
-    auto src = generate_random_data(num_pairs * 2);
-    std::vector<sample_t> dst_even(num_pairs);
-    std::vector<sample_t> dst_odd(num_pairs);
-
-    for (auto _ : state) {
-        kernels::deinterleave_block(src.data(), dst_even.data(), dst_odd.data(), num_pairs);
-        benchmark::DoNotOptimize(dst_even.data());
-        benchmark::DoNotOptimize(dst_odd.data());
-        benchmark::ClobberMemory();
-    }
-
-    state.SetBytesProcessed(state.iterations() * num_pairs * 2 * sizeof(sample_t));
-    state.SetItemsProcessed(state.iterations() * num_pairs * 2);
-}
-BENCHMARK(BM_Deinterleave_256K);
-
-// Parameterized benchmark for different sizes
-static void BM_Deinterleave_Parameterized(benchmark::State& state) {
-    const std::size_t num_pairs = state.range(0);
-    auto src = generate_random_data(num_pairs * 2);
-    std::vector<sample_t> dst_even(num_pairs);
-    std::vector<sample_t> dst_odd(num_pairs);
-
-    for (auto _ : state) {
-        kernels::deinterleave_block(src.data(), dst_even.data(), dst_odd.data(), num_pairs);
-        benchmark::DoNotOptimize(dst_even.data());
-        benchmark::DoNotOptimize(dst_odd.data());
-        benchmark::ClobberMemory();
-    }
-
-    state.SetBytesProcessed(state.iterations() * num_pairs * 2 * sizeof(sample_t));
-    state.SetItemsProcessed(state.iterations() * num_pairs * 2);
-    state.SetLabel("pairs=" + std::to_string(num_pairs));
-}
-// Test powers of 2 from 64 to 256K pairs
-BENCHMARK(BM_Deinterleave_Parameterized)
-    ->RangeMultiplier(4)
-    ->Range(64, 262144)
-    ->Unit(benchmark::kMicrosecond);
-
-// =============================================================================
-// Halfband Filter Kernel Benchmarks
-// =============================================================================
-
-static void BM_HalfbandFilter_1K_6Taps(benchmark::State& state) {
+static void BM_HalfbandFused_1K_6Taps(benchmark::State& state) {
     constexpr std::size_t num_outputs = 1024;
     constexpr std::size_t num_taps = 6;
-    constexpr std::size_t delay_offset = 2;
+    constexpr std::size_t delay_offset = 3;
+    constexpr std::size_t history_len = std::max(num_taps, delay_offset);
     constexpr float center_tap = 0.5f;
 
-    auto even_hist = generate_random_data(num_outputs + num_taps);
-    auto odd_hist = generate_random_data(num_outputs + delay_offset);
+    auto input = generate_random_data(num_outputs * 2);
+    std::vector<sample_t> even_hist(history_len, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(history_len, {0.0f, 0.0f});
     std::vector<float> coeffs = {0.1f, 0.2f, 0.3f, 0.2f, 0.1f, 0.05f};
     std::vector<sample_t> output(num_outputs);
 
     for (auto _ : state) {
-        kernels::halfband_filter_vertical(
+        kernels::halfband_filter_fused(
+            input.data(),
             even_hist.data(), odd_hist.data(),
             coeffs.data(), num_taps,
             center_tap, delay_offset,
-            output.data(), num_outputs
+            output.data(), num_outputs,
+            history_len
         );
         benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
@@ -137,25 +58,29 @@ static void BM_HalfbandFilter_1K_6Taps(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * num_outputs * sizeof(sample_t));
     state.SetItemsProcessed(state.iterations() * num_outputs);
 }
-BENCHMARK(BM_HalfbandFilter_1K_6Taps);
+BENCHMARK(BM_HalfbandFused_1K_6Taps);
 
-static void BM_HalfbandFilter_16K_6Taps(benchmark::State& state) {
+static void BM_HalfbandFused_16K_6Taps(benchmark::State& state) {
     constexpr std::size_t num_outputs = 16384;
     constexpr std::size_t num_taps = 6;
-    constexpr std::size_t delay_offset = 2;
+    constexpr std::size_t delay_offset = 3;
+    constexpr std::size_t history_len = std::max(num_taps, delay_offset);
     constexpr float center_tap = 0.5f;
 
-    auto even_hist = generate_random_data(num_outputs + num_taps);
-    auto odd_hist = generate_random_data(num_outputs + delay_offset);
+    auto input = generate_random_data(num_outputs * 2);
+    std::vector<sample_t> even_hist(history_len, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(history_len, {0.0f, 0.0f});
     std::vector<float> coeffs = {0.1f, 0.2f, 0.3f, 0.2f, 0.1f, 0.05f};
     std::vector<sample_t> output(num_outputs);
 
     for (auto _ : state) {
-        kernels::halfband_filter_vertical(
+        kernels::halfband_filter_fused(
+            input.data(),
             even_hist.data(), odd_hist.data(),
             coeffs.data(), num_taps,
             center_tap, delay_offset,
-            output.data(), num_outputs
+            output.data(), num_outputs,
+            history_len
         );
         benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
@@ -164,25 +89,29 @@ static void BM_HalfbandFilter_16K_6Taps(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * num_outputs * sizeof(sample_t));
     state.SetItemsProcessed(state.iterations() * num_outputs);
 }
-BENCHMARK(BM_HalfbandFilter_16K_6Taps);
+BENCHMARK(BM_HalfbandFused_16K_6Taps);
 
-static void BM_HalfbandFilter_256K_6Taps(benchmark::State& state) {
+static void BM_HalfbandFused_256K_6Taps(benchmark::State& state) {
     constexpr std::size_t num_outputs = 262144;
     constexpr std::size_t num_taps = 6;
-    constexpr std::size_t delay_offset = 2;
+    constexpr std::size_t delay_offset = 3;
+    constexpr std::size_t history_len = std::max(num_taps, delay_offset);
     constexpr float center_tap = 0.5f;
 
-    auto even_hist = generate_random_data(num_outputs + num_taps);
-    auto odd_hist = generate_random_data(num_outputs + delay_offset);
+    auto input = generate_random_data(num_outputs * 2);
+    std::vector<sample_t> even_hist(history_len, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(history_len, {0.0f, 0.0f});
     std::vector<float> coeffs = {0.1f, 0.2f, 0.3f, 0.2f, 0.1f, 0.05f};
     std::vector<sample_t> output(num_outputs);
 
     for (auto _ : state) {
-        kernels::halfband_filter_vertical(
+        kernels::halfband_filter_fused(
+            input.data(),
             even_hist.data(), odd_hist.data(),
             coeffs.data(), num_taps,
             center_tap, delay_offset,
-            output.data(), num_outputs
+            output.data(), num_outputs,
+            history_len
         );
         benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
@@ -191,25 +120,29 @@ static void BM_HalfbandFilter_256K_6Taps(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * num_outputs * sizeof(sample_t));
     state.SetItemsProcessed(state.iterations() * num_outputs);
 }
-BENCHMARK(BM_HalfbandFilter_256K_6Taps);
+BENCHMARK(BM_HalfbandFused_256K_6Taps);
 
-static void BM_HalfbandFilter_16K_12Taps(benchmark::State& state) {
+static void BM_HalfbandFused_16K_12Taps(benchmark::State& state) {
     constexpr std::size_t num_outputs = 16384;
     constexpr std::size_t num_taps = 12;
-    constexpr std::size_t delay_offset = 5;
+    constexpr std::size_t delay_offset = 6;
+    constexpr std::size_t history_len = std::max(num_taps, delay_offset);
     constexpr float center_tap = 0.5f;
 
-    auto even_hist = generate_random_data(num_outputs + num_taps);
-    auto odd_hist = generate_random_data(num_outputs + delay_offset);
+    auto input = generate_random_data(num_outputs * 2);
+    std::vector<sample_t> even_hist(history_len, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(history_len, {0.0f, 0.0f});
     std::vector<float> coeffs(num_taps, 0.08f);
     std::vector<sample_t> output(num_outputs);
 
     for (auto _ : state) {
-        kernels::halfband_filter_vertical(
+        kernels::halfband_filter_fused(
+            input.data(),
             even_hist.data(), odd_hist.data(),
             coeffs.data(), num_taps,
             center_tap, delay_offset,
-            output.data(), num_outputs
+            output.data(), num_outputs,
+            history_len
         );
         benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
@@ -218,26 +151,33 @@ static void BM_HalfbandFilter_16K_12Taps(benchmark::State& state) {
     state.SetBytesProcessed(state.iterations() * num_outputs * sizeof(sample_t));
     state.SetItemsProcessed(state.iterations() * num_outputs);
 }
-BENCHMARK(BM_HalfbandFilter_16K_12Taps);
+BENCHMARK(BM_HalfbandFused_16K_12Taps);
 
-// Parameterized benchmark for different sizes and tap counts
-static void BM_HalfbandFilter_Parameterized(benchmark::State& state) {
+// =============================================================================
+// Parameterized Benchmark
+// =============================================================================
+
+static void BM_HalfbandFused_Parameterized(benchmark::State& state) {
     const std::size_t num_outputs = state.range(0);
     const std::size_t num_taps = state.range(1);
-    constexpr std::size_t delay_offset = 2;
+    const std::size_t delay_offset = num_taps / 2;
+    const std::size_t history_len = std::max(num_taps, delay_offset);
     constexpr float center_tap = 0.5f;
 
-    auto even_hist = generate_random_data(num_outputs + num_taps);
-    auto odd_hist = generate_random_data(num_outputs + delay_offset + num_outputs);
+    auto input = generate_random_data(num_outputs * 2);
+    std::vector<sample_t> even_hist(history_len, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(history_len, {0.0f, 0.0f});
     std::vector<float> coeffs(num_taps, 1.0f / num_taps);
     std::vector<sample_t> output(num_outputs);
 
     for (auto _ : state) {
-        kernels::halfband_filter_vertical(
+        kernels::halfband_filter_fused(
+            input.data(),
             even_hist.data(), odd_hist.data(),
             coeffs.data(), num_taps,
             center_tap, delay_offset,
-            output.data(), num_outputs
+            output.data(), num_outputs,
+            history_len
         );
         benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
@@ -247,45 +187,50 @@ static void BM_HalfbandFilter_Parameterized(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * num_outputs);
     state.SetLabel("outputs=" + std::to_string(num_outputs) + " taps=" + std::to_string(num_taps));
 }
-// Test different combinations of output sizes and tap counts
-BENCHMARK(BM_HalfbandFilter_Parameterized)
+BENCHMARK(BM_HalfbandFused_Parameterized)
     ->Args({1024, 6})
-    ->Args({1024, 8})
     ->Args({1024, 12})
-    ->Args({1024, 16})
     ->Args({16384, 6})
-    ->Args({16384, 8})
     ->Args({16384, 12})
-    ->Args({16384, 16})
-    ->Args({16384, 24})
     ->Args({262144, 6})
-    ->Args({262144, 8})
     ->Args({262144, 12})
-    ->Args({262144, 16})
     ->Unit(benchmark::kMicrosecond);
 
 // =============================================================================
-// Cache Behavior Benchmarks
+// Cache Behavior Benchmark
 // =============================================================================
 
-static void BM_Deinterleave_CacheBehavior(benchmark::State& state) {
-    const std::size_t num_pairs = state.range(0);
-    auto src = generate_random_data(num_pairs * 2);
-    std::vector<sample_t> dst_even(num_pairs);
-    std::vector<sample_t> dst_odd(num_pairs);
+static void BM_HalfbandFused_CacheBehavior(benchmark::State& state) {
+    const std::size_t num_outputs = state.range(0);
+    constexpr std::size_t num_taps = 6;
+    constexpr std::size_t delay_offset = 3;
+    constexpr std::size_t history_len = std::max(num_taps, delay_offset);
+    constexpr float center_tap = 0.5f;
+
+    auto input = generate_random_data(num_outputs * 2);
+    std::vector<sample_t> even_hist(history_len, {0.0f, 0.0f});
+    std::vector<sample_t> odd_hist(history_len, {0.0f, 0.0f});
+    std::vector<float> coeffs = {0.1f, 0.2f, 0.3f, 0.2f, 0.1f, 0.05f};
+    std::vector<sample_t> output(num_outputs);
 
     for (auto _ : state) {
-        kernels::deinterleave_block(src.data(), dst_even.data(), dst_odd.data(), num_pairs);
-        benchmark::DoNotOptimize(dst_even.data());
-        benchmark::DoNotOptimize(dst_odd.data());
+        kernels::halfband_filter_fused(
+            input.data(),
+            even_hist.data(), odd_hist.data(),
+            coeffs.data(), num_taps,
+            center_tap, delay_offset,
+            output.data(), num_outputs,
+            history_len
+        );
+        benchmark::DoNotOptimize(output.data());
         benchmark::ClobberMemory();
     }
 
-    state.SetBytesProcessed(state.iterations() * num_pairs * 2 * sizeof(sample_t));
-    state.SetItemsProcessed(state.iterations() * num_pairs * 2);
+    state.SetBytesProcessed(state.iterations() * num_outputs * sizeof(sample_t));
+    state.SetItemsProcessed(state.iterations() * num_outputs);
 
-    // Calculate approximate cache level
-    std::size_t bytes = num_pairs * 2 * sizeof(sample_t);
+    // Calculate approximate cache level (input size dominates)
+    std::size_t bytes = num_outputs * 2 * sizeof(sample_t);
     std::string cache_level;
     if (bytes < 32 * 1024) cache_level = "L1";
     else if (bytes < 256 * 1024) cache_level = "L2";
@@ -294,10 +239,11 @@ static void BM_Deinterleave_CacheBehavior(benchmark::State& state) {
 
     state.SetLabel(cache_level + " (" + std::to_string(bytes / 1024) + " KB)");
 }
-BENCHMARK(BM_Deinterleave_CacheBehavior)
-    ->Arg(64)        // L1: ~1 KB
-    ->Arg(2048)      // L2: ~32 KB
-    ->Arg(32768)     // L3: ~512 KB
+BENCHMARK(BM_HalfbandFused_CacheBehavior)
+    ->Arg(512)       // L1: ~8 KB
+    ->Arg(2048)      // L1: ~32 KB
+    ->Arg(16384)     // L2: ~256 KB
+    ->Arg(131072)    // L3: ~2 MB
     ->Arg(524288)    // DRAM: ~8 MB
     ->Unit(benchmark::kMicrosecond);
 

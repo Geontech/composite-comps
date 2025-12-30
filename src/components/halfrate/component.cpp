@@ -16,7 +16,8 @@ halfrate::halfrate(std::string_view id) :
     add_port(&m_in_port);
     add_port(&m_out_port);
     add_property("filter_semi_length", m_filter_semi_length).change_listener([this]() {
-        return m_filter_semi_length >= 1;
+        // Min 1, max 128 (kernel limit: history_len = 2*semi_length <= 256)
+        return m_filter_semi_length >= 1 && m_filter_semi_length <= 128;
     });
     add_property("window", m_window_type).change_listener([this]() {
         return m_window_type.empty() || (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
@@ -27,24 +28,15 @@ auto halfrate::property_change_handler() -> void {
     // Generate filter coefficients
     generate_coeffs();
 
-    // 1. Calculate history requirements
-    m_history_len = std::max(m_coeffs.size(), std::size_t{m_filter_semi_length - 1});
+    // Calculate history requirements
+    // Need max of: num_taps (for FIR), filter_semi_length (for delay)
+    m_history_len = std::max(m_coeffs.size(), static_cast<std::size_t>(m_filter_semi_length));
 
-    // 2. Pre-allocate memory
-    constexpr size_t RESERVE_CAPACITY = 8192;
-    std::size_t total_capacity = m_history_len + RESERVE_CAPACITY;
+    // Resize history buffers (fused kernel only needs history_len, not full working set)
+    m_even_lane.resize(m_history_len);
+    m_odd_lane.resize(m_history_len);
 
-    // Reset vectors
-    m_even_lane.clear();
-    m_odd_lane.clear();
-
-    // Enforce capacity
-    if (m_even_lane.capacity() < total_capacity) {
-        m_even_lane.reserve(total_capacity);
-        m_odd_lane.reserve(total_capacity);
-    }
-
-    // Efficient zeroing
+    // Zero-initialize history for clean startup
     std::memset(m_even_lane.data(), 0, m_history_len * sizeof(cf32_t));
     std::memset(m_odd_lane.data(), 0, m_history_len * sizeof(cf32_t));
 }
@@ -56,43 +48,21 @@ auto halfrate::process() -> composite::retval {
         return NORMAL;
     }
 
-    // Iterate over samples to produce output
     const auto n_in = data.size();
     const auto n_out = n_in / 2;
 
-    // 1. Buffer management
-    // aligned_mem::resize is smart; it won't realloc if capacity is sufficient.
-    if (m_even_lane.size() < m_history_len + n_out) {
-        m_even_lane.resize(m_history_len + n_out);
-        m_odd_lane.resize(m_history_len + n_out);
-    }
-
-    // 2. De-Interleave with AVX-enabled kernel
-    // Note: We write *after* the history
-    auto* even_ptr = m_even_lane.data() + m_history_len;
-    auto* odd_ptr = m_odd_lane.data() + m_history_len;
-    kernels::deinterleave_block(data.data(), even_ptr, odd_ptr, n_out);
-
-    // 3. Process vertical filter kernel
-    auto delay_offset = m_filter_semi_length;
-    kernels::halfband_filter_vertical(
-        m_even_lane.data(),
-        m_odd_lane.data(),
+    // Fused kernel handles deinterleave + filter + history update in one pass
+    // History buffers only need to hold history_len samples (not full working set)
+    kernels::halfband_filter_fused(
+        data.data(),                          // Interleaved input
+        m_even_lane.data(),                   // Even history buffer
+        m_odd_lane.data(),                    // Odd history buffer
         m_coeffs.data(), m_coeffs.size(),
-        m_center_tap, delay_offset,
-        data.data(), // Write output directly back to input buffer (in-place safe for decimation)
-        n_out
+        m_center_tap, m_filter_semi_length,   // delay_offset = filter_semi_length
+        data.data(),                          // Output (in-place safe for decimation)
+        n_out,
+        m_history_len
     );
-
-    // 4. Update history
-    // Copy the last m_history_len samples to the front of the buffer for the next process call
-    if (m_history_len > 0) {
-        auto* src_even = m_even_lane.data() + n_out;
-        auto* src_odd  = m_odd_lane.data() + n_out;
-
-        std::memcpy(m_even_lane.data(), src_even, m_history_len * sizeof(cf32_t));
-        std::memcpy(m_odd_lane.data(), src_odd, m_history_len * sizeof(cf32_t));
-    }
 
     // Send data (with updated metadata if present)
     data.resize(n_out);

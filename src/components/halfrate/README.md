@@ -7,7 +7,8 @@ High-performance polyphase half-band decimating filter optimized for single-core
 The `halfrate` component implements a polyphase half-band FIR filter that decimates complex input samples by a factor of 2. It features:
 
 - **Multi-platform SIMD**: AVX-512, AVX2, and scalar implementations via Multi-Function Versioning (MFV)
-- **Configurable filter design**: Adjustable filter length and window function
+- **Cache-optimized fused kernel**: Deinterleave + filter in tile chunks
+- **Configurable filter design**: Adjustable filter length (1..128 semi-length) and window function
 - **Zero-copy architecture**: Efficient buffer management using composite framework
 
 ## Signal Processing Details
@@ -43,50 +44,43 @@ The component automatically:
 ### Processing Pipeline
 
 ```
-Input (interleaved I/Q)
+Input (interleaved I/Q pairs)
     ↓
-┌─────────────────────┐
-│  De-interleave      │  Split interleaved complex samples
-│  (SIMD kernel)      │  → even stream, odd stream
-└─────────────────────┘
-    ↓           ↓
-┌─────────┐ ┌─────────┐
-│  Even   │ │   Odd   │
-│ History │ │ History │  Maintain filter state
-│ Buffer  │ │ Buffer  │
-└─────────┘ └─────────┘
-    ↓           ↓
-┌─────────────────────┐
-│ Vertical Half-band  │  FIR on odd + delayed even
-│ Filter (SIMD)       │  Single fused kernel
-└─────────────────────┘
+┌─────────────────────────────────────────┐
+│     Fused Deinterleave + Filter         │
+│     (Cache-tiled SIMD kernel)           │
+│                                         │
+│  For each L1-sized tile:                │
+│    1. Copy history overlap to tile      │
+│    2. Deinterleave input → tile buffers │
+│    3. Filter while data is L1-hot       │
+│    4. Write outputs                     │
+│                                         │
+│  Finally: Update history with tail      │
+└─────────────────────────────────────────┘
     ↓
 Output (decimated by 2)
 ```
 
-### SIMD Kernels
+### Fused SIMD Kernel
 
-Two high-performance kernels with MFV support:
+The `halfband_filter_fused` kernel combines deinterleaving and filtering in a single pass, processing in L1-cache-sized tiles (512 outputs per tile) to minimize memory traffic.
 
-#### 1. `deinterleave_block`
-Separates interleaved complex samples into contiguous buffers.
+**Constraint**: `filter_semi_length` is capped at 128 (`history_len <= 256`) to keep tile buffers bounded and preserve in-place output safety.
 
-| ISA     | Width |
-|---------|-------|
-| AVX-512 | 16 pairs/iter |
-| AVX2    | 4 pairs/iter |
-| Scalar  | 1 pair/iter  |
+| ISA     | Deinterleave | Filter | Notes |
+|---------|--------------|--------|-------|
+| AVX-512 | 16 pairs/iter | 32 outputs/iter | `permutex2var` + FMA |
+| Scalar  | 1 pair/iter | 1 output/iter | Fallback |
 
-#### 2. `halfband_filter_vertical`
-Computes FIR filter on odd branch + delayed even branch in a single pass.
+**Multi-Function Versioning**: The compiler generates multiple ISA versions. At runtime, the CPU automatically dispatches to the best available implementation based on feature flags.
 
-| ISA     | Width |
-|---------|-------|
-| AVX-512 | 32 outputs/iter |
-| AVX2    | 16 outputs/iter |
-| Scalar  | 1 output/iter   |
+### Performance
 
-**Multi-Function Versioning**: The compiler generates all three versions. At runtime, the CPU automatically dispatches to the best available implementation based on feature flags.
+The fused kernel achieves speedup over separate deinterleave + filter on memory-bound workloads (256K samples) by:
+- Processing in 512-output tiles that fit in L1 cache
+- Filtering immediately after deinterleaving while data is hot
+- Only writing tail samples to history buffers (not full working set)
 
 ## Usage
 
@@ -99,7 +93,7 @@ Computes FIR filter on odd branch + delayed even branch in a single pass.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `filter_semi_length` | `uint32_t` | `3` | Half-band filter semi-length (number of non-zero taps on one side). Total filter length = `2 × filter_semi_length + 1`. Example: semi_length=3 → 7 taps total |
+| `filter_semi_length` | `uint32_t` | `3` | Half-band filter semi-length (number of non-zero taps on one side, 1..128). Total filter length = `2 × filter_semi_length + 1`. Example: semi_length=3 → 7 taps total |
 | `window` | `string` | `"HAMMING"` | Window function for coefficient generation. Valid values: `"HAMMING"` or `"BLACKMAN_HARRIS"` |
 
 ## Building
@@ -117,10 +111,10 @@ The component builds as `build/src/components/halfrate/libhalfrate.so`
 
 ```bash
 # Build tests
-cmake --build build --target kernel_tests halfrate_integration_tests kernel_benchmarks
+cmake --build build --target kernel_tests_avx512 halfrate_integration_tests kernel_benchmarks
 
 # Run unit tests
-./build/src/components/halfrate/tests/kernel_tests
+./build/src/components/halfrate/tests/kernel_tests_avx512
 
 # Run integration tests
 ./build/src/components/halfrate/tests/halfrate_integration_tests
@@ -133,24 +127,24 @@ cmake --build build --target kernel_tests halfrate_integration_tests kernel_benc
 
 ### Test Coverage
 
-Three comprehensive test suites:
+Two comprehensive test suites plus benchmarks:
 
-1. **`kernel_tests.cpp`** (6542 assertions)
-   - Unit tests for SIMD kernels
-   - Validates against scalar reference implementations
-   - Tests boundary conditions, alignment, large blocks
+1. **`kernel_tests.cpp`**
+   - Validates fused SIMD kernel against simple scalar reference
+   - Tests various block sizes, tile boundaries, tap counts
+   - Tests history update correctness
+   - Impulse response validation
 
-2. **`halfrate_integration_tests.cpp`** (2619 assertions)
+2. **`halfrate_integration_tests.cpp`**
    - End-to-end component behavior
    - Frequency response validation (passband, stopband)
    - Streaming tests with history management
    - Edge cases (DC, impulse, Nyquist)
 
 3. **`kernel_benchmarks.cpp`** (Google Benchmark)
-   - Throughput measurements (deinterleave and filter kernels)
+   - Throughput measurements at various block sizes
    - Parameterized size/tap count sweeps
    - Cache behavior analysis (L1/L2/L3/DRAM)
-   - Statistical reporting with repetitions
 
 ### Running Tests
 
@@ -158,15 +152,15 @@ Three comprehensive test suites:
 # All tests via CTest
 cd build && ctest
 
-# Individual test suites
-./build/src/components/halfrate/tests/kernel_tests
+# Individual test suites (AVX-512, AVX2, or scalar variants)
+./build/src/components/halfrate/tests/kernel_tests_avx512
 ./build/src/components/halfrate/tests/halfrate_integration_tests
 
-# Performance benchmarks (Google Benchmark)
+# Performance benchmarks
 ./build/src/components/halfrate/tests/kernel_benchmarks
 
-# Run specific benchmarks with repetitions
-./build/src/components/halfrate/tests/kernel_benchmarks --benchmark_filter="Deinterleave" --benchmark_repetitions=10
+# Run specific benchmarks with filter
+./build/src/components/halfrate/tests/kernel_benchmarks --benchmark_filter="256K"
 
 # Export results to JSON
 ./build/src/components/halfrate/tests/kernel_benchmarks --benchmark_format=json --benchmark_out=results.json
@@ -180,10 +174,10 @@ cd build && ctest
 halfrate/
 ├── component.hpp          # Component class definition
 ├── component.cpp          # Port setup, filter design, process() logic
-├── kernels.hpp            # SIMD kernels with MFV (header-only)
+├── kernels.hpp            # Fused SIMD kernel with MFV (header-only)
 ├── CMakeLists.txt         # Build configuration
 └── tests/
-    ├── kernel_tests.cpp               # Catch2 unit tests for SIMD kernels
+    ├── kernel_tests.cpp               # Catch2 unit tests for fused kernel
     ├── halfrate_integration_tests.cpp # Catch2 integration tests
     ├── kernel_benchmarks.cpp          # Google Benchmark performance tests
     └── CMakeLists.txt
@@ -192,22 +186,20 @@ halfrate/
 ### Key Design Decisions
 
 1. **Polyphase decomposition**: Exploits half-band symmetry for 2× efficiency
-2. **Vertical filtering**: Processes both branches in single kernel (better cache locality)
-3. **In-place de-interleave**: Minimizes memory allocations
-4. **Pre-sized buffers**: History buffers allocated once during init
-5. **MFV over runtime dispatch**: Zero overhead, compiler-optimized
+2. **Fused kernel**: Single kernel for deinterleave + filter improves cache utilization
+3. **L1 tiling**: Process in 512-output tiles to keep working set in L1 cache
+4. **Minimal history**: Only store `history_len` samples (not full working set)
 
 ### History Management
 
-The component maintains history buffers for both polyphase branches:
+The component maintains compact history buffers for filter state continuity:
 - **History size**: `max(num_taps, filter_semi_length)` samples per lane
-- Both even and odd lanes use the same history length
+- **Memory footprint**: `2 * history_len * sizeof(cf32_t)` bytes for N-tap filter
 
-On each `process()` call:
-1. Copy tail of previous block to head of history buffer (maintains FIR state)
-2. Append new samples
-3. Run filter kernel over extended buffer
-4. Output is always `input_size / 2` samples
+The fused kernel handles history internally:
+1. For first tile: reads from persistent history buffers
+2. For subsequent tiles: re-deinterleaves overlap from input
+3. After processing: writes only tail samples back to history
 
 ## License
 
