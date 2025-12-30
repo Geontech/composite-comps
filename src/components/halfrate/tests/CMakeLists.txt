@@ -108,19 +108,36 @@ target_include_directories(halfrate_integration_tests
 target_compile_features(halfrate_integration_tests PRIVATE cxx_std_23)
 target_compile_options(halfrate_integration_tests PRIVATE -mavx512f -mavx512bw -mavx512vl -mavx512dq)
 
-# Google Benchmark kernel benchmarks
-add_executable(kernel_benchmarks kernel_benchmarks.cpp)
-target_link_libraries(kernel_benchmarks
+# Google Benchmark kernel benchmarks - AVX-512 version
+add_executable(kernel_benchmarks_avx512 kernel_benchmarks.cpp)
+target_link_libraries(kernel_benchmarks_avx512
     PRIVATE
         benchmark::benchmark
         benchmark::benchmark_main
 )
-target_include_directories(kernel_benchmarks
+target_include_directories(kernel_benchmarks_avx512
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
-target_compile_features(kernel_benchmarks PRIVATE cxx_std_23)
-target_compile_options(kernel_benchmarks PRIVATE -mavx512f -mavx512bw -mavx512vl -mavx512dq -O3 -march=native)
+target_compile_features(kernel_benchmarks_avx512 PRIVATE cxx_std_23)
+target_compile_options(kernel_benchmarks_avx512 PRIVATE -mavx512f -mavx512bw -mavx512vl -mavx512dq -O3)
+
+# Google Benchmark kernel benchmarks - AVX2 version
+add_executable(kernel_benchmarks_avx2 kernel_benchmarks.cpp)
+target_link_libraries(kernel_benchmarks_avx2
+    PRIVATE
+        benchmark::benchmark
+        benchmark::benchmark_main
+)
+target_include_directories(kernel_benchmarks_avx2
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+target_compile_features(kernel_benchmarks_avx2 PRIVATE cxx_std_23)
+target_compile_options(kernel_benchmarks_avx2 PRIVATE -march=haswell -mno-avx512f -O3)
+
+# Convenience alias
+add_executable(kernel_benchmarks ALIAS kernel_benchmarks_avx512)
 
 # Register tests with CTest
 include(CTest)
@@ -150,7 +167,8 @@ install(TARGETS
     kernel_tests_avx2
     kernel_tests_avx512
     halfrate_integration_tests
-    kernel_benchmarks
+    kernel_benchmarks_avx512
+    kernel_benchmarks_avx2
     RUNTIME DESTINATION bin/tests
     OPTIONAL
 )
