@@ -44,16 +44,16 @@ static_assert(
 // -----------------------------------------------------------------------------
 [[gnu::target("avx512f")]]
 inline auto halfband_filter_fused(
-    const std::complex<float>* __restrict__ input,       // Interleaved input pairs
-    std::complex<float>* __restrict__ even_hist,         // History buffer for even lane (read/write)
-    std::complex<float>* __restrict__ odd_hist,          // History buffer for odd lane (read/write)
-    const float* __restrict__ coeffs,
-    std::size_t num_taps,
-    float center_tap,
-    std::size_t delay_offset,
-    std::complex<float>* __restrict__ output,
-    std::size_t num_outputs,
-    std::size_t history_len
+  const std::complex<float>* __restrict__ input,       // Interleaved input pairs
+  std::complex<float>* __restrict__ even_hist,         // History buffer for even lane (read/write)
+  std::complex<float>* __restrict__ odd_hist,          // History buffer for odd lane (read/write)
+  const float* __restrict__ coeffs,
+  std::size_t num_taps,
+  float center_tap,
+  std::size_t delay_offset,
+  std::complex<float>* __restrict__ output,
+  std::size_t num_outputs,
+  std::size_t history_len
 ) -> void {
     // Validate parameters to prevent buffer overflow and in-place corruption
     assert(history_len <= MAX_HISTORY_LEN && "history_len exceeds MAX_HISTORY_LEN (256)");
@@ -229,20 +229,180 @@ inline auto halfband_filter_fused(
 }
 
 // -----------------------------------------------------------------------------
+// AVX2 Version
+// -----------------------------------------------------------------------------
+[[gnu::target("avx2,fma")]]
+inline auto halfband_filter_fused(
+  const std::complex<float>* __restrict__ input,
+  std::complex<float>* __restrict__ even_hist,
+  std::complex<float>* __restrict__ odd_hist,
+  const float* __restrict__ coeffs,
+  std::size_t num_taps,
+  float center_tap,
+  std::size_t delay_offset,
+  std::complex<float>* __restrict__ output,
+  std::size_t num_outputs,
+  std::size_t history_len
+) -> void {
+    assert(history_len <= MAX_HISTORY_LEN && "history_len exceeds MAX_HISTORY_LEN (256)");
+
+    alignas(64) std::complex<float> tile_even[FUSED_TILE_SIZE + MAX_HISTORY_LEN];
+    alignas(64) std::complex<float> tile_odd[FUSED_TILE_SIZE + MAX_HISTORY_LEN];
+
+    const auto* input_f = reinterpret_cast<const float*>(input);
+    auto* output_f = reinterpret_cast<float*>(output);
+
+    auto center_reg = _mm256_set1_ps(center_tap);
+
+    std::size_t output_pos = 0;
+
+    while (output_pos < num_outputs) {
+        std::size_t tile_outputs = std::min(FUSED_TILE_SIZE, num_outputs - output_pos);
+
+        // --- PHASE 1: Set up tile buffers with history + new data ---
+        if (output_pos == 0) {
+            std::memcpy(tile_even, even_hist, history_len * sizeof(std::complex<float>));
+            std::memcpy(tile_odd, odd_hist, history_len * sizeof(std::complex<float>));
+        } else {
+            for (std::size_t j = 0; j < history_len; ++j) {
+                std::size_t input_idx = output_pos - history_len + j;
+                tile_even[j] = input[2 * input_idx];
+                tile_odd[j] = input[2 * input_idx + 1];
+            }
+        }
+
+        // Deinterleave new samples into tile buffer AFTER history
+        auto* tile_even_new = tile_even + history_len;
+        auto* tile_odd_new = tile_odd + history_len;
+
+        // AVX2 deinterleave: process 4 output pairs per iteration
+        // Input: [e0,o0,e1,o1,e2,o2,e3,o3] as doubles (complex<float> pairs)
+        std::size_t di = 0;
+        for (; di + 4 <= tile_outputs; di += 4) {
+            // Load 8 interleaved complex samples as 4 doubles each
+            auto a = _mm256_loadu_pd(reinterpret_cast<const double*>(input + 2*(output_pos + di)));
+            auto b = _mm256_loadu_pd(reinterpret_cast<const double*>(input + 2*(output_pos + di) + 4));
+
+            // Shuffle to separate even and odd
+            auto evens_lo = _mm256_unpacklo_pd(a, b);  // [e0,e2,e1,e3]
+            auto odds_lo  = _mm256_unpackhi_pd(a, b);  // [o0,o2,o1,o3]
+
+            // Permute to correct order
+            auto evens = _mm256_permute4x64_pd(evens_lo, 0xD8); // [e0,e1,e2,e3]
+            auto odds  = _mm256_permute4x64_pd(odds_lo, 0xD8);  // [o0,o1,o2,o3]
+
+            _mm256_storeu_pd(reinterpret_cast<double*>(tile_even_new + di), evens);
+            _mm256_storeu_pd(reinterpret_cast<double*>(tile_odd_new + di), odds);
+        }
+
+        // Scalar tail for deinterleave
+        for (; di < tile_outputs; ++di) {
+            tile_even_new[di] = input[2 * (output_pos + di)];
+            tile_odd_new[di] = input[2 * (output_pos + di) + 1];
+        }
+
+        // --- PHASE 2: Filter (data is hot in L1!) ---
+        const auto* filter_even = reinterpret_cast<const float*>(tile_even);
+        const auto* filter_odd = reinterpret_cast<const float*>(tile_odd);
+
+        // AVX2 filter: process 16 outputs (4 YMM registers) per iteration
+        std::size_t fi = 0;
+        for (; fi + 16 <= tile_outputs; fi += 16) {
+            // Load even samples for center tap (with delay)
+            auto even_0 = _mm256_loadu_ps(filter_even + 2*(fi + delay_offset));
+            auto even_1 = _mm256_loadu_ps(filter_even + 2*(fi + delay_offset) + 8);
+            auto even_2 = _mm256_loadu_ps(filter_even + 2*(fi + delay_offset) + 16);
+            auto even_3 = _mm256_loadu_ps(filter_even + 2*(fi + delay_offset) + 24);
+
+            auto acc_0a = _mm256_mul_ps(even_0, center_reg);
+            auto acc_1a = _mm256_mul_ps(even_1, center_reg);
+            auto acc_2a = _mm256_mul_ps(even_2, center_reg);
+            auto acc_3a = _mm256_mul_ps(even_3, center_reg);
+
+            auto acc_0b = _mm256_setzero_ps();
+            auto acc_1b = _mm256_setzero_ps();
+            auto acc_2b = _mm256_setzero_ps();
+            auto acc_3b = _mm256_setzero_ps();
+
+            for (std::size_t k = 0; k < num_taps; k += 2) {
+                auto h_even = _mm256_set1_ps(coeffs[k]);
+
+                auto od_0a = _mm256_loadu_ps(filter_odd + 2*(fi + k));
+                auto od_1a = _mm256_loadu_ps(filter_odd + 2*(fi + k) + 8);
+                auto od_2a = _mm256_loadu_ps(filter_odd + 2*(fi + k) + 16);
+                auto od_3a = _mm256_loadu_ps(filter_odd + 2*(fi + k) + 24);
+
+                acc_0a = _mm256_fmadd_ps(od_0a, h_even, acc_0a);
+                acc_1a = _mm256_fmadd_ps(od_1a, h_even, acc_1a);
+                acc_2a = _mm256_fmadd_ps(od_2a, h_even, acc_2a);
+                acc_3a = _mm256_fmadd_ps(od_3a, h_even, acc_3a);
+
+                if (k + 1 < num_taps) {
+                    auto h_odd = _mm256_set1_ps(coeffs[k+1]);
+
+                    auto od_0b = _mm256_loadu_ps(filter_odd + 2*(fi + k + 1));
+                    auto od_1b = _mm256_loadu_ps(filter_odd + 2*(fi + k + 1) + 8);
+                    auto od_2b = _mm256_loadu_ps(filter_odd + 2*(fi + k + 1) + 16);
+                    auto od_3b = _mm256_loadu_ps(filter_odd + 2*(fi + k + 1) + 24);
+
+                    acc_0b = _mm256_fmadd_ps(od_0b, h_odd, acc_0b);
+                    acc_1b = _mm256_fmadd_ps(od_1b, h_odd, acc_1b);
+                    acc_2b = _mm256_fmadd_ps(od_2b, h_odd, acc_2b);
+                    acc_3b = _mm256_fmadd_ps(od_3b, h_odd, acc_3b);
+                }
+            }
+
+            _mm256_storeu_ps(output_f + 2*(output_pos + fi),      _mm256_add_ps(acc_0a, acc_0b));
+            _mm256_storeu_ps(output_f + 2*(output_pos + fi) + 8,  _mm256_add_ps(acc_1a, acc_1b));
+            _mm256_storeu_ps(output_f + 2*(output_pos + fi) + 16, _mm256_add_ps(acc_2a, acc_2b));
+            _mm256_storeu_ps(output_f + 2*(output_pos + fi) + 24, _mm256_add_ps(acc_3a, acc_3b));
+        }
+
+        // Scalar tail for filter
+        for (; fi < tile_outputs; ++fi) {
+            auto sum = tile_even[fi + delay_offset] * center_tap;
+            for (std::size_t k = 0; k < num_taps; ++k) {
+                sum += tile_odd[fi + k] * coeffs[k];
+            }
+            output[output_pos + fi] = sum;
+        }
+
+        output_pos += tile_outputs;
+    }
+
+    // --- PHASE 3: Update history ---
+    if (num_outputs >= history_len) {
+        for (std::size_t i = 0; i < history_len; ++i) {
+            std::size_t src_idx = num_outputs - history_len + i;
+            even_hist[i] = input[2 * src_idx];
+            odd_hist[i] = input[2 * src_idx + 1];
+        }
+    } else {
+        std::size_t keep = history_len - num_outputs;
+        std::memmove(even_hist, even_hist + num_outputs, keep * sizeof(std::complex<float>));
+        std::memmove(odd_hist, odd_hist + num_outputs, keep * sizeof(std::complex<float>));
+        for (std::size_t i = 0; i < num_outputs; ++i) {
+            even_hist[keep + i] = input[2 * i];
+            odd_hist[keep + i] = input[2 * i + 1];
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Scalar Version (fallback)
 // -----------------------------------------------------------------------------
 [[gnu::target("default")]]
 inline auto halfband_filter_fused(
-    const std::complex<float>* __restrict__ input,
-    std::complex<float>* __restrict__ even_hist,
-    std::complex<float>* __restrict__ odd_hist,
-    const float* __restrict__ coeffs,
-    std::size_t num_taps,
-    float center_tap,
-    std::size_t delay_offset,
-    std::complex<float>* __restrict__ output,
-    std::size_t num_outputs,
-    std::size_t history_len
+  const std::complex<float>* __restrict__ input,
+  std::complex<float>* __restrict__ even_hist,
+  std::complex<float>* __restrict__ odd_hist,
+  const float* __restrict__ coeffs,
+  std::size_t num_taps,
+  float center_tap,
+  std::size_t delay_offset,
+  std::complex<float>* __restrict__ output,
+  std::size_t num_outputs,
+  std::size_t history_len
 ) -> void {
     // Validate parameters to prevent buffer overflow and in-place corruption
     assert(history_len <= MAX_HISTORY_LEN && "history_len exceeds MAX_HISTORY_LEN (256)");

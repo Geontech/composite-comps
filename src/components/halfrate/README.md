@@ -71,9 +71,10 @@ The `halfband_filter_fused` kernel combines deinterleaving and filtering in a si
 | ISA     | Deinterleave | Filter | Notes |
 |---------|--------------|--------|-------|
 | AVX-512 | 16 pairs/iter | 32 outputs/iter | `permutex2var` + FMA |
-| Scalar  | 1 pair/iter | 1 output/iter | Fallback |
+| AVX2    | 4 pairs/iter  | 16 outputs/iter | `unpack`/`permute` + FMA |
+| Scalar  | 1 pair/iter   | 1 output/iter   | Fallback |
 
-**Multi-Function Versioning**: The compiler generates multiple ISA versions. At runtime, the CPU automatically dispatches to the best available implementation based on feature flags.
+**Multi-Function Versioning (MFV)**: The compiler generates all three ISA versions. At runtime, the CPU automatically dispatches to the best available implementation (AVX-512 → AVX2 → Scalar) based on CPUID feature flags.
 
 ### Performance
 
@@ -110,11 +111,13 @@ The component builds as `build/src/components/halfrate/libhalfrate.so`
 ### Tests
 
 ```bash
-# Build tests
-cmake --build build --target kernel_tests_avx512 halfrate_integration_tests kernel_benchmarks
+# Build all test variants
+cmake --build build --target kernel_tests_scalar kernel_tests_avx2 kernel_tests_avx512 halfrate_integration_tests kernel_benchmarks
 
-# Run unit tests
-./build/src/components/halfrate/tests/kernel_tests_avx512
+# Run kernel tests (choose ISA variant for your CPU)
+./build/src/components/halfrate/tests/kernel_tests_avx512   # AVX-512
+./build/src/components/halfrate/tests/kernel_tests_avx2     # AVX2
+./build/src/components/halfrate/tests/kernel_tests_scalar   # Scalar baseline
 
 # Run integration tests
 ./build/src/components/halfrate/tests/halfrate_integration_tests
@@ -127,13 +130,14 @@ cmake --build build --target kernel_tests_avx512 halfrate_integration_tests kern
 
 ### Test Coverage
 
-Two comprehensive test suites plus benchmarks:
+Two comprehensive test suites plus benchmarks, with kernel tests built for three ISA targets:
 
-1. **`kernel_tests.cpp`**
+1. **`kernel_tests.cpp`** (built as `kernel_tests_scalar`, `kernel_tests_avx2`, `kernel_tests_avx512`)
    - Validates fused SIMD kernel against simple scalar reference
    - Tests various block sizes, tile boundaries, tap counts
    - Tests history update correctness
    - Impulse response validation
+   - Each ISA variant tests its specific code path
 
 2. **`halfrate_integration_tests.cpp`**
    - End-to-end component behavior
@@ -149,11 +153,15 @@ Two comprehensive test suites plus benchmarks:
 ### Running Tests
 
 ```bash
-# All tests via CTest
+# All tests via CTest (runs all ISA variants)
 cd build && ctest
 
-# Individual test suites (AVX-512, AVX2, or scalar variants)
+# Individual kernel test suites by ISA
 ./build/src/components/halfrate/tests/kernel_tests_avx512
+./build/src/components/halfrate/tests/kernel_tests_avx2
+./build/src/components/halfrate/tests/kernel_tests_scalar
+
+# Integration tests
 ./build/src/components/halfrate/tests/halfrate_integration_tests
 
 # Performance benchmarks
@@ -189,6 +197,7 @@ halfrate/
 2. **Fused kernel**: Single kernel for deinterleave + filter improves cache utilization
 3. **L1 tiling**: Process in 512-output tiles to keep working set in L1 cache
 4. **Minimal history**: Only store `history_len` samples (not full working set)
+5. **MFV over runtime dispatch**: Zero overhead, compiler-optimized (AVX-512/AVX2/Scalar)
 
 ### History Management
 
