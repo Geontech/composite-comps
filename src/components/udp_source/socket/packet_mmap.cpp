@@ -242,7 +242,8 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 auto* payload = (uint8_t*)(udp_hdr) + sizeof(struct udphdr);
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
 
-                auto buffer = std::make_shared<composite::external_buffer<uint8_t>>(
+                // Wrap payload in external_buffer with ring frame release callback (zero-allocation)
+                auto buffer = composite::external_buffer<uint8_t>(
                     payload,
                     payload_len,
                     frame_release{hdr, m_ring_buffer}

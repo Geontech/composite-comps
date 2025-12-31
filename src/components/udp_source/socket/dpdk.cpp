@@ -318,7 +318,8 @@ auto dpdk::receive(std::stop_token token) -> void {
             if (payload.valid) {
                 m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
 
-                auto buffer = std::make_shared<composite::external_buffer<uint8_t, mbuf_release>>(
+                // Wrap payload in external_buffer with DPDK mbuf release callback (zero-allocation)
+                auto buffer = composite::external_buffer<uint8_t>(
                     payload.data,
                     payload.length,
                     mbuf_release{mbuf}

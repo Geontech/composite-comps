@@ -233,12 +233,8 @@ auto polyphase_channelizer::emit_frames(composite::timestamp frame_ts) -> void {
         m_output_buffers[ch].reset();
         m_output_ptrs[ch] = nullptr;
 
-        // Wrap pool buffer in immutable_buffer for port send
-        auto out = composite::immutable_buffer<cf32_t>(
-            std::make_shared<composite::external_buffer<cf32_t>>(
-                std::move(buffer)
-            )
-        );
+        // Wrap pool buffer in immutable_buffer for port send (zero-allocation)
+        auto out = composite::immutable_buffer<cf32_t>(std::move(buffer));
         m_data_out.send_data(out, frame_ts);
     }
 

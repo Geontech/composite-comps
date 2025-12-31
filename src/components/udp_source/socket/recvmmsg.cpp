@@ -270,12 +270,10 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                     continue;
                 }
 
-                // Create length-adjusted view using take()
+                // Create length-adjusted view (zero-allocation)
                 auto len = msgs[i].msg_len;
                 auto sized_buffer = composite::immutable_buffer<uint8_t>(
-                    std::make_shared<composite::external_buffer<uint8_t>>(
-                        std::move(buffers[i].value())
-                    )
+                    std::move(buffers[i].value())
                 ).slice(0, len);
 
                 // Send data downstream

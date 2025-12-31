@@ -243,11 +243,8 @@ public:
             .slot_index = slot_idx
         };
 
-        auto buffer = std::make_shared<composite::external_buffer<T>>(
-            data_ptr, m_frame_size, deleter
-        );
-
-        return composite::immutable_buffer<T>(buffer);
+        auto buffer = composite::external_buffer<T>(data_ptr, m_frame_size, deleter);
+        return composite::immutable_buffer<T>(std::move(buffer));
     }
 
     auto frame_size() const noexcept -> std::size_t {
