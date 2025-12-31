@@ -23,6 +23,8 @@
 #include <optional>
 #include <string>
 
+namespace struct_props {
+
 /**
  * @brief Signal override configuration
  *
@@ -43,3 +45,5 @@ struct signal_overrides {
     format data_format;
     std::string transport;
 };
+
+} // namespace struct_props

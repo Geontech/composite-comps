@@ -29,7 +29,7 @@ struct FramerTestFixture {
     std::shared_ptr<composite::input_port<composite::immutable_buffer<std::complex<float>>>> sink_port;
 
     FramerTestFixture() {
-        uut = std::make_shared<framer<std::complex<float>>>();
+        uut = std::make_shared<framer<std::complex<float>>>("test");
         source_port = std::make_shared<composite::output_port<composite::immutable_buffer<uint8_t>>>("source");
         sink_port = std::make_shared<composite::input_port<composite::immutable_buffer<std::complex<float>>>>("sink");
 
@@ -40,7 +40,7 @@ struct FramerTestFixture {
 
     void reset() {
         // Create fresh component and reconnect ports
-        uut = std::make_shared<framer<std::complex<float>>>();
+        uut = std::make_shared<framer<std::complex<float>>>("test");
         source_port = std::make_shared<composite::output_port<composite::immutable_buffer<uint8_t>>>("source");
         sink_port = std::make_shared<composite::input_port<composite::immutable_buffer<std::complex<float>>>>("sink");
         source_port->connect(&uut->m_in_port);

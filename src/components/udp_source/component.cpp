@@ -38,30 +38,21 @@
 udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_port(&m_out_port);
     using enum composite::properties::config_type;
-    add_property("active", &m_active).configurability(RUNTIME);
-    add_property("socket_type", &m_socket_type).change_listener([this]() {
+    add_property("active", m_active, RUNTIME);
+    add_property("socket_type", m_socket_type).change_listener([this]() {
         return m_socket_type == RECVMMSG
             || m_socket_type == PACKET_MMAP
             || m_socket_type == DPDK;
     });
-    add_property("interface", &m_interface).configurability(RUNTIME);
-    add_property("ip_addr", &m_ip_addr).configurability(RUNTIME);
-    add_property("port", &m_port).configurability(RUNTIME);
-    add_property("recv_buf_size", &m_recv_buf_size).units("bytes");
-    add_property("num_msgs", &m_num_msgs).configurability(RUNTIME);
-    add_property("frame_count", &m_frame_count).configurability(RUNTIME);
-    add_property("autodiscovery_timeout", &m_autodiscovery_timeout).units("seconds");
-    add_struct_property("overrides", &m_overrides, [this](auto& set, auto* prop) {
-        set.add_property("msg_size", &prop->msg_size).configurability(RUNTIME).units("bytes");
-    }).configurability(RUNTIME);
-    add_struct_property("dpdk", &m_dpdk, [this](auto& set, auto* prop) {
-        set.add_property("port_id", &prop->port_id);
-        set.add_property("queue_id", &prop->queue_id);
-        set.add_property("mempool_name", &prop->mempool_name);
-        set.add_property("burst_size", &prop->burst_size);
-        set.add_property("igmp_respond_to_queries", &prop->igmp_respond_to_queries);
-        set.add_property("src_ip", &prop->src_ip);
-    });
+    add_property("interface", m_interface, RUNTIME);
+    add_property("ip_addr", m_ip_addr, RUNTIME);
+    add_property("port", m_port, RUNTIME);
+    add_property("recv_buf_size", m_recv_buf_size).units("bytes");
+    add_property("num_msgs", m_num_msgs, RUNTIME);
+    add_property("frame_count", m_frame_count, RUNTIME);
+    add_property("autodiscovery_timeout", m_autodiscovery_timeout).units("seconds");
+    add_property("overrides", m_overrides, RUNTIME);
+    add_property("dpdk", m_dpdk);
 }
 
 auto udp_source::property_change_handler() -> void {

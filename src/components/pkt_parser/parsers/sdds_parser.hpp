@@ -34,7 +34,7 @@ namespace parsers {
  */
 class sdds_parser : public protocol_parser {
 public:
-    explicit sdds_parser(const signal_overrides& overrides);
+    explicit sdds_parser(const struct_props::signal_overrides& overrides);
     ~sdds_parser() override = default;
 
     auto can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool override;
@@ -45,7 +45,7 @@ public:
     auto name() const -> std::string_view override { return "sdds"; }
 
 private:
-    signal_overrides m_overrides;
+    struct_props::signal_overrides m_overrides;
     uint16_t m_pkt_count{0};
 
 }; // class sdds_parser

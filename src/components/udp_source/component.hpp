@@ -27,6 +27,25 @@
 #include <string>
 #include <string_view>
 
+namespace struct_props {
+
+struct overrides {
+    std::optional<uint32_t> msg_size;
+}; // struct overrides
+
+struct dpdk_config {
+    std::optional<uint16_t> port_id;        // Optional: auto-resolved from interface
+    std::optional<uint16_t> queue_id;       // Optional: auto-assigned
+    std::string mempool_name{"mbuf_pool"};
+    uint16_t burst_size{32};
+
+    // IGMP configuration (automatically enabled for multicast if src_ip provided)
+    bool igmp_respond_to_queries{true};
+    std::string src_ip;                     // Source IP for IGMP (enables IGMP if dst is multicast)
+}; // struct dpdk_config
+
+} // namespace struct_props
+
 class udp_source : public composite::component {
     static constexpr std::string_view RECVMMSG = "recvmmsg";
     static constexpr std::string_view PACKET_MMAP = "packet_mmap";
@@ -55,24 +74,8 @@ private:
     uint32_t m_frame_count{8192};
     uint32_t m_recv_buf_size{};
     uint32_t m_autodiscovery_timeout{10};
-
-    struct overrides {
-        std::optional<uint32_t> msg_size;
-    }; // struct overrides
-    overrides m_overrides;
-
-    // DPDK-specific properties
-    struct dpdk_config {
-        std::optional<uint16_t> port_id;        // Optional: auto-resolved from interface
-        std::optional<uint16_t> queue_id;       // Optional: auto-assigned
-        std::string mempool_name{"mbuf_pool"};
-        uint16_t burst_size{32};
-
-        // IGMP configuration (automatically enabled for multicast if src_ip provided)
-        bool igmp_respond_to_queries{true};
-        std::string src_ip;                     // Source IP for IGMP (enables IGMP if dst is multicast)
-    }; // struct dpdk_config
-    dpdk_config m_dpdk;
+    struct_props::overrides m_overrides;
+    struct_props::dpdk_config m_dpdk;
 
     // Members
     std::unique_ptr<udp::interface> m_receiver;
@@ -85,3 +88,25 @@ private:
     auto stop_receiver_locked() -> void;
 
 }; // class udp_source
+
+// Struct property trait specializations
+template<>
+struct composite::properties::property_traits<struct_props::overrides> {
+    static void register_fields(composite::properties::property_set& ps, struct_props::overrides& prop) {
+        using enum composite::properties::config_type;
+        ps.add("msg_size", prop.msg_size, RUNTIME);
+    }
+};
+
+template<>
+struct composite::properties::property_traits<struct_props::dpdk_config> {
+    static void register_fields(composite::properties::property_set& ps, struct_props::dpdk_config& prop) {
+        using enum composite::properties::config_type;
+        ps.add("port_id", prop.port_id);
+        ps.add("queue_id", prop.queue_id);
+        ps.add("mempool_name", prop.mempool_name);
+        ps.add("burst_size", prop.burst_size);
+        ps.add("igmp_respond_to_queries", prop.igmp_respond_to_queries);
+        ps.add("src_ip", prop.src_ip);
+    }
+};

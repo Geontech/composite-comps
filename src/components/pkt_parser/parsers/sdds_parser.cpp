@@ -40,7 +40,7 @@ namespace {
     constexpr uint8_t DM_16BIT_UNSIGNED = 6;   // 16-bit unsigned integer
 } // anonymous namespace
 
-sdds_parser::sdds_parser(const signal_overrides& overrides)
+sdds_parser::sdds_parser(const struct_props::signal_overrides& overrides)
     : m_overrides(overrides) {}
 
 auto sdds_parser::can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool {

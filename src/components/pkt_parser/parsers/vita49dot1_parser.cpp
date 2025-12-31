@@ -31,7 +31,7 @@ constexpr uint32_t VRLP_MAGIC = 0x56524C50;      // "VRLP" magic word (big-endia
 constexpr std::size_t VRL_HEADER_SIZE = 8;       // VRLP word + frame word
 constexpr std::size_t MIN_V491_PACKET_SIZE = 12; // VRL header + minimal V49 header
 
-vita49dot1_parser::vita49dot1_parser(const signal_overrides& overrides) :
+vita49dot1_parser::vita49dot1_parser(const struct_props::signal_overrides& overrides) :
   m_overrides(overrides),
   m_vita49_parser(overrides) {}
 

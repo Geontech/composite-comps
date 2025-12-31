@@ -38,7 +38,7 @@ namespace parsers {
  */
 class vita49_parser : public protocol_parser {
 public:
-    explicit vita49_parser(const signal_overrides& overrides);
+    explicit vita49_parser(const struct_props::signal_overrides& overrides);
     ~vita49_parser() override = default;
 
     auto can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool override;
@@ -49,7 +49,7 @@ public:
     auto name() const -> std::string_view override { return "vita49"; }
 
 private:
-    signal_overrides m_overrides;
+    struct_props::signal_overrides m_overrides;
     uint16_t m_pkt_count{0};
     bool m_tsf_warn{false};
 

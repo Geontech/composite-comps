@@ -32,7 +32,7 @@ namespace parsers {
  */
 class vita49dot1_parser : public protocol_parser {
 public:
-    explicit vita49dot1_parser(const signal_overrides& overrides);
+    explicit vita49dot1_parser(const struct_props::signal_overrides& overrides);
     ~vita49dot1_parser() override = default;
 
     auto can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool override;
@@ -43,7 +43,7 @@ public:
     auto name() const -> std::string_view override { return "vita49.1"; }
 
 private:
-    signal_overrides m_overrides;
+    struct_props::signal_overrides m_overrides;
     vita49_parser m_vita49_parser;  // Delegate to standard V49 parser
 
 }; // class vita49dot1_parser

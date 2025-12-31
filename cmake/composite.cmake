@@ -3,7 +3,7 @@ if(NOT TARGET composite::composite)
     message(STATUS "composite not found, falling back to FetchContent")
     FetchContent_Declare(composite
         GIT_REPOSITORY https://github.com/geontech/composite.git
-        GIT_TAG develop
+        GIT_TAG 57-add-metrics-and-enable-otel-exporting
     )
     FetchContent_MakeAvailable(composite)
 else()

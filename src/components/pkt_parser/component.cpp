@@ -28,28 +28,7 @@ pkt_parser::pkt_parser(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
     using enum composite::properties::config_type;
-    add_struct_property("signal_overrides", &m_signal_overrides, [this](auto& set, auto* prop) {
-        set.add_property("center_frequency", &prop->center_frequency).configurability(RUNTIME);
-        set.add_property("bandwidth", &prop->bandwidth).configurability(RUNTIME);
-        set.add_property("sample_rate", &prop->sample_rate).configurability(RUNTIME);
-        set.add_struct_property("data_format", &prop->data_format, [this](auto& set, auto* prop) {
-            set.add_property("is_complex", &prop->is_complex).configurability(RUNTIME);
-            set.add_property("type", &prop->type).configurability(RUNTIME).change_listener([this]() {
-                return (m_signal_overrides.data_format.type == "signed_integer") ||
-                       (m_signal_overrides.data_format.type == "unsigned_integer") ||
-                       (m_signal_overrides.data_format.type == "floating_point");
-            });
-            set.add_property("bit_width", &prop->bit_width).configurability(RUNTIME);
-            set.add_property("endianness", &prop->endianness).configurability(RUNTIME).change_listener([this]() {
-                return (m_signal_overrides.data_format.endianness == "big") || (m_signal_overrides.data_format.endianness == "little");
-            });
-        }).configurability(RUNTIME);
-        set.add_property("transport", &prop->transport).configurability(RUNTIME).change_listener([this]() {
-            return (m_signal_overrides.transport == "sdds") ||
-                   (m_signal_overrides.transport == "vita49") ||
-                   (m_signal_overrides.transport == "vita49.1");
-        });
-    }).configurability(RUNTIME);
+    add_property("signal_overrides", m_signal_overrides, RUNTIME);
 }
 
 auto pkt_parser::property_change_handler() -> void {

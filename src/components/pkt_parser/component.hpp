@@ -43,7 +43,7 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Properties
-    ::signal_overrides m_signal_overrides;
+    struct_props::signal_overrides m_signal_overrides;
 
     // Members
     std::vector<std::unique_ptr<parsers::protocol_parser>> m_parsers;
@@ -53,3 +53,36 @@ private:
     bool m_unknown_protocol_warned{false};
 
 }; // class pkt_parser
+
+template<>
+struct composite::properties::property_traits<struct_props::signal_overrides::format> {
+    static void register_fields(composite::properties::property_set& ps, struct_props::signal_overrides::format& f) {
+        using enum composite::properties::config_type;
+        ps.add("is_complex", f.is_complex, RUNTIME);
+        ps.add("type", f.type, RUNTIME).change_listener([&f]() {
+            return (f.type == "signed_integer") ||
+                   (f.type == "unsigned_integer") ||
+                   (f.type == "floating_point");
+        });
+        ps.add("bit_width", f.bit_width, RUNTIME);
+        ps.add("endianness", f.endianness, RUNTIME).change_listener([&f]() {
+            return (f.endianness == "big") || (f.endianness == "little");
+        });
+    }
+};
+
+template<>
+struct composite::properties::property_traits<struct_props::signal_overrides> {
+    static void register_fields(composite::properties::property_set& ps, struct_props::signal_overrides& s) {
+        using enum composite::properties::config_type;
+        ps.add("center_frequency", s.center_frequency, RUNTIME);
+        ps.add("bandwidth", s.bandwidth, RUNTIME);
+        ps.add("sample_rate", s.sample_rate, RUNTIME);
+        ps.add("data_format", s.data_format, RUNTIME);
+        ps.add("transport", s.transport, RUNTIME).change_listener([&s]() {
+            return (s.transport == "sdds") ||
+                   (s.transport == "vita49") ||
+                   (s.transport == "vita49.1");
+        });
+    }
+};

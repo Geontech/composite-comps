@@ -31,15 +31,11 @@ psd<T>::psd(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
     using enum composite::properties::config_type;
-    add_property("num_workers", &m_num_workers)
-        .configurability(RUNTIME)
-        .change_listener([this]() {
-            return m_num_workers <= 8u;
-        });
-    add_property("power_based_normalization", &m_power_based_normalization)
-        .configurability(RUNTIME);
+    add_property("num_workers", m_num_workers, RUNTIME).change_listener([this]() {
+        return m_num_workers <= 8u;
+    });
+    add_property("power_based_normalization", m_power_based_normalization, RUNTIME);
 }
-
 
 template <typename T>
 auto psd<T>::property_change_handler() -> void {

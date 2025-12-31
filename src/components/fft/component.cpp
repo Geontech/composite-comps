@@ -32,17 +32,17 @@ fft<T>::fft(std::string_view id) : composite::component(id) {
 
     add_port(&m_in_port);
     add_port(&m_out_port);
-    add_property("window", &m_window_type).change_listener([this]() {
+    add_property("window", m_window_type).change_listener([this]() {
         return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING") || m_window_type.empty();
     });
-    add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
+    add_property("fft_size", m_fft_size).configurability(RUNTIME).change_listener([this]() {
         return std::has_single_bit(m_fft_size);
     });
-    add_property("num_workers", &m_num_workers).configurability(RUNTIME).change_listener([this]() {
+    add_property("num_workers", m_num_workers).configurability(RUNTIME).change_listener([this]() {
         return m_num_workers <= 8u;
     });
-    add_property("fftw_threads", &m_fftw_threads);
-    add_property("shift", &m_shift).configurability(RUNTIME);
+    add_property("fftw_threads", m_fftw_threads);
+    add_property("shift", m_shift).configurability(RUNTIME);
 
     if constexpr (std::is_same_v<scalar_t, float>) {
         fftwf_init_threads();

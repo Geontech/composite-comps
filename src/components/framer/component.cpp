@@ -29,22 +29,19 @@ framer<T>::framer(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
 
-    add_property("frame_size", &m_frame_size)
+    add_property("frame_size", m_frame_size)
         .units("samples")
-        .configurability(composite::properties::config_type::INITIALIZE)
         .change_listener([this]() {
             return m_frame_size > 0;
         });
 
-    add_property("overlap", &m_overlap)
+    add_property("overlap", m_overlap)
         .units("samples")
-        .configurability(composite::properties::config_type::INITIALIZE)
         .change_listener([this]() {
             return m_overlap < m_frame_size;
         });
 
-    add_property("frame_count", &m_frame_count)
-        .configurability(composite::properties::config_type::INITIALIZE)
+    add_property("frame_count", m_frame_count)
         .change_listener([this]() {
             return m_frame_count >= 2;
         });
@@ -72,9 +69,8 @@ auto framer<T>::initialize_pool() -> void {
         return;
     }
 
-    auto frames = std::max<uint32_t>(m_frame_count, 2);
-
     try {
+        auto frames = std::max<uint32_t>(m_frame_count, 2);
         m_pool = std::make_shared<framer_pool<T>>(m_frame_size, m_overlap, frames);
         logger()->debug("framer: initialized pool with frame_size={}, overlap={}, frame_count={}, "
                        "hop_size={}, ring_size={}",

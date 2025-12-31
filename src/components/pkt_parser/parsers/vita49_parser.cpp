@@ -33,7 +33,7 @@ namespace {
                                                      // Formats 0x08-0x0F are floating point
 } // anonymous namespace
 
-vita49_parser::vita49_parser(const signal_overrides& overrides)
+vita49_parser::vita49_parser(const struct_props::signal_overrides& overrides)
     : m_overrides(overrides) {}
 
 auto vita49_parser::can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool {
