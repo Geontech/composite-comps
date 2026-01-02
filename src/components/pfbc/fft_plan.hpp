@@ -44,10 +44,10 @@ public:
         return m_size;
     }
 
-    auto execute(const std::complex<float>* in, std::complex<float>* out) -> void {
+    auto execute(std::complex<float>* in, std::complex<float>* out) -> void {
         fftwf_execute_dft(
             m_plan,
-            const_cast<fftwf_complex*>(reinterpret_cast<const fftwf_complex*>(in)),
+            reinterpret_cast<fftwf_complex*>(in),
             reinterpret_cast<fftwf_complex*>(out)
         );
     }

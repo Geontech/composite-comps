@@ -164,6 +164,12 @@ auto polyphase_channelizer::reset_state() -> void {
         std::fill(m_frame_tm->begin(), m_frame_tm->end(), cf32_t{0.0f, 0.0f});
     }
 
+    // Release any acquired output buffers
+    for (auto& buf : m_output_buffers) {
+        buf.reset();
+    }
+    std::fill(m_output_ptrs.begin(), m_output_ptrs.end(), nullptr);
+
     // Reset timestamp tracking
     m_stream_sample_idx = 0;
     m_ts_initialized = false;
@@ -200,9 +206,8 @@ auto polyphase_channelizer::emit_frames(composite::timestamp frame_ts) -> void {
     const auto M = static_cast<std::size_t>(m_num_channels);
     const auto N = static_cast<std::size_t>(m_frame_size);
 
-    // Acquire output buffers up front so transpose can write contiguously.
+    // Acquire output buffers from pool
     for (std::size_t ch = 0; ch < M; ++ch) {
-        // Acquire buffer from pool (non-blocking, returns nullopt if exhausted)
         auto pool_buf = m_output_pool->acquire();
         if (!pool_buf) {
             logger()->warn("pfbc: output pool exhausted, dropping channel {} frame", ch);
@@ -210,20 +215,14 @@ auto polyphase_channelizer::emit_frames(composite::timestamp frame_ts) -> void {
             m_output_buffers[ch].reset();
             continue;
         }
-
         m_output_buffers[ch] = std::move(*pool_buf);
         m_output_ptrs[ch] = m_output_buffers[ch]->data();
     }
 
-    // Transpose time-major frame to channel-major output buffers using AVX-512.
-    // Layout: frame_tm[t * M + ch] -> output[ch][t]
-    kernels::transpose_to_channel_buffers(
-        m_frame_tm->data(),
-        m_output_ptrs.data(),
-        M,
-        N
-    );
+    // Transpose from m_frame_tm (time-major) to channel buffers
+    kernels::transpose_to_channel_buffers(m_frame_tm->data(), m_output_ptrs.data(), M, N);
 
+    // Send and release the buffers
     for (std::size_t ch = 0; ch < M; ++ch) {
         if (!m_output_buffers[ch].has_value()) {
             continue;
@@ -304,34 +303,63 @@ auto polyphase_channelizer::process() -> composite::retval {
         m_ts_initialized = true;
     }
 
-    // Ensure filter output buffer has sufficient capacity
-    if (num_outputs > m_filter_output_capacity) {
-        m_filter_output_capacity = num_outputs;
-        m_filter_output = composite::make_aligned<cf32_t>(64, M * m_filter_output_capacity);
-    }
-
     // =========================================================================
-    // Stage 1: Polyphase filtering with direct span access
+    // Interleaved filter+FFT processing for cache locality
     // =========================================================================
-    // Split processing into boundary outputs (need history) and direct outputs
-    // (entirely from new data, can read directly from span).
-    //
-    // Boundary outputs: 0..(K-2) - span history and new data
-    // Direct outputs: (K-1)..(num_outputs-1) - entirely from new data
-    //
     const std::size_t boundary_outputs = std::min(m_history_len, num_outputs);
     const std::size_t direct_outputs = num_outputs - boundary_outputs;
     const std::size_t history_samples = m_history_len * M;
 
-    // Process boundary outputs (first K-1) - need assembled buffer
+    // Lambda to process a chunk: filter → FFT → frame accumulation
+    auto process_outputs = [&](const cf32_t* input, std::size_t count) {
+        // Process in small chunks to keep filter output in L1 cache for FFT
+        constexpr std::size_t CHUNK_SIZE = 32;  // Tune for L1 cache
+
+        for (std::size_t chunk_start = 0; chunk_start < count; chunk_start += CHUNK_SIZE) {
+            const std::size_t chunk_count = std::min(CHUNK_SIZE, count - chunk_start);
+            const cf32_t* chunk_input = input + chunk_start * M;
+
+            // Filter this chunk
+            kernels::filter_interleaved_dispatch(
+                chunk_input,
+                m_coeffs->data(),
+                m_filter_output->data(),
+                M,
+                chunk_count,
+                K
+            );
+
+            // FFT each row in chunk immediately (data still in cache)
+            for (std::size_t i = 0; i < chunk_count; ++i) {
+                cf32_t* fft_input = m_filter_output->data() + i * M;
+                cf32_t* fft_output = m_frame_tm->data() + m_frame_idx * M;
+                m_fft->execute(fft_input, fft_output);
+
+                ++m_frame_idx;
+                m_stream_sample_idx += M;
+
+                // Check if frame is complete
+                if (m_frame_idx >= N) {
+                    const uint64_t frame_start_sample = m_stream_sample_idx - N * M;
+                    composite::timestamp frame_ts = ts_present ? m_ts_base : composite::timestamp{};
+                    if (ts_present && has_rate) {
+                        const double offset_seconds = static_cast<double>(frame_start_sample) / sample_rate;
+                        const auto offset_ns = std::chrono::nanoseconds(
+                            static_cast<int64_t>(offset_seconds * 1e9)
+                        );
+                        frame_ts = m_ts_base + offset_ns;
+                    }
+                    emit_frames(frame_ts);
+                }
+            }
+        }
+    };
+
+    // Process boundary outputs (first K-1) - need assembled buffer with history
     if (boundary_outputs > 0) {
         // Assemble boundary buffer: [history: (K-1)*M][new data: boundary_outputs*M]
-        // Copy history
-        std::memcpy(m_boundary_buffer->data(),
-                    m_history->data(),
-                    history_samples * sizeof(cf32_t));
+        std::memcpy(m_boundary_buffer->data(), m_history->data(), history_samples * sizeof(cf32_t));
 
-        // Copy first boundary_outputs*M samples from new data (tail + part of span)
         cf32_t* new_data_dst = m_boundary_buffer->data() + history_samples;
         const std::size_t boundary_new_samples = boundary_outputs * M;
         const std::size_t from_tail = std::min(m_tail_len, boundary_new_samples);
@@ -344,108 +372,27 @@ auto polyphase_channelizer::process() -> composite::retval {
             std::memcpy(new_data_dst, span.data(), from_span * sizeof(cf32_t));
         }
 
-        // Process boundary outputs
-        kernels::filter_interleaved(
-            m_boundary_buffer->data(),
-            m_coeffs->data(),
-            m_filter_output->data(),
-            M,
-            boundary_outputs,
-            K
-        );
+        process_outputs(m_boundary_buffer->data(), boundary_outputs);
     }
 
     // Process direct outputs - read directly from span when possible (NO COPY!)
-    // Direct outputs exist only when boundary_outputs == m_history_len (i.e., num_outputs >= K-1).
     if (direct_outputs > 0) {
         if (m_tail_len == 0) {
-            // Simple case: new_data == span, process all direct outputs from row 0
-            kernels::filter_interleaved(
-                span.data(),
-                m_coeffs->data(),
-                m_filter_output->data() + boundary_outputs * M,
-                M,
-                direct_outputs,
-                K
-            );
+            // Simple case: all direct outputs from span
+            process_outputs(span.data(), direct_outputs);
         } else {
-            // Tail present: output K-1 needs new_data row 0 which starts in tail.
-            // Assemble new_data rows 0..K-1 (K*M samples) in boundary buffer and process 1 output.
+            // Tail present: first direct output needs assembled buffer
             cf32_t* extra_buf = m_boundary_buffer->data();
             std::memcpy(extra_buf, m_tail.data(), m_tail_len * sizeof(cf32_t));
             std::memcpy(extra_buf + m_tail_len, span.data(), (K * M - m_tail_len) * sizeof(cf32_t));
 
-            kernels::filter_interleaved(
-                extra_buf,
-                m_coeffs->data(),
-                m_filter_output->data() + boundary_outputs * M,
-                M,
-                1,
-                K
-            );
+            process_outputs(extra_buf, 1);
 
-            // Remaining direct outputs (t >= K) read new_data rows 1..,
-            // which start at span offset (M - tail_len).
+            // Remaining direct outputs read from span with offset
             if (direct_outputs > 1) {
                 const cf32_t* remaining_input = span.data() + (M - m_tail_len);
-                kernels::filter_interleaved(
-                    remaining_input,
-                    m_coeffs->data(),
-                    m_filter_output->data() + (boundary_outputs + 1) * M,
-                    M,
-                    direct_outputs - 1,
-                    K
-                );
+                process_outputs(remaining_input, direct_outputs - 1);
             }
-        }
-    }
-
-    // =========================================================================
-    // Stage 2: FFT each output time step and accumulate
-    // =========================================================================
-    // Filter output is already in correct layout for FFT: [t0: p0,p1,...,pM-1]
-    //
-    // Track the sample offset for timestamp calculation:
-    // - Each output time step corresponds to M input samples
-    // - Frame timestamp = base_ts + (samples_at_frame_start / sample_rate)
-    // - Since we don't have sample_rate here, we store sample counts and let
-    //   the downstream compute time if needed. For now, we compute timestamps
-    //   assuming the base timestamp corresponds to sample 0.
-
-    for (std::size_t t = 0; t < num_outputs; ++t) {
-        // FFT input is already at m_filter_output[t * M]
-        const cf32_t* fft_input = m_filter_output->data() + t * M;
-
-        // Execute FFT directly to frame buffer (no intermediate copy)
-        cf32_t* frame_row = m_frame_tm->data() + m_frame_idx * M;
-        m_fft->execute(fft_input, frame_row);
-
-        // Advance frame index
-        ++m_frame_idx;
-
-        // Track input samples consumed (M samples per output time step)
-        m_stream_sample_idx += M;
-
-        // Check if frame is complete and emit
-        if (m_frame_idx >= N) {
-            // Compute timestamp for this frame
-            // The frame started N output time steps ago, each consuming M input samples
-            // Frame start sample = m_stream_sample_idx - N * M
-            const uint64_t frame_start_sample = m_stream_sample_idx - N * M;
-
-            // Convert sample offset to nanoseconds using sample_rate from metadata
-            // If sample_rate is 0 or not set, use the base timestamp directly
-            composite::timestamp frame_ts = ts_present ? m_ts_base : composite::timestamp{};
-            if (ts_present && has_rate) {
-                // offset_ns = frame_start_sample / sample_rate * 1e9
-                const double offset_seconds = static_cast<double>(frame_start_sample) / sample_rate;
-                const auto offset_ns = std::chrono::nanoseconds(
-                    static_cast<int64_t>(offset_seconds * 1e9)
-                );
-                frame_ts = m_ts_base + offset_ns;
-            }
-
-            emit_frames(frame_ts);
         }
     }
 
