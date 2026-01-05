@@ -42,7 +42,7 @@
 namespace udp {
 
 recvmmsg::recvmmsg(const config& config) :
-  interface(config.logger),
+  interface(config.logger, config.metrics),
   m_frame_count(config.frame_count),
   m_autodiscovery_timeout(config.autodiscovery_timeout) {
     // Create socket
@@ -264,6 +264,10 @@ auto recvmmsg::receive(std::stop_token token) -> void {
             auto msgs_recvd = static_cast<std::size_t>(recvd);
             m_pkts_recvd.fetch_add(msgs_recvd, std::memory_order_relaxed);
 
+            // Record metrics
+            m_metrics.packets_received.add(msgs_recvd);
+            m_metrics.batch_sizes.record(static_cast<double>(msgs_recvd));
+
             // Process received messages
             for (std::size_t i = 0; i < msgs_recvd; ++i) {
                 if (!buffers[i].has_value()) {
@@ -272,6 +276,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
 
                 // Create length-adjusted view (zero-allocation)
                 auto len = msgs[i].msg_len;
+                m_metrics.bytes_received.add(len);
                 auto sized_buffer = composite::immutable_buffer<uint8_t>(
                     std::move(buffers[i].value())
                 ).slice(0, len);

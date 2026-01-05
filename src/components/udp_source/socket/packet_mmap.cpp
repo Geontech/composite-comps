@@ -73,7 +73,7 @@ packet_mmap::ring_buffer::~ring_buffer() {
 }
 
 packet_mmap::packet_mmap(const config& config) :
-  interface(config.logger),
+  interface(config.logger, config.metrics),
   m_frame_count(config.frame_count) {
     auto requested_size = config.msg_size;
     if (requested_size == 0) {
@@ -232,6 +232,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
         if (status & TP_STATUS_USER) [[likely]] {
             idle_spins = 0;
             m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
+            m_metrics.packets_received.inc();
 
             // Validate protocol
             // Note: With SOCK_DGRAM, tp_net points to IP header (no Ethernet header)
@@ -241,6 +242,8 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                 auto* udp_hdr = (struct udphdr*)((uint8_t*)(ip_hdr) + ip_hdr->ihl * 4);
                 auto* payload = (uint8_t*)(udp_hdr) + sizeof(struct udphdr);
                 size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
+
+                m_metrics.bytes_received.add(payload_len);
 
                 // Wrap payload in external_buffer with ring frame release callback (zero-allocation)
                 auto buffer = composite::external_buffer<uint8_t>(

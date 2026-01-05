@@ -63,6 +63,9 @@ public:
         // IGMP configuration (automatically enabled for multicast destinations)
         std::string src_ip;               // Source IP for IGMP (required for multicast)
         bool igmp_respond_to_queries = true;
+
+        // Optional metrics for the receiver
+        udp::metrics metrics;
     };
 
     explicit dpdk(const config& cfg);

@@ -53,6 +53,45 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_property("autodiscovery_timeout", m_autodiscovery_timeout).units("seconds");
     add_property("overrides", m_overrides, RUNTIME);
     add_property("dpdk", m_dpdk);
+
+    // Create metrics
+    auto& registry = composite::metrics::registry::instance();
+    auto sanitized_id = composite::metrics::sanitize_for_metric_name(this->id());
+
+    m_packets_received = &registry.get_or_create_counter(
+        "udp_source.packets_received",
+        "Total UDP packets received",
+        "1",
+        {{"component_id", sanitized_id}}
+    );
+    m_bytes_received = &registry.get_or_create_counter(
+        "udp_source.bytes_received",
+        "Total bytes received from network",
+        "bytes",
+        {{"component_id", sanitized_id}}
+    );
+    m_packets_dropped = &registry.get_or_create_counter(
+        "udp_source.packets_dropped",
+        "Packets dropped due to filtering or errors",
+        "1",
+        {{"component_id", sanitized_id}}
+    );
+    m_batch_sizes = &registry.get_or_create_histogram_pow2(
+        "udp_source.batch_sizes",
+        "Distribution of packets received per batch",
+        "1",
+        10,  // 10 buckets: 1, 2, 4, 8, ..., 512
+        {{"component_id", sanitized_id}}
+    );
+}
+
+auto udp_source::create_metrics() -> udp::metrics {
+    return udp::metrics{
+        .packets_received = *m_packets_received,
+        .bytes_received = *m_bytes_received,
+        .packets_dropped = *m_packets_dropped,
+        .batch_sizes = *m_batch_sizes
+    };
 }
 
 auto udp_source::property_change_handler() -> void {
@@ -80,7 +119,8 @@ auto udp_source::property_change_handler() -> void {
         .recv_buf_size = m_recv_buf_size,
         .batch_size = m_num_msgs,
         .frame_count = m_frame_count,
-        .autodiscovery_timeout = m_autodiscovery_timeout
+        .autodiscovery_timeout = m_autodiscovery_timeout,
+        .metrics = create_metrics()
     };
     if (m_overrides.msg_size.has_value()) {
         config.msg_size = m_overrides.msg_size.value();
@@ -100,7 +140,8 @@ auto udp_source::property_change_handler() -> void {
             .mempool_name = m_dpdk.mempool_name,
             .burst_size = m_dpdk.burst_size,
             .src_ip = m_dpdk.src_ip,
-            .igmp_respond_to_queries = m_dpdk.igmp_respond_to_queries
+            .igmp_respond_to_queries = m_dpdk.igmp_respond_to_queries,
+            .metrics = create_metrics()
         };
         receiver = std::make_unique<udp::dpdk>(dpdk_cfg);
 #else

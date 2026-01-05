@@ -22,6 +22,7 @@
 #include <atomic>
 #include <bit>
 #include <composite/buffers/buffer.hpp>
+#include <composite/metrics/metrics.hpp>
 #include <composite/ports/output_port.hpp>
 #include <map>
 #include <memory>
@@ -29,6 +30,19 @@
 #include <spdlog/spdlog.h>
 
 namespace udp {
+
+/**
+ * @brief Metrics for UDP receiver implementations.
+ *
+ * These are created by the component and passed to the receiver via config.
+ * All metrics are required - receivers always record to these.
+ */
+struct metrics {
+    composite::metrics::counter<uint64_t>& packets_received;
+    composite::metrics::counter<uint64_t>& bytes_received;
+    composite::metrics::counter<uint64_t>& packets_dropped;
+    composite::metrics::histogram& batch_sizes;
+}; // struct metrics
 
 /**
  * @brief Configuration parameters for a UDP receiver interface.
@@ -85,6 +99,12 @@ struct config {
      */
     std::size_t autodiscovery_timeout{10};
 
+    /**
+     * @brief Optional metrics for the receiver.
+     * If provided, the receiver will record metrics to these counters.
+     */
+    udp::metrics metrics;
+
 }; // struct config
 
 /**
@@ -137,16 +157,23 @@ public:
 
 protected:
     /**
-     * @brief Default constructor.
+     * @brief Constructor.
      *
      * @param logger spdlog logger instance
+     * @param metrics metrics for recording
      */
-    explicit interface(std::shared_ptr<spdlog::logger> logger) : m_logger(logger) {}
+    interface(std::shared_ptr<spdlog::logger> logger, udp::metrics metrics)
+        : m_logger(logger), m_metrics(metrics) {}
 
     /**
      * @brief Logger instance
      */
     std::shared_ptr<spdlog::logger> m_logger;
+
+    /**
+     * @brief Metrics for recording
+     */
+    udp::metrics m_metrics;
 
     std::atomic<uint64_t> m_pkts_recvd{0};      ///< Total packets received
 

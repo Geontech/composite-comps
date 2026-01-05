@@ -56,7 +56,7 @@ struct mbuf_release {
 namespace udp {
 
 dpdk::dpdk(const config& cfg) :
-  interface(cfg.logger),
+  interface(cfg.logger, cfg.metrics),
   m_config(cfg) {
     // Get DPDK manager and acquire resources
     auto& dpdk_mgr = composite::dpdk::manager::instance();
@@ -302,6 +302,9 @@ auto dpdk::receive(std::stop_token token) -> void {
             continue;
         }
 
+        // Record batch size metric
+        m_metrics.batch_sizes.record(static_cast<double>(nb_rx));
+
         // Process each received packet
         for (uint16_t i = 0; i < nb_rx; i++) {
             struct rte_mbuf* mbuf = pkts[i];
@@ -317,6 +320,8 @@ auto dpdk::receive(std::stop_token token) -> void {
 
             if (payload.valid) {
                 m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
+                m_metrics.packets_received.inc();
+                m_metrics.bytes_received.add(payload.length);
 
                 // Wrap payload in external_buffer with DPDK mbuf release callback (zero-allocation)
                 auto buffer = composite::external_buffer<uint8_t>(
@@ -327,6 +332,7 @@ auto dpdk::receive(std::stop_token token) -> void {
                 m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
             } else {
                 m_pkts_dropped.fetch_add(1, std::memory_order_relaxed);
+                m_metrics.packets_dropped.inc();
                 rte_pktmbuf_free(mbuf);
             }
         }

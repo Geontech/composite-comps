@@ -20,6 +20,7 @@
 #include "socket/interface.hpp"
 
 #include <composite/composite.hpp>
+#include <composite/metrics/metrics.hpp>
 
 #include <array>
 #include <memory>
@@ -84,8 +85,15 @@ private:
     bool m_component_running{false};
     bool m_receiver_running{false};
 
+    // Metrics
+    composite::metrics::counter<uint64_t>* m_packets_received{nullptr};
+    composite::metrics::counter<uint64_t>* m_bytes_received{nullptr};
+    composite::metrics::counter<uint64_t>* m_packets_dropped{nullptr};
+    composite::metrics::histogram* m_batch_sizes{nullptr};
+
     auto start_receiver_locked() -> void;
     auto stop_receiver_locked() -> void;
+    auto create_metrics() -> udp::metrics;
 
 }; // class udp_source
 
