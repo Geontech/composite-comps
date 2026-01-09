@@ -15,10 +15,28 @@
 #include <composite/buffers/slab_pool.hpp>
 #include <composite/composite.hpp>
 
-// Forward declaration
+#include "ring_buffer.hpp"
+
+// Forward declarations
 template <typename T>
 class fft_plan;
 
+namespace pfbc {
+class engine_interface;
+}
+
+// =============================================================================
+// Polyphase Filter Bank Channelizer
+// =============================================================================
+//
+// High-performance PFBC using policy-based processing engine:
+//
+//   M=8:       Fused in-register pipeline (filter → FFT → transpose in ZMM)
+//   M>=64:     L1-tiled processing (8-row tiles stay hot in cache)
+//   Other M:   Staged batch processing
+//
+// Component manages all state; engine provides templated tile processing.
+//
 class polyphase_channelizer : public composite::component {
     // Test access
     friend struct PfbcTestFixture;
@@ -30,87 +48,93 @@ public:
     using input_port_t = composite::input_port<input_t>;
     using output_port_t = composite::output_port<input_t>;
 
+    static constexpr std::size_t TILE_SIZE = 8;
+
     explicit polyphase_channelizer(std::string_view id);
-    ~polyphase_channelizer() override = default;
+    ~polyphase_channelizer() override;
 
     auto property_change_handler() -> void override;
     auto process() -> composite::retval override;
 
 private:
-    // Configuration and validation
+    // -------------------------------------------------------------------------
+    // Configuration and Lifecycle
+    // -------------------------------------------------------------------------
     auto configure() -> bool;
     auto validate_properties() const -> bool;
     auto allocate_buffers() -> void;
     auto reset_state() -> void;
     auto prepare_coefficients() -> void;
 
-    // Processing stages
-    auto emit_frames(composite::timestamp base_ts) -> void;
+    // -------------------------------------------------------------------------
+    // Processing Pipeline
+    // -------------------------------------------------------------------------
+    auto process_tile() -> void;
+    auto process_partial_tile(std::size_t count) -> void;
 
+    // -------------------------------------------------------------------------
+    // Output Buffer Management
+    // -------------------------------------------------------------------------
+    auto emit_frame() -> void;
+    auto acquire_output_buffers() -> void;
+
+    // -------------------------------------------------------------------------
     // Ports
+    // -------------------------------------------------------------------------
     input_port_t m_data_in{"data_in"};
     output_port_t m_data_out{"data_out"};
 
+    // -------------------------------------------------------------------------
     // Properties (configurable)
-    uint32_t m_num_channels{64};       // M - must be power of 2
-    uint32_t m_taps_per_phase{16};     // K - filter length per polyphase arm
-    uint32_t m_frame_size{1024};       // N - samples per channel output frame
-    std::vector<float> m_prototype_filter{}; // M*K taps, lowpass prototype
-    uint32_t m_num_threads{4};         // OpenMP threads for filter stage
+    // -------------------------------------------------------------------------
+    uint32_t m_num_channels{64};
+    uint32_t m_taps_per_phase{16};
+    uint32_t m_frame_size{1024};
+    std::vector<float> m_prototype_filter{};
 
-    // Internal state - interleaved coefficients (prepared once at configure)
-    // Layout: [tap0: p0,p0,p1,p1,...,pM-1,pM-1][tap1: ...][...]
-    // Each coefficient is doubled for complex multiply: h * (re,im) = (h*re, h*im)
-    // Size: M * K * 2 floats (64-byte aligned for AVX-512)
+    // -------------------------------------------------------------------------
+    // Processing Engine (templated tile dispatch)
+    // -------------------------------------------------------------------------
+    std::unique_ptr<pfbc::engine_interface> m_engine;
+
+    // -------------------------------------------------------------------------
+    // Ring Buffer
+    // -------------------------------------------------------------------------
+    pfbc::cf32_ring_buffer m_ring;
+
+    // -------------------------------------------------------------------------
+    // Coefficients
+    // -------------------------------------------------------------------------
     std::unique_ptr<composite::aligned_mem<float>> m_coeffs;
 
-    // History length (K-1 rows needed for FIR filter continuity)
-    std::size_t m_history_len{0};  // K - 1
+    // -------------------------------------------------------------------------
+    // L1 Scratch Buffer
+    // -------------------------------------------------------------------------
+    std::unique_ptr<composite::aligned_mem<cf32_t>> m_l1_scratch;
 
-    // Internal state - filter output buffer (direct input to FFT)
-    // Layout: [t0: p0,p1,...,pM-1][t1: ...][...]
-    // Size: M * max_outputs samples (64-byte aligned)
-    std::unique_ptr<composite::aligned_mem<cf32_t>> m_filter_output;
-    std::size_t m_filter_output_capacity{0};
-
-    // Internal state - FFT (always FP32 for FFT library compatibility)
-    // FFT writes directly to frame buffer, no intermediate output buffer needed
+    // -------------------------------------------------------------------------
+    // FFT (for partial tile fallback)
+    // -------------------------------------------------------------------------
     std::unique_ptr<fft_plan<cf32_t>> m_fft;
 
-    // Internal state - time-major frame accumulator (contiguous FFT output writes)
-    // Layout: [t0: ch0,ch1,...,ch(M-1)][t1: ...][...]
-    // Size: M * N samples (always FP32 for FFT)
-    // Transposed on frame completion to channel-major output buffers.
-    std::unique_ptr<composite::aligned_mem<cf32_t>> m_frame_tm;
-    std::size_t m_frame_idx{0};  // Current sample index within frame (0..N-1)
-
-    // Output buffer pool - eliminates malloc/free from hot path
+    // -------------------------------------------------------------------------
+    // Output Buffers
+    // -------------------------------------------------------------------------
     std::shared_ptr<composite::slab_pool<cf32_t>> m_output_pool;
     std::vector<cf32_t*> m_output_ptrs;
     std::vector<std::optional<composite::external_buffer<cf32_t>>> m_output_buffers;
+    std::size_t m_frame_idx{0};
 
-    // History buffer - exactly (K-1)*M samples for FIR filter continuity
-    // Persists across calls, updated after each process() with last (K-1) rows
-    std::unique_ptr<composite::aligned_mem<cf32_t>> m_history;
-
-    // Boundary buffer - max((2K-2)*M, K*M) samples for boundary outputs + scratch.
-    // Used to assemble [history][first (K-1)*M of new data] for outputs that
-    // span the history/new-data boundary. Also used as K*M scratch when tail
-    // samples require assembling a full row for direct output.
-    std::unique_ptr<composite::aligned_mem<cf32_t>> m_boundary_buffer;
-
-    // Tail buffer - holds partial row (0 to M-1 samples) between calls
-    // When input doesn't divide evenly by M, leftover samples wait here
-    std::vector<cf32_t> m_tail;
-    std::size_t m_tail_len{0};
-
-    // Sample counter for timestamp calculation
-    // Tracks total input samples processed since the current time base
-    uint64_t m_stream_sample_idx{0};
+    // -------------------------------------------------------------------------
+    // Timestamp Tracking
+    // -------------------------------------------------------------------------
+    uint64_t m_samples_processed{0};
     bool m_ts_initialized{false};
-    composite::timestamp m_ts_base{0};  // Base timestamp for stream sample index 0
+    composite::timestamp m_ts_base{0};
 
-    // Metadata
+    // -------------------------------------------------------------------------
+    // Metadata and State
+    // -------------------------------------------------------------------------
     composite::metadata m_metadata{};
     bool m_configured{false};
 

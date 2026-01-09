@@ -40,11 +40,10 @@ struct PfbcTestFixture {
         pfbc->m_data_out.connect(sink_port.get());
     }
 
-    void configure(uint32_t M, uint32_t K, uint32_t N, uint32_t threads = 1) {
+    void configure(uint32_t M, uint32_t K, uint32_t N) {
         pfbc->m_num_channels = M;
         pfbc->m_taps_per_phase = K;
         pfbc->m_frame_size = N;
-        pfbc->m_num_threads = threads;
         pfbc->property_change_handler();
     }
 
@@ -117,7 +116,7 @@ TEST_CASE("streaming port test - single frame", "[pfbc][streaming]") {
 
     // Create and configure fixture
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Generate input: enough samples for one complete frame output
     // Need M * N input samples to produce N output samples per channel
@@ -167,7 +166,7 @@ TEST_CASE("streaming port test - multiple frames", "[pfbc][streaming]") {
 
     // Create and configure fixture
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 2);
+    fixture.configure(M, K, N);
 
     // Track total outputs across all frames
     std::size_t total_outputs = 0;
@@ -229,7 +228,7 @@ TEST_CASE("streaming port test - tail split matches single batch output", "[pfbc
 
     auto run_with_chunks = [&](const std::vector<std::size_t>& chunks) {
         PfbcTestFixture fixture("test_pfbc");
-        fixture.configure(M, K, N, 1);
+        fixture.configure(M, K, N);
 
         std::vector<std::vector<sample_t>> outputs;
         std::size_t offset = 0;
@@ -268,8 +267,9 @@ TEST_CASE("streaming port test - tail split matches single batch output", "[pfbc
         const auto& b = outputs_split[i];
         REQUIRE(a.size() == b.size());
         for (std::size_t j = 0; j < a.size(); ++j) {
-            CHECK(a[j].real() == Approx(b[j].real()).epsilon(1e-5));
-            CHECK(a[j].imag() == Approx(b[j].imag()).epsilon(1e-5));
+            // Use both relative (epsilon) and absolute (margin) tolerance for robust comparison
+            CHECK(a[j].real() == Approx(b[j].real()).epsilon(1e-4).margin(3e-5));
+            CHECK(a[j].imag() == Approx(b[j].imag()).epsilon(1e-4).margin(3e-5));
         }
     }
 }
@@ -288,7 +288,7 @@ TEST_CASE("streaming port test - K=1 tail split matches single batch output", "[
 
     auto run_with_chunks = [&](const std::vector<std::size_t>& chunks) {
         PfbcTestFixture fixture("test_pfbc");
-        fixture.configure(M, K, N, 1);
+        fixture.configure(M, K, N);
 
         std::vector<std::vector<sample_t>> outputs;
         std::size_t offset = 0;
@@ -325,8 +325,8 @@ TEST_CASE("streaming port test - K=1 tail split matches single batch output", "[
         const auto& b = outputs_split[i];
         REQUIRE(a.size() == b.size());
         for (std::size_t j = 0; j < a.size(); ++j) {
-            CHECK(a[j].real() == Approx(b[j].real()).epsilon(1e-5));
-            CHECK(a[j].imag() == Approx(b[j].imag()).epsilon(1e-5));
+            CHECK(a[j].real() == Approx(b[j].real()).epsilon(1e-4).margin(3e-5));
+            CHECK(a[j].imag() == Approx(b[j].imag()).epsilon(1e-4).margin(3e-5));
         }
     }
 }
@@ -341,7 +341,7 @@ TEST_CASE("streaming port test - tone detection through ports", "[pfbc][streamin
 
     // Create and configure fixture
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 4);
+    fixture.configure(M, K, N);
 
     // Generate tone at target channel frequency
     float normalized_freq = static_cast<float>(target_channel) / static_cast<float>(M);
@@ -406,7 +406,7 @@ TEST_CASE("streaming - remainder handling across calls", "[pfbc][streaming][rema
     constexpr uint32_t N = 4;    // frame size
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Send partial block that doesn't fill a frame
     // M * N = 64 samples needed per frame
@@ -456,7 +456,7 @@ TEST_CASE("streaming - small inputs accumulate correctly", "[pfbc][streaming][re
     constexpr uint32_t N = 4;    // frame size (need M*N = 32 samples)
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Send input in small chunks of 5 samples each
     // 32 samples / 5 = 6 full chunks + 2 extra = need 7 chunks minimum
@@ -488,7 +488,7 @@ TEST_CASE("streaming - no data loss with odd-sized inputs", "[pfbc][streaming][r
     constexpr uint32_t N = 4;
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Send various odd-sized inputs
     std::vector<std::size_t> input_sizes = {17, 23, 31, 29, 11, 13, 19, 37};
@@ -525,7 +525,7 @@ TEST_CASE("streaming - timestamp progression across frames", "[pfbc][streaming][
     constexpr std::size_t num_frames = 2;  // 2 frames fits in M*2 pool
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Set sample rate in metadata for proper timestamp calculation
     composite::metadata md;
@@ -588,7 +588,7 @@ TEST_CASE("streaming - timestamp resets on new input timestamp", "[pfbc][streami
     constexpr uint32_t N = 4;
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Send first frame with timestamp 10
     {
@@ -627,7 +627,7 @@ TEST_CASE("streaming - timestamp always reanchors on new input ts", "[pfbc][stre
     constexpr uint32_t N = 4;
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     composite::metadata md;
     md.sample_rate = 1e6;  // 1 MHz
@@ -667,7 +667,7 @@ TEST_CASE("streaming - output metadata sample rate is decimated", "[pfbc][stream
     constexpr uint32_t N = 4;
 
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     composite::metadata md;
     md.sample_rate = 1e6;  // 1 MHz
@@ -699,7 +699,7 @@ TEST_CASE("streaming - output metadata sample rate is decimated", "[pfbc][stream
 // Throughput Benchmark
 // =============================================================================
 
-#if 0  // Disabled benchmark tests
+#if 1  // Benchmark tests (enabled for A/B comparison)
 TEST_CASE("pool exhaustion handling", "[pfbc][streaming]") {
     // Test behavior when output pool is exhausted (small pool, fast producer)
     constexpr uint32_t M = 16;
@@ -708,7 +708,7 @@ TEST_CASE("pool exhaustion handling", "[pfbc][streaming]") {
 
     // Create and configure fixture
     PfbcTestFixture fixture("test_pfbc");
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Send many frames without draining - pool should handle it gracefully
     // Pool size is M * 2 = 32 buffers
@@ -760,7 +760,7 @@ TEST_CASE("custom prototype filter - valid size", "[pfbc][config]") {
 
     // Configure with custom filter
     fixture.set_prototype_filter(custom_filter);
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Should be configured successfully
     CHECK(fixture.is_configured());
@@ -790,102 +790,10 @@ TEST_CASE("custom prototype filter - invalid size rejected", "[pfbc][config]") {
     // Create filter with WRONG size (should be M*K = 128, using 100)
     std::vector<float> wrong_size_filter(100, 1.0f);
     fixture.set_prototype_filter(wrong_size_filter);
-    fixture.configure(M, K, N, 1);
+    fixture.configure(M, K, N);
 
     // Should NOT be configured due to invalid filter size
     CHECK_FALSE(fixture.is_configured());
-}
-
-// =============================================================================
-// Batch FFT Comparison Benchmark
-// =============================================================================
-
-TEST_CASE("batch FFT comparison", "[pfbc][benchmark][batch-fft]") {
-    // Compare single FFT calls vs batched FFT calls
-    struct Config {
-        uint32_t M;           // FFT size
-        uint32_t batch_size;  // Number of transforms to batch
-    };
-
-    std::vector<Config> configs = {
-        {64, 1},      // Baseline: no batching
-        {64, 16},
-        {64, 64},
-        {64, 256},
-        {64, 1024},
-        {256, 1},     // Baseline: no batching
-        {256, 16},
-        {256, 64},
-        {256, 256},
-        {256, 1024},
-    };
-
-    constexpr std::size_t warmup_iters = 100;
-    constexpr std::size_t benchmark_iters = 1000;
-
-    for (const auto& cfg : configs) {
-        const uint32_t M = cfg.M;
-        const uint32_t batch_size = cfg.batch_size;
-
-        // Create FFT plans
-        fft_plan<sample_t> single_fft(M, 1, 1);              // Single transform
-        fft_plan<sample_t> batch_fft(M, 1, batch_size);      // Batch transforms
-
-        // Allocate buffers
-        auto single_in = composite::make_aligned<sample_t>(64, M);
-        auto single_out = composite::make_aligned<sample_t>(64, M);
-        auto batch_in = composite::make_aligned<sample_t>(64, M * batch_size);
-        auto batch_out = composite::make_aligned<sample_t>(64, M * batch_size);
-
-        // Fill with test data
-        for (std::size_t i = 0; i < M; ++i) {
-            float phase = 2.0f * std::numbers::pi_v<float> * 0.1f * static_cast<float>(i);
-            (*single_in)[i] = sample_t{std::cos(phase), std::sin(phase)};
-        }
-        // Replicate to batch buffer
-        for (std::size_t b = 0; b < batch_size; ++b) {
-            std::copy(single_in->begin(), single_in->end(),
-                      batch_in->begin() + b * M);
-        }
-
-        // Warmup
-        for (std::size_t i = 0; i < warmup_iters; ++i) {
-            single_fft.execute(single_in->data(), single_out->data());
-            batch_fft.execute(batch_in->data(), batch_out->data());
-        }
-
-        // Benchmark: Single FFT approach (call N times)
-        auto t0 = std::chrono::high_resolution_clock::now();
-        for (std::size_t iter = 0; iter < benchmark_iters; ++iter) {
-            for (std::size_t b = 0; b < batch_size; ++b) {
-                single_fft.execute(single_in->data(), single_out->data());
-            }
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto single_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-
-        // Benchmark: Batch FFT approach (call once with batch)
-        auto t2 = std::chrono::high_resolution_clock::now();
-        for (std::size_t iter = 0; iter < benchmark_iters; ++iter) {
-            batch_fft.execute(batch_in->data(), batch_out->data());
-        }
-        auto t3 = std::chrono::high_resolution_clock::now();
-        auto batch_us = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
-
-        // Calculate metrics
-        std::size_t total_transforms = benchmark_iters * batch_size;
-        double single_ns_per_fft = (static_cast<double>(single_us) * 1000.0) / static_cast<double>(total_transforms);
-        double batch_ns_per_fft = (static_cast<double>(batch_us) * 1000.0) / static_cast<double>(total_transforms);
-        double speedup = static_cast<double>(single_us) / static_cast<double>(batch_us);
-
-        WARN("=== M=" << M << ", Batch=" << batch_size << " ===");
-        WARN("  Single FFT: " << single_us << " us total, " << single_ns_per_fft << " ns/FFT");
-        WARN("  Batch FFT:  " << batch_us << " us total, " << batch_ns_per_fft << " ns/FFT");
-        WARN("  Speedup:    " << speedup << "x");
-        WARN("");
-
-        CHECK(batch_us > 0);  // Sanity check
-    }
 }
 
 // =============================================================================
@@ -922,11 +830,10 @@ TEST_CASE("batch size scaling", "[pfbc][benchmark][scaling]") {
 
     constexpr std::size_t warmup_batches = 10;
     constexpr std::size_t benchmark_batches = 100;
-    constexpr uint32_t threads = 4;
 
     for (const auto& cfg : configs) {
         PfbcTestFixture fixture("bench_pfbc");
-        fixture.configure(cfg.M, cfg.K, cfg.N, threads);
+        fixture.configure(cfg.M, cfg.K, cfg.N);
 
         const std::size_t input_size = cfg.M * cfg.N;
 

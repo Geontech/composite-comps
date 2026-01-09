@@ -46,8 +46,23 @@ function(add_pfbc_test TEST_NAME SOURCE_FILE)
     target_compile_options(${TEST_NAME} PRIVATE -march=x86-64-v3 -mtune=generic)
 endfunction()
 
-# Unit tests for new SIMD kernels (commutator, filter, gather)
-add_pfbc_test(pfbc_kernel_tests kernel_tests.cpp)
+# Unit tests for new SIMD kernels (commutator, filter, gather, fft8)
+add_executable(pfbc_kernel_tests kernel_tests.cpp)
+target_link_libraries(pfbc_kernel_tests
+    PRIVATE
+        Catch2::Catch2WithMain
+        composite::composite
+        Threads::Threads
+        ${FFTW3F_LIBRARIES}
+)
+target_include_directories(pfbc_kernel_tests
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${PROJECT_SOURCE_DIR}/../../../include
+        ${FFTW3F_INCLUDE_DIRS}
+)
+target_compile_features(pfbc_kernel_tests PRIVATE cxx_std_23)
+target_compile_options(pfbc_kernel_tests PRIVATE -march=x86-64-v3 -mtune=generic)
 
 # Integration tests (requires component.cpp and FFTW)
 add_executable(pfbc_integration_tests

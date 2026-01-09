@@ -22,30 +22,23 @@ add_compile_options(-march=native -mtune=native)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFTW3F REQUIRED fftw3f)
 
-# Library
+# PFBC Component Library
 add_library(pfbc MODULE
     component.cpp
 )
 
-# Includes
 target_include_directories(pfbc
     PRIVATE
     ${PROJECT_SOURCE_DIR}/../../../include
     ${FFTW3F_INCLUDE_DIRS}
 )
 
-# Link
 target_link_libraries(pfbc
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
     ${FFTW3F_LIBRARIES}
     fftw3f_threads
-)
-
-# Install
-install(TARGETS pfbc
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 
 # Tests

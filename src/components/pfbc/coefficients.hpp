@@ -77,4 +77,69 @@ inline auto prepare_interleaved_coeffs(
     return result;
 }
 
+// =============================================================================
+// Blocked Coefficient Layout (Optimized for Linear Access)
+// =============================================================================
+//
+// Layout: [Block0: tap0..tapK][Block1: tap0..tapK]...[BlockN: tap0..tapK]
+//
+// Within each block's tap:
+//   [ch0, ch0, ch1, ch1, ch2, ch2, ch3, ch3, ch4, ch4, ch5, ch5, ch6, ch6, ch7, ch7]
+//   (8 channels × 2 for I/Q duplication = 16 floats = 1 ZMM register)
+//
+// Memory access pattern in hot loop:
+//   - Outer loop: iterate over blocks (groups of 8 channels)
+//   - Inner loop: iterate over taps
+//   - Tap-to-tap stride: 16 floats (contiguous! prefetcher heaven)
+//
+// Comparison:
+//   Old layout: coeffs[tap * M*2 + phase*2]  → M*2 stride between taps
+//   New layout: coeffs[block * K*16 + tap*16] → 16 stride between taps (LINEAR!)
+//
+inline auto prepare_blocked_coeffs(
+    const std::vector<std::vector<float>>& phase_coeffs,
+    std::size_t num_channels,
+    std::size_t taps_per_phase
+) -> std::vector<float>
+{
+    constexpr std::size_t BLOCK_WIDTH = 8;      // Channels per AVX-512 register
+    constexpr std::size_t FLOATS_PER_BLOCK = 16; // 8 channels × 2 (I/Q duplication)
+
+    const std::size_t num_blocks = num_channels / BLOCK_WIDTH;
+
+    // Total size: M * K * 2 (same total as interleaved, different arrangement)
+    std::vector<float> result(num_channels * taps_per_phase * 2);
+
+    float* dst = result.data();
+
+    // Outer loop: Blocks (groups of 8 channels)
+    for (std::size_t block = 0; block < num_blocks; ++block) {
+        // Inner loop: Taps (contiguous in memory!)
+        for (std::size_t tap = 0; tap < taps_per_phase; ++tap) {
+            // Fill one ZMM register payload (8 channels, duplicated)
+            for (std::size_t i = 0; i < BLOCK_WIDTH; ++i) {
+                const std::size_t ch = block * BLOCK_WIDTH + i;
+                const float h = phase_coeffs[ch][tap];
+
+                // Duplicate for complex multiply: h * (re, im) = (h*re, h*im)
+                *dst++ = h;
+                *dst++ = h;
+            }
+        }
+    }
+
+    return result;
+}
+
+// Get pointer to start of a block's coefficients
+inline auto get_block_coeffs_ptr(
+    const float* coeffs,
+    std::size_t block_idx,
+    std::size_t taps_per_phase
+) -> const float*
+{
+    constexpr std::size_t FLOATS_PER_BLOCK = 16;
+    return coeffs + block_idx * taps_per_phase * FLOATS_PER_BLOCK;
+}
+
 } // namespace pfbc

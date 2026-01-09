@@ -3,27 +3,31 @@
 
 #include "component.hpp"
 #include "coefficients.hpp"
-#include "kernels.hpp"
 #include "fft_plan.hpp"
+#include "pfbc_engine.hpp"
 
 #include <composite/buffers/external_buffer.hpp>
 
 #include <algorithm>
 #include <bit>
-#include <cmath>
 #include <chrono>
 #include <cstring>
 #include <format>
-#include <numbers>
 #include <stdexcept>
 #include <string_view>
-#include <vector>
 
-polyphase_channelizer::polyphase_channelizer(std::string_view id) : composite::component(id) {
+// =============================================================================
+// Constructor / Destructor
+// =============================================================================
+
+polyphase_channelizer::polyphase_channelizer(std::string_view id)
+    : composite::component(id)
+{
     add_port(&m_data_in);
     add_port(&m_data_out);
 
     using enum composite::properties::config_type;
+
     add_property("num_channels", m_num_channels).change_listener([this]() {
         return m_num_channels > 0 && std::has_single_bit(m_num_channels);
     });
@@ -41,9 +45,20 @@ polyphase_channelizer::polyphase_channelizer(std::string_view id) : composite::c
     add_property("prototype_filter", m_prototype_filter);
 }
 
+polyphase_channelizer::~polyphase_channelizer() = default;
+
+// =============================================================================
+// Configuration
+// =============================================================================
+
 auto polyphase_channelizer::validate_properties() const -> bool {
     if (m_num_channels == 0 || !std::has_single_bit(m_num_channels)) {
         logger()->error("pfbc: num_channels ({}) must be a power of 2", m_num_channels);
+        return false;
+    }
+
+    if (m_num_channels < 8) {
+        logger()->error("pfbc: num_channels ({}) must be at least 8", m_num_channels);
         return false;
     }
 
@@ -57,7 +72,6 @@ auto polyphase_channelizer::validate_properties() const -> bool {
         return false;
     }
 
-    // Validate prototype filter if provided
     if (!m_prototype_filter.empty()) {
         const auto expected_size = static_cast<std::size_t>(m_num_channels) * m_taps_per_phase;
         if (m_prototype_filter.size() != expected_size) {
@@ -75,7 +89,6 @@ auto polyphase_channelizer::prepare_coefficients() -> void {
     const auto K = static_cast<std::size_t>(m_taps_per_phase);
     const auto N = M * K;
 
-    // Generate or use provided prototype filter
     std::vector<float> prototype;
     if (!m_prototype_filter.empty()) {
         prototype = m_prototype_filter;
@@ -86,13 +99,13 @@ auto polyphase_channelizer::prepare_coefficients() -> void {
     }
 
     auto phase_coeffs = pfbc::build_phase_coeffs(prototype, M, K);
-    auto interleaved = pfbc::prepare_interleaved_coeffs(phase_coeffs, M, K);
+    auto blocked = pfbc::prepare_blocked_coeffs(phase_coeffs, M, K);
 
-    // Copy to aligned storage
-    m_coeffs = composite::make_aligned<float>(64, interleaved.size());
-    std::copy(interleaved.begin(), interleaved.end(), m_coeffs->begin());
+    m_coeffs = composite::make_aligned<float>(64, blocked.size());
+    std::copy(blocked.begin(), blocked.end(), m_coeffs->begin());
 
-    logger()->debug("pfbc: prepared interleaved coefficients ({} floats)", interleaved.size());
+    logger()->debug("pfbc: prepared blocked coefficients ({} floats, {} blocks)",
+                   blocked.size(), M / 8);
 }
 
 auto polyphase_channelizer::allocate_buffers() -> void {
@@ -100,80 +113,60 @@ auto polyphase_channelizer::allocate_buffers() -> void {
     const auto K = static_cast<std::size_t>(m_taps_per_phase);
     const auto N = static_cast<std::size_t>(m_frame_size);
 
-    // Prepare interleaved coefficients
+    // Coefficients
     prepare_coefficients();
 
-    // Calculate history requirements: (K-1) time steps, M samples each
-    m_history_len = K > 0 ? K - 1 : 0;
-    const std::size_t history_samples = m_history_len * M;
+    // Ring Buffer
+    const std::size_t history_samples = (K - 1) * M;
+    const std::size_t processing_samples = N * M * 4;
+    const std::size_t min_capacity = history_samples + processing_samples;
 
-    // Allocate history buffer - exactly (K-1)*M samples
-    m_history = composite::make_aligned<cf32_t>(64, history_samples);
+    m_ring.allocate(min_capacity);
+    m_ring.prefill_zeros(history_samples);
 
-    // Allocate boundary buffer - enough for boundary outputs plus a full K-row scratch.
-    // Boundary outputs (first K-1) span history + new data, need assembled input.
-    // The direct-output tail path also needs a full K*M scratch (K can be 1).
-    const std::size_t boundary_rows = std::max<std::size_t>(2 * K - 2, K);
-    const std::size_t boundary_samples = boundary_rows * M;
-    m_boundary_buffer = composite::make_aligned<cf32_t>(64, boundary_samples);
+    logger()->debug("pfbc: ring buffer capacity {} samples ({} KB)",
+                   m_ring.capacity(), m_ring.capacity() * sizeof(cf32_t) / 1024);
 
-    // Allocate tail buffer - up to M-1 samples for partial rows between calls
-    m_tail.resize(M);
-    m_tail_len = 0;
+    // L1 Scratch Buffer
+    const std::size_t scratch_samples = TILE_SIZE * M;
+    m_l1_scratch = composite::make_aligned<cf32_t>(64, scratch_samples);
 
-    // Allocate filter output buffer (64-byte aligned)
-    // Size based on expected max input block size
-    // Layout: [t0: p0,p1,...,pM-1][t1: ...][...]
-    constexpr std::size_t INITIAL_OUTPUT_CAPACITY = 8192;
-    m_filter_output_capacity = INITIAL_OUTPUT_CAPACITY;
-    m_filter_output = composite::make_aligned<cf32_t>(64, M * m_filter_output_capacity);
+    logger()->debug("pfbc: L1 scratch {} samples ({} KB)",
+                   scratch_samples, scratch_samples * sizeof(cf32_t) / 1024);
 
-    // Initialize FFT plan (single FFT, single-threaded FFTW)
-    // FFT writes directly to frame buffer, no intermediate output buffer needed
+    // FFT plan (for partial tiles)
     m_fft = std::make_unique<fft_plan<cf32_t>>(static_cast<uint32_t>(M));
 
-    // Allocate time-major frame buffer (64-byte aligned)
-    // Layout: [t0: ch0,ch1,...,ch(M-1)][t1: ...][...]
-    // Size: M * N samples
-    // Time-major enables contiguous writes from FFT output.
-    m_frame_tm = composite::make_aligned<cf32_t>(64, M * N);
-
-    // Allocate output buffer pool - M channels * 2 for pipeline headroom
-    // Each buffer holds N samples for one channel's frame
-    m_output_pool = composite::slab_pool<cf32_t>::create(N, M * 2);
+    // Output Buffer Pool
+    m_output_pool = composite::slab_pool<cf32_t>::create(N, M * 8);
     m_output_ptrs.resize(M, nullptr);
     m_output_buffers.resize(M);
 
-    logger()->debug("pfbc: allocated buffers - M={}, K={}, N={}, history={} samples",
-                   M, K, N, M * m_history_len);
+    logger()->debug("pfbc: allocated - M={}, K={}, N={}, tile_size={}",
+                   M, K, N, TILE_SIZE);
 }
 
 auto polyphase_channelizer::reset_state() -> void {
     m_frame_idx = 0;
+    m_samples_processed = 0;
+    m_ts_initialized = false;
+    m_ts_base = composite::timestamp{};
 
-    // Zero out history buffer
-    if (m_history) {
-        std::fill(m_history->begin(), m_history->end(), cf32_t{0.0f, 0.0f});
+    if (m_ring.is_allocated()) {
+        const auto M = static_cast<std::size_t>(m_num_channels);
+        const auto K = static_cast<std::size_t>(m_taps_per_phase);
+        m_ring.reset();
+        m_ring.prefill_zeros((K - 1) * M);
     }
 
-    // Reset tail
-    m_tail_len = 0;
-
-    // Zero out time-major frame buffer
-    if (m_frame_tm) {
-        std::fill(m_frame_tm->begin(), m_frame_tm->end(), cf32_t{0.0f, 0.0f});
+    if (m_l1_scratch) {
+        std::fill(m_l1_scratch->begin(), m_l1_scratch->end(), cf32_t{0.0f, 0.0f});
     }
 
-    // Release any acquired output buffers
     for (auto& buf : m_output_buffers) {
         buf.reset();
     }
     std::fill(m_output_ptrs.begin(), m_output_ptrs.end(), nullptr);
-
-    // Reset timestamp tracking
-    m_stream_sample_idx = 0;
-    m_ts_initialized = false;
-    m_ts_base = composite::timestamp{};
 }
 
 auto polyphase_channelizer::configure() -> bool {
@@ -184,12 +177,25 @@ auto polyphase_channelizer::configure() -> bool {
     }
 
     try {
+        const auto M = static_cast<std::size_t>(m_num_channels);
+        const auto K = static_cast<std::size_t>(m_taps_per_phase);
+
+        // Create processing engine (selects fused/tiled/batch based on M)
+        m_engine = pfbc::make_engine(M, K);
+        if (!m_engine) {
+            logger()->error("pfbc: failed to create engine (M={}, K={})", M, K);
+            return false;
+        }
+
         allocate_buffers();
         reset_state();
+        acquire_output_buffers();
+
         m_configured = true;
 
-        logger()->info("pfbc: configured with {} channels, {} taps/phase, {} frame size",
-                      m_num_channels, m_taps_per_phase, m_frame_size);
+        logger()->info("pfbc: configured - {} channels, {} taps/phase, {} frame size, policy={}",
+                      m_num_channels, m_taps_per_phase, m_frame_size, m_engine->name());
+
     } catch (const std::exception& e) {
         logger()->error("pfbc: configuration failed: {}", e.what());
         return false;
@@ -202,15 +208,17 @@ auto polyphase_channelizer::property_change_handler() -> void {
     configure();
 }
 
-auto polyphase_channelizer::emit_frames(composite::timestamp frame_ts) -> void {
-    const auto M = static_cast<std::size_t>(m_num_channels);
-    const auto N = static_cast<std::size_t>(m_frame_size);
+// =============================================================================
+// Output Buffer Management
+// =============================================================================
 
-    // Acquire output buffers from pool
+auto polyphase_channelizer::acquire_output_buffers() -> void {
+    const auto M = static_cast<std::size_t>(m_num_channels);
+
     for (std::size_t ch = 0; ch < M; ++ch) {
         auto pool_buf = m_output_pool->acquire();
         if (!pool_buf) {
-            logger()->warn("pfbc: output pool exhausted, dropping channel {} frame", ch);
+            logger()->warn("pfbc: output pool exhausted, channel {} unavailable", ch);
             m_output_ptrs[ch] = nullptr;
             m_output_buffers[ch].reset();
             continue;
@@ -218,11 +226,26 @@ auto polyphase_channelizer::emit_frames(composite::timestamp frame_ts) -> void {
         m_output_buffers[ch] = std::move(*pool_buf);
         m_output_ptrs[ch] = m_output_buffers[ch]->data();
     }
+}
 
-    // Transpose from m_frame_tm (time-major) to channel buffers
-    kernels::transpose_to_channel_buffers(m_frame_tm->data(), m_output_ptrs.data(), M, N);
+auto polyphase_channelizer::emit_frame() -> void {
+    const auto M = static_cast<std::size_t>(m_num_channels);
+    const auto N = static_cast<std::size_t>(m_frame_size);
 
-    // Send and release the buffers
+    composite::timestamp frame_ts{};
+    if (m_ts_initialized) {
+        if (m_metadata.sample_rate > 0.0) {
+            const uint64_t frame_start = m_samples_processed - N * M;
+            const double offset_seconds = static_cast<double>(frame_start) / m_metadata.sample_rate;
+            const auto offset_ns = std::chrono::nanoseconds(
+                static_cast<int64_t>(offset_seconds * 1e9)
+            );
+            frame_ts = m_ts_base + offset_ns;
+        } else {
+            frame_ts = m_ts_base;
+        }
+    }
+
     for (std::size_t ch = 0; ch < M; ++ch) {
         if (!m_output_buffers[ch].has_value()) {
             continue;
@@ -232,13 +255,80 @@ auto polyphase_channelizer::emit_frames(composite::timestamp frame_ts) -> void {
         m_output_buffers[ch].reset();
         m_output_ptrs[ch] = nullptr;
 
-        // Wrap pool buffer in immutable_buffer for port send (zero-allocation)
         auto out = composite::immutable_buffer<cf32_t>(std::move(buffer));
         m_data_out.send_data(out, frame_ts);
     }
 
     m_frame_idx = 0;
+    acquire_output_buffers();
 }
+
+// =============================================================================
+// Tile Processing
+// =============================================================================
+
+auto polyphase_channelizer::process_tile() -> void {
+    const auto M = static_cast<std::size_t>(m_num_channels);
+    const auto N = static_cast<std::size_t>(m_frame_size);
+
+    // Prepare write pointers offset by current frame index
+    std::vector<cf32_t*> write_ptrs(M);
+    for (std::size_t ch = 0; ch < M; ++ch) {
+        write_ptrs[ch] = m_output_ptrs[ch] ? m_output_ptrs[ch] + m_frame_idx : nullptr;
+    }
+
+    // Engine handles the processing (fused for M=8, staged otherwise)
+    m_engine->process_tile(
+        m_ring.read_ptr(),
+        m_coeffs->data(),
+        write_ptrs.data(),
+        m_l1_scratch->data(),
+        m_fft.get()
+    );
+
+    m_ring.consume(TILE_SIZE * M);
+    m_samples_processed += TILE_SIZE * M;
+    m_frame_idx += TILE_SIZE;
+
+    if (m_frame_idx >= N) {
+        emit_frame();
+    }
+}
+
+auto polyphase_channelizer::process_partial_tile(std::size_t count) -> void {
+    if (count == 0) return;
+
+    const auto M = static_cast<std::size_t>(m_num_channels);
+    const auto N = static_cast<std::size_t>(m_frame_size);
+
+    // Prepare write pointers offset by current frame index
+    std::vector<cf32_t*> write_ptrs(M);
+    for (std::size_t ch = 0; ch < M; ++ch) {
+        write_ptrs[ch] = m_output_ptrs[ch] ? m_output_ptrs[ch] + m_frame_idx : nullptr;
+    }
+
+    // Engine handles partial processing
+    m_engine->process_partial(
+        m_ring.read_ptr(),
+        m_coeffs->data(),
+        write_ptrs.data(),
+        m_l1_scratch->data(),
+        m_fft.get(),
+        count
+    );
+
+    m_ring.consume(count * M);
+    m_samples_processed += count * M;
+    m_frame_idx += count;
+
+    if (m_frame_idx >= N) {
+        emit_frame();
+    }
+}
+
+// =============================================================================
+// Main Processing Loop
+// =============================================================================
 
 auto polyphase_channelizer::process() -> composite::retval {
     using enum composite::retval;
@@ -252,218 +342,85 @@ auto polyphase_channelizer::process() -> composite::retval {
         return NOOP;
     }
 
-    // Handle metadata updates
+    // Handle metadata
     if (meta.has_value()) {
         m_metadata = meta.value();
         auto out_metadata = m_metadata;
         if (out_metadata.sample_rate > 0.0) {
-            out_metadata.sample_rate = out_metadata.sample_rate / static_cast<double>(m_num_channels);
+            out_metadata.sample_rate /= static_cast<double>(m_num_channels);
         }
         m_data_out.send_metadata(out_metadata);
     }
 
+    // Timestamp tracking
+    const composite::timestamp zero_ts{};
+    if (ts != zero_ts) {
+        m_ts_base = ts;
+        m_samples_processed = 0;
+        m_ts_initialized = true;
+    }
+
+    // Ingest input
     auto span = buffer.as_span();
+    m_ring.write(span.data(), span.size());
+
+    // Process tiles
     const auto M = static_cast<std::size_t>(m_num_channels);
     const auto K = static_cast<std::size_t>(m_taps_per_phase);
     const auto N = static_cast<std::size_t>(m_frame_size);
 
-    // =========================================================================
-    // Timestamp tracking
-    // =========================================================================
-    // The input timestamp corresponds to the first sample of the new batch,
-    // which starts after any remainder samples from the previous call.
-    const composite::timestamp zero_ts{};
-    const bool ts_present = (ts != zero_ts);
-    const auto sample_rate = m_metadata.sample_rate;
-    const bool has_rate = (sample_rate > 0.0);
+    const std::size_t min_for_tile = (K - 1 + TILE_SIZE) * M;
 
-    // =========================================================================
-    // Calculate available data and outputs
-    // =========================================================================
-    const std::size_t total_data_samples = m_tail_len + span.size();
-    const std::size_t num_outputs = total_data_samples / M;
+    while (m_ring.available() >= min_for_tile) {
+        const std::size_t remaining_in_frame = N - m_frame_idx;
 
-    if (num_outputs == 0) {
-        // Not enough samples for a complete row - accumulate in tail
-        std::memcpy(m_tail.data() + m_tail_len, span.data(), span.size() * sizeof(cf32_t));
-        m_tail_len += span.size();
-        return NORMAL;
-    }
+        if (remaining_in_frame >= TILE_SIZE) {
+            process_tile();
+        } else {
+            // Handle frame boundary - may span multiple frames when TILE_SIZE > N
+            std::size_t rows_to_process = TILE_SIZE;
 
-    // Timestamp tracking
-    if (ts_present && has_rate) {
-        const auto offset_seconds = static_cast<double>(m_stream_sample_idx + m_tail_len) / sample_rate;
-        const auto offset_ns = std::chrono::nanoseconds(
-            static_cast<int64_t>(offset_seconds * 1e9)
-        );
-        m_ts_base = ts - offset_ns;
-        m_ts_initialized = true;
-    } else if (ts_present) {
-        m_ts_base = ts;
-        m_ts_initialized = true;
-    }
+            while (rows_to_process > 0) {
+                const std::size_t space_in_frame = N - m_frame_idx;
+                const std::size_t batch = std::min(rows_to_process, space_in_frame);
 
-    // =========================================================================
-    // Interleaved filter+FFT processing for cache locality
-    // =========================================================================
-    const std::size_t boundary_outputs = std::min(m_history_len, num_outputs);
-    const std::size_t direct_outputs = num_outputs - boundary_outputs;
-    const std::size_t history_samples = m_history_len * M;
-
-    // Lambda to process a chunk: filter → FFT → frame accumulation
-    auto process_outputs = [&](const cf32_t* input, std::size_t count) {
-        // Process in small chunks to keep filter output in L1 cache for FFT
-        constexpr std::size_t CHUNK_SIZE = 32;  // Tune for L1 cache
-
-        for (std::size_t chunk_start = 0; chunk_start < count; chunk_start += CHUNK_SIZE) {
-            const std::size_t chunk_count = std::min(CHUNK_SIZE, count - chunk_start);
-            const cf32_t* chunk_input = input + chunk_start * M;
-
-            // Filter this chunk
-            kernels::filter_interleaved_dispatch(
-                chunk_input,
-                m_coeffs->data(),
-                m_filter_output->data(),
-                M,
-                chunk_count,
-                K
-            );
-
-            // FFT each row in chunk immediately (data still in cache)
-            for (std::size_t i = 0; i < chunk_count; ++i) {
-                cf32_t* fft_input = m_filter_output->data() + i * M;
-                cf32_t* fft_output = m_frame_tm->data() + m_frame_idx * M;
-                m_fft->execute(fft_input, fft_output);
-
-                ++m_frame_idx;
-                m_stream_sample_idx += M;
-
-                // Check if frame is complete
-                if (m_frame_idx >= N) {
-                    const uint64_t frame_start_sample = m_stream_sample_idx - N * M;
-                    composite::timestamp frame_ts = ts_present ? m_ts_base : composite::timestamp{};
-                    if (ts_present && has_rate) {
-                        const double offset_seconds = static_cast<double>(frame_start_sample) / sample_rate;
-                        const auto offset_ns = std::chrono::nanoseconds(
-                            static_cast<int64_t>(offset_seconds * 1e9)
-                        );
-                        frame_ts = m_ts_base + offset_ns;
-                    }
-                    emit_frames(frame_ts);
+                if (batch == 0 || m_ring.available() < (K - 1 + batch) * M) {
+                    break;
                 }
-            }
-        }
-    };
 
-    // Process boundary outputs (first K-1) - need assembled buffer with history
-    if (boundary_outputs > 0) {
-        // Assemble boundary buffer: [history: (K-1)*M][new data: boundary_outputs*M]
-        std::memcpy(m_boundary_buffer->data(), m_history->data(), history_samples * sizeof(cf32_t));
-
-        cf32_t* new_data_dst = m_boundary_buffer->data() + history_samples;
-        const std::size_t boundary_new_samples = boundary_outputs * M;
-        const std::size_t from_tail = std::min(m_tail_len, boundary_new_samples);
-        if (from_tail > 0) {
-            std::memcpy(new_data_dst, m_tail.data(), from_tail * sizeof(cf32_t));
-            new_data_dst += from_tail;
-        }
-        const std::size_t from_span = boundary_new_samples - from_tail;
-        if (from_span > 0) {
-            std::memcpy(new_data_dst, span.data(), from_span * sizeof(cf32_t));
-        }
-
-        process_outputs(m_boundary_buffer->data(), boundary_outputs);
-    }
-
-    // Process direct outputs - read directly from span when possible (NO COPY!)
-    if (direct_outputs > 0) {
-        if (m_tail_len == 0) {
-            // Simple case: all direct outputs from span
-            process_outputs(span.data(), direct_outputs);
-        } else {
-            // Tail present: first direct output needs assembled buffer
-            cf32_t* extra_buf = m_boundary_buffer->data();
-            std::memcpy(extra_buf, m_tail.data(), m_tail_len * sizeof(cf32_t));
-            std::memcpy(extra_buf + m_tail_len, span.data(), (K * M - m_tail_len) * sizeof(cf32_t));
-
-            process_outputs(extra_buf, 1);
-
-            // Remaining direct outputs read from span with offset
-            if (direct_outputs > 1) {
-                const cf32_t* remaining_input = span.data() + (M - m_tail_len);
-                process_outputs(remaining_input, direct_outputs - 1);
+                process_partial_tile(batch);
+                rows_to_process -= batch;
             }
         }
     }
 
-    // =========================================================================
-    // Stage 3: Update history and tail for next call
-    // =========================================================================
-    // History: last (K-1) rows from the combined (old_history + new_data) stream
-    // new_data = tail + span
-    //
-    // After processing num_outputs, new history starts at combined sample num_outputs*M
-    // Combined layout: [old_history: (K-1)*M][new_data: tail + span]
+    // Process remaining partial rows for lower latency
+    const std::size_t history_needed = (K - 1) * M;
 
-    const std::size_t history_start_combined = num_outputs * M;
+    while (m_ring.available() > history_needed) {
+        const std::size_t avail = m_ring.available();
+        const std::size_t rows_available = (avail - history_needed) / M;
 
-    if (history_start_combined >= history_samples) {
-        // Common case: history entirely from new_data
-        const std::size_t start_in_newdata = history_start_combined - history_samples;
-
-        if (start_in_newdata >= m_tail_len) {
-            // All from span (most common)
-            std::memcpy(m_history->data(),
-                        span.data() + (start_in_newdata - m_tail_len),
-                        history_samples * sizeof(cf32_t));
-        } else {
-            // Spans tail and span
-            const std::size_t from_tail = m_tail_len - start_in_newdata;
-            std::memcpy(m_history->data(), m_tail.data() + start_in_newdata, from_tail * sizeof(cf32_t));
-            std::memcpy(m_history->data() + from_tail, span.data(), (history_samples - from_tail) * sizeof(cf32_t));
+        if (rows_available == 0 || rows_available >= TILE_SIZE) {
+            break;  // No partial rows or enough for full tile (handled above)
         }
-    } else {
-        // Rare case: history spans old history and new_data (small input batch)
-        const std::size_t from_old = history_samples - history_start_combined;
-        const std::size_t from_new = history_samples - from_old;
 
-        // Shift old history within m_history buffer
-        std::memmove(m_history->data(), m_history->data() + history_start_combined, from_old * sizeof(cf32_t));
+        const std::size_t space_in_frame = N - m_frame_idx;
+        const std::size_t rows_to_process = std::min(rows_available, space_in_frame);
 
-        // Append from new_data (tail + span)
-        cf32_t* dst = m_history->data() + from_old;
-        if (from_new <= m_tail_len) {
-            std::memcpy(dst, m_tail.data(), from_new * sizeof(cf32_t));
-        } else {
-            if (m_tail_len > 0) {
-                std::memcpy(dst, m_tail.data(), m_tail_len * sizeof(cf32_t));
-            }
-            std::memcpy(dst + m_tail_len, span.data(), (from_new - m_tail_len) * sizeof(cf32_t));
+        if (rows_to_process == 0) {
+            break;
         }
+
+        process_partial_tile(rows_to_process);
     }
-
-    // Update tail with leftover samples
-    const std::size_t leftover = total_data_samples - num_outputs * M;
-    if (leftover > 0) {
-        // Leftover is at end of new_data = tail + span
-        // leftover_start_in_newdata = num_outputs * M
-        const std::size_t leftover_start = num_outputs * M;
-        if (leftover_start >= m_tail_len) {
-            // Leftover entirely in span
-            std::memcpy(m_tail.data(),
-                        span.data() + (leftover_start - m_tail_len),
-                        leftover * sizeof(cf32_t));
-        } else {
-            // Leftover spans tail and span (shouldn't happen with M-aligned, but handle it)
-            const std::size_t from_old_tail = m_tail_len - leftover_start;
-            std::memmove(m_tail.data(), m_tail.data() + leftover_start, from_old_tail * sizeof(cf32_t));
-            std::memcpy(m_tail.data() + from_old_tail, span.data(), (leftover - from_old_tail) * sizeof(cf32_t));
-        }
-    }
-    m_tail_len = leftover;
 
     return NORMAL;
 }
+
+// =============================================================================
+// Component Factory
+// =============================================================================
 
 extern "C" {
     auto create(std::string_view id) -> std::shared_ptr<composite::component> {

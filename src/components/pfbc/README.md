@@ -1,13 +1,14 @@
 # Polyphase Filter Bank Channelizer (PFBC)
 
-A high-performance polyphase filter bank channelizer component for the composite framework. Splits a wideband input signal into M narrowband channel outputs using an efficient polyphase filterbank decomposition.
+A high-performance polyphase filter bank channelizer component for the composite framework. Splits a wideband input signal into M narrowband channel outputs using an efficient polyphase filterbank decomposition with AVX-512 optimized kernels.
 
 ## Overview
 
 The PFBC implements a critically-sampled analysis filterbank using:
 - Polyphase decomposition of the prototype lowpass filter
-- Interleaved SIMD polyphase FIR filtering (single contiguous stream)
-- FFT-based channelization via FFTW single-precision
+- Blocked SIMD polyphase FIR filtering optimized for AVX-512
+- Custom in-register FFT kernels for M=8, 16, 32 (no FFTW overhead)
+- FFTW fallback for larger channel counts
 
 ## Properties
 
@@ -15,7 +16,7 @@ The PFBC implements a critically-sampled analysis filterbank using:
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `num_channels` | uint32_t | Number of output channels M (must be power of 2, ≥8 for AVX-512 kernels) |
+| `num_channels` | uint32_t | Number of output channels M (must be power of 2, ≥8) |
 | `taps_per_phase` | uint32_t | FIR taps per polyphase branch K |
 | `frame_size` | uint32_t | Output samples per channel per frame N |
 | `prototype_filter` | vector\<float\> | Custom prototype filter (M*K taps). If empty, uses default sinc-windowed lowpass |
@@ -25,67 +26,135 @@ The PFBC implements a critically-sampled analysis filterbank using:
 - **data_in**: `input_port<immutable_buffer<complex<float>>>` - Wideband input samples (read-only)
 - **data_out**: `output_port<immutable_buffer<complex<float>>>` - Per-channel output frames (pool-backed)
 
+## Engine Policies
+
+The PFBC uses compile-time policy selection based on channel count M:
+
+| M | Policy | Description | Throughput |
+|---|--------|-------------|------------|
+| 8 | `fused_m8_vertical` | In-register vertical FFT-8, fully fused pipeline | ~458 Msps |
+| 16 | `fused_m16_vertical` | In-register vertical FFT-16, fully fused pipeline | ~417 Msps |
+| 32 | `hybrid_m32` | In-register FFT-32, L1 scratch transpose | ~218 Msps |
+| ≥64 | `staged` | Filter → FFTW → transpose via L1 scratch | ~150-207 Msps |
+
 ## Processing Pipeline
 
-Each M-sample input block flows through a 2-stage pipeline:
+### Fused Pipeline (M=8, 16)
 
-1. **Interleaved polyphase filter**: Apply K-tap FIR filter across all phases in one pass
-   - Input stays time-major interleaved (`[t0: p0..pM-1][t1: ...]`)
-   - Coefficients are interleaved to match complex layout for SIMD FMAs
-
-2. **FFT**: M-point FFT transforms to frequency domain, output accumulates
-   - FFT output writes directly into per-channel frame accumulators
-   - When N samples accumulate per channel, frames are emitted
-
-When N samples have accumulated per channel, frames are emitted on `data_out`.
-
-## Architecture
+For small channel counts, the entire pipeline runs in AVX-512 registers:
 
 ```
-Input (M samples)
+Input (tile of 8 rows × M channels)
       ↓
-+---------------------------+
-| Interleaved Polyphase FIR |  M phases in one pass
-| (time-major, SIMD)        |  coefficients interleaved for FMAs
-+---------------------------+
++----------------------------------+
+| Blocked Polyphase FIR            |  8 rows accumulated in registers
+| (8 ZMM accumulators)             |
++----------------------------------+
       ↓
-+------------------+
-| M-point FFT      |  FFTW single-precision
-+------------------+  Output directly to accumulators
++----------------------------------+
+| 8×M Transpose (in registers)     |  Row-major → column-major
++----------------------------------+
       ↓
-+--------------------+
-| Frame Accumulators | Gather N samples per channel
-+--------------------+
++----------------------------------+
+| Vertical FFT-M                   |  8 parallel FFTs, no shuffles
+| (M separate FFTs per ZMM lane)   |
++----------------------------------+
       ↓
-Output (M channels × N samples per frame)
+Direct scatter to M channel buffers
+```
+
+### Hybrid Pipeline (M=32)
+
+For M=32, filter+FFT runs in registers, transpose uses L1 scratch:
+
+```
+Input (tile of 4 rows × 32 channels)
+      ↓
++----------------------------------+
+| Blocked Polyphase FIR            |  16 ZMM accumulators (4 rows × 4 regs)
++----------------------------------+
+      ↓
++----------------------------------+
+| In-Register FFT-32               |  4 ZMMs per row, sequential
++----------------------------------+
+      ↓
++----------------------------------+
+| L1 Scratch (4×32 samples)        |  Store FFT output
++----------------------------------+
+      ↓
++----------------------------------+
+| 4×32 Transpose                   |  Two 4×16 transpose passes
++----------------------------------+
+      ↓
+Scatter to 32 channel buffers
+```
+
+### Staged Pipeline (M≥64)
+
+For larger channel counts, uses FFTW:
+
+```
+Input (tile of 8 rows × M channels)
+      ↓
++----------------------------------+
+| Blocked Polyphase FIR            |  Output to L1 scratch
++----------------------------------+
+      ↓
++----------------------------------+
+| FFTW M-point FFT (per row)       |  In-place on scratch
++----------------------------------+
+      ↓
++----------------------------------+
+| SIMD Transpose                   |  Scratch → channel buffers
++----------------------------------+
 ```
 
 ## Performance Optimizations
 
-### Interleaved SIMD Kernel (kernels_interleaved.hpp)
+### Vertical FFT (M=8, 16)
 
-Kernels are pure functions with no side effects, optimized for AVX-512:
+The vertical FFT approach processes 8 parallel FFTs simultaneously:
+- Each ZMM lane holds one sample from each of 8 different FFTs
+- No cross-lane shuffles during FFT computation
+- Direct scatter-store to channel buffers (no post-FFT transpose)
+- ~4.5x faster than FFTW-based pipeline
 
-1. **Interleaved polyphase filter** (`filter_interleaved`)
-   - Processes all M phases in one sequential memory stream
-   - Specialized kernels for M = 8/16/32/64/128 with time unrolling
-   - Generic AVX-512 path for other channel counts
+### Blocked Coefficient Layout
+
+Coefficients are arranged for optimal cache access:
+```
+Block 0 (channels 0-7):   [tap0: h0,h0,h1,h1,...,h7,h7][tap1: ...][...]
+Block 1 (channels 8-15):  [tap0: h8,h8,h9,h9,...][tap1: ...][...]
+...
+```
+- Taps contiguous within each block (prefetcher optimal)
+- Each coefficient duplicated for complex multiply: h × (re,im) = (h×re, h×im)
 
 ### Zero-Allocation Hot Path
-- **Output buffer pool**: `slab_pool` pre-allocates output buffers, eliminating malloc/free from the processing loop
-- **Pool-backed immutable_buffer**: Output buffers automatically return to pool when downstream releases them
 
-### Cache-Friendly Memory Layout
-- **Time-major interleaved input**: Single contiguous stream for filter stage
-- **Frame-major accumulator**: FFT outputs written contiguously for all channels
-  - Better cache locality than M separate per-channel buffers
-- **Direct FFT-to-accumulator**: FFT output goes directly into frame accumulator
-  - Eliminates intermediate buffer and copy
+- **Output buffer pool**: `slab_pool` pre-allocates output buffers
+- **Pool-backed immutable_buffer**: Automatic return to pool on release
+- **L1-resident scratch**: Tile processing keeps working set in cache
+
+## Architecture
+
+```
+src/components/pfbc/
+├── component.hpp/cpp      # Main component implementation
+├── pfbc_engine.hpp        # Compile-time policy selection
+├── kernels.hpp            # AVX-512 kernels (filter, FFT, transpose)
+├── coefficients.hpp       # Blocked coefficient preparation
+├── fft_plan.hpp           # FFTW wrapper for staged pipeline
+└── tests/
+    ├── kernel_tests.cpp           # Kernel unit tests
+    ├── kernel_benchmarks.cpp      # Performance benchmarks
+    └── pfbc_integration_tests.cpp # Component integration tests
+```
 
 ## Dependencies
 
-- **FFTW3** (single-precision): `libfftw3f`, `libfftw3f_threads`
-- **AVX-512**: Required for current SIMD kernels (no runtime dispatch in component)
+- **FFTW3** (single-precision): For M≥64 staged pipeline
+- **AVX-512F, AVX-512DQ, AVX-512VL**: Required for SIMD kernels
 - **composite**: Framework ports, buffers, properties
 
 ## Build
@@ -99,25 +168,23 @@ cmake --build build --parallel
 
 ```bash
 cd build
-ctest -R pfbc
+ctest -L pfbc
 
 # Or run individually:
-./src/components/pfbc/tests/pfbc_kernel_tests        # Kernel unit tests (1338 assertions)
-./src/components/pfbc/tests/pfbc_integration_tests   # Component integration tests (2480 assertions)
+./src/components/pfbc/tests/pfbc_kernel_tests        # Kernel unit tests
+./src/components/pfbc/tests/pfbc_integration_tests   # Component integration tests
 ```
 
 ## Benchmarks
-
-Performance benchmarks using Google Benchmark:
 
 ```bash
 # Run all kernel benchmarks
 ./build/src/components/pfbc/tests/pfbc_kernel_benchmarks
 
 # Run specific benchmarks
-./build/src/components/pfbc/tests/pfbc_kernel_benchmarks --benchmark_filter="BM_Commutator"
-./build/src/components/pfbc/tests/pfbc_kernel_benchmarks --benchmark_filter="BM_Filter"
-./build/src/components/pfbc/tests/pfbc_kernel_benchmarks --benchmark_filter="BM_Full_Pipeline"
+./build/src/components/pfbc/tests/pfbc_kernel_benchmarks --benchmark_filter="BM_Fused"
+./build/src/components/pfbc/tests/pfbc_kernel_benchmarks --benchmark_filter="BM_Hybrid"
+./build/src/components/pfbc/tests/pfbc_kernel_benchmarks --benchmark_filter="BM_Pipeline_Comprehensive"
 ```
 
 ## Example Configuration
@@ -127,20 +194,10 @@ components:
   - id: channelizer
     type: pfbc
     properties:
-      num_channels: 64       # Must be power of 2, ≥8 recommended
-      taps_per_phase: 12     # Filter length per phase
+      num_channels: 32       # Uses hybrid_m32 policy
+      taps_per_phase: 16     # Filter length per phase
       frame_size: 1024       # Samples per channel per output frame
 ```
-
-## Files
-
-- `component.hpp/cpp` - Main component implementation
-- `coefficients.hpp` - Prototype and interleaved coefficient helpers
-- `kernels_interleaved.hpp` - Interleaved AVX-512 polyphase filter kernels
-- `fft_plan.hpp` - FFTW wrapper for M-point FFT (single/batch support)
-- `tests/pfbc_kernel_tests.cpp` - Kernel unit tests (Catch2)
-- `tests/pfbc_integration_tests.cpp` - Component integration tests (Catch2)
-- `tests/kernel_benchmarks.cpp` - Performance benchmarks (Google Benchmark)
 
 ## License
 
