@@ -307,25 +307,11 @@ inline auto halfband_filter_fused(
     }
 
     // -------------------------------------------------------------------------
-    // Update history with tail samples
+    // Update history with tail samples from last tile (safe for in-place output)
     // -------------------------------------------------------------------------
-    if (num_outputs >= history_len) {
-        // Normal case: copy last history_len samples from input
-        for (std::size_t i = 0; i < history_len; ++i) {
-            std::size_t src_idx = num_outputs - history_len + i;
-            even_hist[i] = input[2 * src_idx];
-            odd_hist[i] = input[2 * src_idx + 1];
-        }
-    } else {
-        // Small input: shift history left, append new samples
-        // This preserves filter continuity for tiny blocks
-        std::size_t keep = history_len - num_outputs;
-        std::memmove(even_hist, even_hist + num_outputs, keep * sizeof(std::complex<float>));
-        std::memmove(odd_hist, odd_hist + num_outputs, keep * sizeof(std::complex<float>));
-        for (std::size_t i = 0; i < num_outputs; ++i) {
-            even_hist[keep + i] = input[2 * i];
-            odd_hist[keep + i] = input[2 * i + 1];
-        }
+    for (std::size_t i = 0; i < history_len; ++i) {
+        even_hist[i] = tile_even[tile_outputs + i];
+        odd_hist[i] = tile_odd[tile_outputs + i];
     }
 }
 
@@ -333,6 +319,7 @@ inline auto halfband_filter_fused(
 // AVX2 Helper: Process tile (deinterleave new samples + filter)
 // Must be always_inline with matching target attributes for loop peeling
 // -----------------------------------------------------------------------------
+static_assert(sizeof(std::complex<float>) == sizeof(double), "process_tile_avx2 assumes complex<float> is 64-bit");
 [[gnu::target("avx2,fma"), gnu::always_inline]]
 static inline auto process_tile_avx2(
   const std::complex<float>* input,
@@ -573,22 +560,11 @@ inline auto halfband_filter_fused(
     }
 
     // -------------------------------------------------------------------------
-    // Update history with tail samples
+    // Update history with tail samples from last tile (safe for in-place output)
     // -------------------------------------------------------------------------
-    if (num_outputs >= history_len) {
-        for (std::size_t i = 0; i < history_len; ++i) {
-            std::size_t src_idx = num_outputs - history_len + i;
-            even_hist[i] = input[2 * src_idx];
-            odd_hist[i] = input[2 * src_idx + 1];
-        }
-    } else {
-        std::size_t keep = history_len - num_outputs;
-        std::memmove(even_hist, even_hist + num_outputs, keep * sizeof(std::complex<float>));
-        std::memmove(odd_hist, odd_hist + num_outputs, keep * sizeof(std::complex<float>));
-        for (std::size_t i = 0; i < num_outputs; ++i) {
-            even_hist[keep + i] = input[2 * i];
-            odd_hist[keep + i] = input[2 * i + 1];
-        }
+    for (std::size_t i = 0; i < history_len; ++i) {
+        even_hist[i] = tile_even[tile_outputs + i];
+        odd_hist[i] = tile_odd[tile_outputs + i];
     }
 }
 
@@ -618,9 +594,10 @@ inline auto halfband_filter_fused(
     alignas(64) std::array<std::complex<float>, FUSED_TILE_SIZE + MAX_HISTORY_LEN> tile_odd{};
 
     std::size_t output_pos = 0;
+    std::size_t tile_outputs = 0;
 
     while (output_pos < num_outputs) {
-        std::size_t tile_outputs = std::min(FUSED_TILE_SIZE, num_outputs - output_pos);
+        tile_outputs = std::min(FUSED_TILE_SIZE, num_outputs - output_pos);
 
         // Copy history to the beginning of tile buffers
         if (output_pos == 0) {
@@ -654,23 +631,10 @@ inline auto halfband_filter_fused(
         output_pos += tile_outputs;
     }
 
-    // Update history with tail samples
-    if (num_outputs >= history_len) {
-        // Normal case: copy last history_len samples from input
-        for (std::size_t i = 0; i < history_len; ++i) {
-            std::size_t src_idx = num_outputs - history_len + i;
-            even_hist[i] = input[2 * src_idx];
-            odd_hist[i] = input[2 * src_idx + 1];
-        }
-    } else {
-        // Small input: shift history left, append new samples
-        std::size_t keep = history_len - num_outputs;
-        std::memmove(even_hist, even_hist + num_outputs, keep * sizeof(std::complex<float>));
-        std::memmove(odd_hist, odd_hist + num_outputs, keep * sizeof(std::complex<float>));
-        for (std::size_t i = 0; i < num_outputs; ++i) {
-            even_hist[keep + i] = input[2 * i];
-            odd_hist[keep + i] = input[2 * i + 1];
-        }
+    // Update history with tail samples from last tile (safe for in-place output)
+    for (std::size_t i = 0; i < history_len; ++i) {
+        even_hist[i] = tile_even[tile_outputs + i];
+        odd_hist[i] = tile_odd[tile_outputs + i];
     }
 }
 
