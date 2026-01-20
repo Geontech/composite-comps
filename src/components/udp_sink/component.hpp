@@ -56,12 +56,19 @@ class udp_sink : public composite::component {
 public:
     explicit udp_sink(std::string_view id);
     ~udp_sink() override;
+    auto initialize() -> void override;
     auto property_change_handler() -> void override;
     auto start() -> void override;
     auto stop() -> void override;
     auto process() -> composite::retval override;
 
 private:
+    // Per-stream state for destination latching
+    struct stream_state {
+        std::string last_dest_ip;
+        uint16_t last_dest_port{0};
+    };
+
     // Ports
     input_port_t m_in_port{"data_in"};
 
@@ -69,6 +76,7 @@ private:
     std::string m_socket_type{SENDMMSG};        // Socket backend type
     std::string m_dest_ip_key{"dest_ip"};       // Metadata key for destination IP
     std::string m_dest_port_key{"dest_port"};   // Metadata key for destination port
+    std::string m_stream_id_key{"stream_id"};   // Metadata key for stream ID
     uint32_t m_socket_timeout_s{30};            // Close idle sockets after N seconds
     uint32_t m_send_buf_size{0};                // Socket send buffer size (0 = system default)
     uint32_t m_batch_size{64};                  // Max packets per sendmmsg() call
@@ -80,14 +88,17 @@ private:
     // Sender backend
     std::unique_ptr<udp_tx::interface> m_sender;
     std::mutex m_sender_mtx;
-    bool m_component_running{false};
+    bool m_initialized{false};
+
+    // Per-stream destination state
+    std::unordered_map<uint32_t, stream_state> m_stream_states;
 
     // Cleanup thread for idle sockets
     std::jthread m_cleanup_thread;
 
     // Helper methods
-    auto get_destination(const composite::metadata& metadata) -> std::pair<std::string, uint16_t>;
-    auto start_sender_locked() -> void;
-    auto stop_sender_locked() -> void;
+    auto get_stream_id(const composite::metadata& metadata) -> uint32_t;
+    auto get_destination(uint32_t stream_id, const composite::metadata& metadata) -> std::pair<std::string, uint16_t>;
+    auto create_sender() -> std::unique_ptr<udp_tx::interface>;
 
 }; // class udp_sink

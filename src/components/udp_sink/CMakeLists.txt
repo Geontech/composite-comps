@@ -40,6 +40,9 @@ add_library(udp_sink MODULE
     socket/send.cpp
     socket/sendmmsg.cpp
 )
+set_target_properties(udp_sink PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/components
+)
 # Includes
 target_include_directories(udp_sink
     PRIVATE

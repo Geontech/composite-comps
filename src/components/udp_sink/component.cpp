@@ -26,16 +26,17 @@
 udp_sink::udp_sink(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     using enum composite::properties::config_type;
-    add_property("socket_type", m_socket_type).change_listener([this]() {
+    add_property("socket_type", m_socket_type, INITIALIZE).change_listener([this]() {
         return m_socket_type == SEND || m_socket_type == SENDMMSG;
     });
     add_property("dest_ip_key", m_dest_ip_key, RUNTIME);
     add_property("dest_port_key", m_dest_port_key, RUNTIME);
+    add_property("stream_id_key", m_stream_id_key, RUNTIME);
     add_property("socket_timeout_s", m_socket_timeout_s, RUNTIME).units("s");
-    add_property("send_buf_size", m_send_buf_size).units("bytes");
+    add_property("send_buf_size", m_send_buf_size, INITIALIZE).units("bytes");
     add_property("batch_size", m_batch_size, RUNTIME);
     add_property("batch_timeout_us", m_batch_timeout_us, RUNTIME).units("us");
-    add_property("bind_interface", m_bind_interface);
+    add_property("bind_interface", m_bind_interface, INITIALIZE);
     add_property("default_dest_ip", m_default_dest_ip, RUNTIME);
     add_property("default_dest_port", m_default_dest_port, RUNTIME);
 }
@@ -44,9 +45,31 @@ udp_sink::~udp_sink() {
     stop();
 }
 
+auto udp_sink::initialize() -> void {
+    logger()->trace(std::source_location::current().function_name());
+
+    std::scoped_lock lock(m_sender_mtx);
+    m_sender = create_sender();
+    m_stream_states.clear();
+    m_initialized = true;
+
+    logger()->info("udp_sink initialized with socket_type={}", m_socket_type);
+}
+
 auto udp_sink::property_change_handler() -> void {
     logger()->trace(std::source_location::current().function_name());
 
+    // Only recreate sender if already initialized (runtime property changes)
+    if (m_initialized) {
+        std::scoped_lock lock(m_sender_mtx);
+        if (m_sender) {
+            m_sender->flush();
+        }
+        m_sender = create_sender();
+    }
+}
+
+auto udp_sink::create_sender() -> std::unique_ptr<udp_tx::interface> {
     auto config = udp_tx::config{
         .logger = logger(),
         .send_buf_size = m_send_buf_size,
@@ -56,30 +79,15 @@ auto udp_sink::property_change_handler() -> void {
         .bind_interface = m_bind_interface
     };
 
-    std::unique_ptr<udp_tx::interface> sender;
     if (m_socket_type == SENDMMSG) {
-        sender = std::make_unique<udp_tx::sendmmsg_tx>(config);
+        return std::make_unique<udp_tx::sendmmsg_tx>(config);
     } else {
-        sender = std::make_unique<udp_tx::send_tx>(config);
-    }
-
-    {
-        std::scoped_lock lock(m_sender_mtx);
-        stop_sender_locked();
-        m_sender = std::move(sender);
-        if (m_component_running) {
-            start_sender_locked();
-        }
+        return std::make_unique<udp_tx::send_tx>(config);
     }
 }
 
 auto udp_sink::start() -> void {
     component::start();
-    {
-        std::scoped_lock lock(m_sender_mtx);
-        m_component_running = true;
-        start_sender_locked();
-    }
 
     // Start cleanup thread
     m_cleanup_thread = std::jthread([this](std::stop_token token) {
@@ -116,10 +124,12 @@ auto udp_sink::stop() -> void {
         m_cleanup_thread.join();
     }
 
+    // Flush any pending data
     {
         std::scoped_lock lock(m_sender_mtx);
-        stop_sender_locked();
-        m_component_running = false;
+        if (m_sender) {
+            m_sender->flush();
+        }
     }
 
     component::stop();
@@ -139,12 +149,13 @@ auto udp_sink::process() -> composite::retval {
         return NORMAL;
     }
 
-    // Get destination from metadata
+    // Get stream ID and destination from metadata (with latching)
     auto metadata = metadata_opt.value_or(composite::metadata{});
-    auto [dest_ip, dest_port] = get_destination(metadata);
+    auto stream_id = get_stream_id(metadata);
+    auto [dest_ip, dest_port] = get_destination(stream_id, metadata);
 
     if (dest_ip.empty() || dest_port == 0) {
-        logger()->warn("No destination specified in metadata and no default configured");
+        logger()->warn("No destination specified in metadata and no default configured for stream_id={}", stream_id);
         return NORMAL;
     }
 
@@ -162,46 +173,69 @@ auto udp_sink::process() -> composite::retval {
     return NORMAL;
 }
 
-auto udp_sink::get_destination(const composite::metadata& metadata) -> std::pair<std::string, uint16_t> {
+auto udp_sink::get_stream_id(const composite::metadata& metadata) -> uint32_t {
+    if (auto it = metadata.annotations.find(m_stream_id_key); it != metadata.annotations.end()) {
+        try {
+            return static_cast<uint32_t>(std::stoul(it->second));
+        } catch (...) {
+            // Invalid stream ID, use default
+        }
+    }
+    return 0;  // Default stream ID
+}
+
+auto udp_sink::get_destination(uint32_t stream_id, const composite::metadata& metadata) -> std::pair<std::string, uint16_t> {
+    auto& state = m_stream_states[stream_id];
     std::string ip;
     uint16_t port = 0;
+    bool got_new_dest = false;
 
     // Try to get IP from metadata
     if (auto it = metadata.annotations.find(m_dest_ip_key); it != metadata.annotations.end()) {
         ip = it->second;
-    } else {
-        ip = m_default_dest_ip;
+        got_new_dest = true;
     }
 
     // Try to get port from metadata
     if (auto it = metadata.annotations.find(m_dest_port_key); it != metadata.annotations.end()) {
         try {
             port = static_cast<uint16_t>(std::stoul(it->second));
+            got_new_dest = true;
         } catch (...) {
             logger()->warn("Invalid {} value in metadata: '{}'", m_dest_port_key, it->second);
-            port = m_default_dest_port;
         }
+    }
+
+    // If we got new destination info, update latched state
+    if (got_new_dest) {
+        if (!ip.empty()) {
+            state.last_dest_ip = ip;
+        }
+        if (port != 0) {
+            state.last_dest_port = port;
+        }
+    }
+
+    // Use latched values if available, otherwise fall back to defaults
+    if (state.last_dest_ip.empty()) {
+        ip = m_default_dest_ip;
     } else {
+        ip = state.last_dest_ip;
+    }
+
+    if (state.last_dest_port == 0) {
         port = m_default_dest_port;
+    } else {
+        port = state.last_dest_port;
     }
 
     return {ip, port};
 }
 
-auto udp_sink::start_sender_locked() -> void {
-    // Sender is already started when created
-    logger()->info("UDP sink started");
-}
-
-auto udp_sink::stop_sender_locked() -> void {
-    if (m_sender) {
-        m_sender->flush();
-        logger()->info("UDP sink stopped");
-    }
-}
-
+#ifndef UNIT_TESTS
 extern "C" {
-    auto create(std::string_view id) -> std::shared_ptr<composite::component> {
-        return std::make_shared<udp_sink>(id);
-    }
+auto create(std::string_view id, [[maybe_unused]] std::string_view type) -> std::shared_ptr<composite::component> {
+    return std::make_shared<udp_sink>(id);
 }
+}
+#endif
