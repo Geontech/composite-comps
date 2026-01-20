@@ -17,8 +17,8 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
-project(pkt_sink VERSION 0.1.0 LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.20)
+project(udp_sink VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 
 # Set the C++ version required
@@ -32,24 +32,26 @@ set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Custom compile options
-add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
+add_compile_options(-march=x86-64-v2 -mtune=generic)
 
 # Library
-add_library(pkt_sink MODULE
+add_library(udp_sink MODULE
     component.cpp
+    socket/send.cpp
+    socket/sendmmsg.cpp
 )
 # Includes
-target_include_directories(pkt_sink
+target_include_directories(udp_sink
     PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(pkt_sink
+# Link
+target_link_libraries(udp_sink
     PRIVATE
     composite::composite
     spdlog::spdlog_header_only
 )
 # Install
-install(TARGETS pkt_sink
+install(TARGETS udp_sink
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
