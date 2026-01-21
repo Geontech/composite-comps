@@ -39,6 +39,7 @@ struct config {
     uint32_t socket_timeout_s{30};      // Close idle sockets after N seconds
     uint32_t batch_size{64};            // Max packets per sendmmsg() call
     uint32_t batch_timeout_us{1000};    // Flush batch after N microseconds
+    uint32_t max_packet_size{4096};     // Max expected packet size (for buffer pre-allocation)
     std::string bind_interface;         // Optional: bind to specific interface
 };
 

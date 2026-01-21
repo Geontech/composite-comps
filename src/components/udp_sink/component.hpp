@@ -81,6 +81,7 @@ private:
     uint32_t m_send_buf_size{0};                // Socket send buffer size (0 = system default)
     uint32_t m_batch_size{64};                  // Max packets per sendmmsg() call
     uint32_t m_batch_timeout_us{1000};          // Flush batch after N microseconds
+    uint32_t m_max_packet_size{4096};           // Max expected packet size (for buffer pre-allocation)
     std::string m_bind_interface;               // Optional: bind to specific interface
     std::string m_default_dest_ip;              // Default destination IP if not in metadata
     uint16_t m_default_dest_port{0};            // Default destination port if not in metadata

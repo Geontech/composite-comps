@@ -57,8 +57,8 @@ private:
         struct sockaddr_in dest_addr;
     };
 
-    // Maximum expected packet size (jumbo frame support)
-    static constexpr size_t MAX_PACKET_SIZE = 9000;
+    // Maximum expected packet size (configurable via config)
+    size_t m_max_packet_size;
 
     // Per-destination stats and last-used tracking
     struct dest_stats {

@@ -36,6 +36,7 @@ udp_sink::udp_sink(std::string_view id) : composite::component(id) {
     add_property("send_buf_size", m_send_buf_size, INITIALIZE).units("bytes");
     add_property("batch_size", m_batch_size, RUNTIME);
     add_property("batch_timeout_us", m_batch_timeout_us, RUNTIME).units("us");
+    add_property("max_packet_size", m_max_packet_size, INITIALIZE).units("bytes");
     add_property("bind_interface", m_bind_interface, INITIALIZE);
     add_property("default_dest_ip", m_default_dest_ip, RUNTIME);
     add_property("default_dest_port", m_default_dest_port, RUNTIME);
@@ -76,6 +77,7 @@ auto udp_sink::create_sender() -> std::unique_ptr<udp_tx::interface> {
         .socket_timeout_s = m_socket_timeout_s,
         .batch_size = m_batch_size,
         .batch_timeout_us = m_batch_timeout_us,
+        .max_packet_size = m_max_packet_size,
         .bind_interface = m_bind_interface
     };
 

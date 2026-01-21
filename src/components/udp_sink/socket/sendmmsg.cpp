@@ -40,7 +40,8 @@ sendmmsg_tx::sendmmsg_tx(const config& cfg) : m_config(cfg) {
     m_msgs.resize(m_config.batch_size);
 
     // Pre-allocate data buffer (batch_size * max packet size)
-    m_data_buffer.resize(m_config.batch_size * MAX_PACKET_SIZE);
+    m_max_packet_size = m_config.max_packet_size;
+    m_data_buffer.resize(m_config.batch_size * m_max_packet_size);
     m_data_buffer_pos = 0;
 
     m_config.logger->info("sendmmsg_tx initialized: batch_size={}, batch_timeout_us={}",
