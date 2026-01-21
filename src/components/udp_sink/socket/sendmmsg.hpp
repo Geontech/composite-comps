@@ -50,11 +50,15 @@ public:
     auto get_stats() const -> std::map<std::string, std::string> override;
 
 private:
-    // Queued packet with its destination
+    // Queued packet metadata (data stored in pre-allocated buffer)
     struct queued_packet {
-        std::vector<uint8_t> data;
+        size_t data_offset;  // Offset into m_data_buffer
+        size_t data_size;    // Size of this packet's data
         struct sockaddr_in dest_addr;
     };
+
+    // Maximum expected packet size (jumbo frame support)
+    static constexpr size_t MAX_PACKET_SIZE = 9000;
 
     // Per-destination stats and last-used tracking
     struct dest_stats {
@@ -70,6 +74,10 @@ private:
     // Batch queue (packets waiting to be sent)
     std::vector<queued_packet> m_batch_queue;
     std::chrono::steady_clock::time_point m_batch_start_time{};
+
+    // Pre-allocated data buffer (avoids per-packet malloc)
+    std::vector<uint8_t> m_data_buffer;
+    size_t m_data_buffer_pos{0};
 
     // Pre-allocated sendmmsg structures (reused across flushes)
     std::vector<struct iovec> m_iovecs;

@@ -39,6 +39,10 @@ sendmmsg_tx::sendmmsg_tx(const config& cfg) : m_config(cfg) {
     m_iovecs.resize(m_config.batch_size);
     m_msgs.resize(m_config.batch_size);
 
+    // Pre-allocate data buffer (batch_size * max packet size)
+    m_data_buffer.resize(m_config.batch_size * MAX_PACKET_SIZE);
+    m_data_buffer_pos = 0;
+
     m_config.logger->info("sendmmsg_tx initialized: batch_size={}, batch_timeout_us={}",
                           m_config.batch_size, m_config.batch_timeout_us);
 }
@@ -71,13 +75,25 @@ auto sendmmsg_tx::send(const std::string& ip, uint16_t port, std::span<const uin
         return -1;
     }
 
-    // Queue the packet
+    // Copy packet data into pre-allocated buffer
+    auto data_size = data.size();
+    if (m_data_buffer_pos + data_size > m_data_buffer.size()) {
+        // Buffer full - shouldn't happen if batch_size is respected, but flush and retry
+        flush_locked();
+        m_data_buffer_pos = 0;
+    }
+
+    std::memcpy(m_data_buffer.data() + m_data_buffer_pos, data.data(), data_size);
+
+    // Queue packet metadata (no allocation - just offset/size)
     m_batch_queue.emplace_back(queued_packet{
-        .data = std::vector<uint8_t>(data.begin(), data.end()),
+        .data_offset = m_data_buffer_pos,
+        .data_size = data_size,
         .dest_addr = dest_addr
     });
 
-    auto bytes_queued = static_cast<ssize_t>(data.size());
+    m_data_buffer_pos += data_size;
+    auto bytes_queued = static_cast<ssize_t>(data_size);
 
     // Update destination stats
     auto dest_key = make_dest_key(ip, port);
@@ -124,8 +140,8 @@ auto sendmmsg_tx::flush_locked() -> void {
     for (size_t i = 0; i < batch_size; i++) {
         auto& pkt = m_batch_queue[i];
 
-        m_iovecs[i].iov_base = pkt.data.data();
-        m_iovecs[i].iov_len = pkt.data.size();
+        m_iovecs[i].iov_base = m_data_buffer.data() + pkt.data_offset;
+        m_iovecs[i].iov_len = pkt.data_size;
 
         std::memset(&m_msgs[i], 0, sizeof(struct mmsghdr));
         m_msgs[i].msg_hdr.msg_name = &pkt.dest_addr;
@@ -168,6 +184,7 @@ auto sendmmsg_tx::flush_locked() -> void {
 
     m_total_flushes++;
     m_batch_queue.clear();
+    m_data_buffer_pos = 0;  // Reset buffer position for next batch
 }
 
 auto sendmmsg_tx::cleanup_idle_sockets() -> void {
