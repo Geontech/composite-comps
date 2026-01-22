@@ -10,6 +10,7 @@ target_link_libraries(sigmf_source
     PRIVATE
         composite::composite
         spdlog::spdlog_header_only
+        nlohmann_json::nlohmann_json
 )
 target_include_directories(sigmf_source
     PRIVATE

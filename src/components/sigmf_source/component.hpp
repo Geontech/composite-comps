@@ -1,19 +1,40 @@
 /*
  * Copyright (C) 2025 Geon Technologies, LLC
  *
- * Simple SigMF file source component for testing.
- * Reads SigMF metadata and data files, outputs samples through a port.
+ * SigMF file source component with rate-controlled playback.
+ * Reads SigMF metadata and data files, outputs samples through a port
+ * at the file's native sample rate (or a configurable max rate).
  */
 
 #pragma once
 
 #include <composite/composite.hpp>
 
+#include <chrono>
 #include <complex>
 #include <cstdint>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
+
+/**
+ * Parsed SigMF datatype format information.
+ * Supports formats like: cf32_le, ri16_be, cu8, etc.
+ */
+struct SigmfFormat {
+    std::string datatype_str;
+    bool is_complex{true};
+    bool is_big_endian{false};  // true = big endian, false = little endian
+    enum class DataType { FLOAT, SIGNED_INT, UNSIGNED_INT } datatype{DataType::FLOAT};
+    uint32_t bitwidth{32};
+
+    [[nodiscard]] uint32_t bytes_per_sample() const {
+        uint32_t bytes = bitwidth / 8;
+        return is_complex ? bytes * 2 : bytes;
+    }
+};
 
 template<typename T>
 class sigmf_source : public composite::component {
@@ -31,15 +52,30 @@ public:
 private:
     void parse_metadata();
     void send_metadata_to_port();
+    void calculate_timing();
+    auto process_chunk() -> composite::retval;
+
+    // Datatype parsing
+    static auto parse_datatype(std::string_view datatype_str) -> std::optional<SigmfFormat>;
+
+    // Endianness handling - swap bytes in loaded data buffer
+    void apply_endianness_swap();
+    static void byte_swap_16(std::vector<T>& data);
+    static void byte_swap_32(std::vector<T>& data);
 
     output_port_t m_out_port{"data_out"};
 
-    // Configuration
-    std::string m_file_path;           // Path to .sigmf-meta or base name
-    std::size_t m_chunk_samples{4096}; // Samples per output buffer
-    bool m_loop{false};                // Loop file when EOF reached
+    // Configuration properties
+    std::string m_file_path;              // Path to .sigmf-meta or base name
+    std::size_t m_chunk_samples{1024};    // Samples per output buffer
+    bool m_loop{false};                   // Loop file when EOF reached
+    uint32_t m_stream_id{0};              // Stream identifier
 
-    // State
+    // Rate control properties
+    bool m_rate_control{true};            // Enable sample-rate pacing (default: enabled)
+    double m_max_sample_rate{-1.0};       // Max rate limit, -1 = use file's sample rate
+
+    // File state
     std::ifstream m_data_file;
     std::size_t m_samples_read{0};
     std::size_t m_total_samples{0};
@@ -49,7 +85,18 @@ private:
     double m_sample_rate{0.0};
     double m_center_frequency{0.0};
     std::string m_description;
-    uint32_t m_stream_id{0};
+    SigmfFormat m_format;
+
+    // Rate control timing state
+    double m_effective_sample_rate{0.0};
+    std::chrono::steady_clock::time_point m_next_send_time;
+    std::chrono::microseconds m_chunk_interval{0};
+    uint32_t m_chunks_per_wakeup{1};
+
+    // Pre-loaded file data for endianness conversion
+    std::vector<T> m_file_data;
+    std::size_t m_file_data_index{0};
+    bool m_data_preloaded{false};
 };
 
 // Type aliases for common sample types

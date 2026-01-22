@@ -32,5 +32,7 @@ include(cmake/composite.cmake)
 include(cmake/vrtgen.cmake)
 # spdlog dependency
 include(cmake/spdlog.cmake)
+# nlohmann_json dependency
+include(cmake/nlohmann_json.cmake)
 
 add_subdirectory(src)

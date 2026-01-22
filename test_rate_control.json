@@ -1,0 +1,36 @@
+{
+    "components": [
+        {
+            "id": "source",
+            "library": "build/components/libsigmf_source.so",
+            "subtype": "cf32",
+            "properties": {
+                "file_path": "test_50msps_big",
+                "chunk_samples": 8192,
+                "loop": true,
+                "rate_control": true,
+                "max_sample_rate": -1
+            }
+        },
+        {
+            "id": "monitor",
+            "library": "build/components/librate_monitor.so",
+            "subtype": "cf32",
+            "properties": {
+                "report_interval_sec": 1.0
+            }
+        }
+    ],
+    "connections": [
+        {
+            "output": {
+                "component": "source",
+                "port": "data_out"
+            },
+            "input": {
+                "component": "monitor",
+                "port": "data_in"
+            }
+        }
+    ]
+}
