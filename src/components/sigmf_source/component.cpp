@@ -2,6 +2,7 @@
  * Copyright (C) 2025 Geon Technologies, LLC
  *
  * SigMF file source component with rate-controlled playback.
+ * Uses mmap for zero-copy file reading at high sample rates.
  */
 
 #include "component.hpp"
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <stdexcept>
 #include <thread>
 
@@ -148,50 +150,42 @@ void sigmf_source<T>::parse_metadata() {
 }
 
 template<typename T>
-void sigmf_source<T>::byte_swap_16(std::vector<T>& data) {
-    auto* bytes = reinterpret_cast<uint8_t*>(data.data());
-    const std::size_t num_bytes = data.size() * sizeof(T);
-    for (std::size_t i = 0; i + 1 < num_bytes; i += 2) {
-        std::swap(bytes[i], bytes[i + 1]);
-    }
-}
-
-template<typename T>
-void sigmf_source<T>::byte_swap_32(std::vector<T>& data) {
-    auto* bytes = reinterpret_cast<uint8_t*>(data.data());
-    const std::size_t num_bytes = data.size() * sizeof(T);
-    for (std::size_t i = 0; i + 3 < num_bytes; i += 4) {
-        std::swap(bytes[i], bytes[i + 3]);
-        std::swap(bytes[i + 1], bytes[i + 2]);
-    }
-}
-
-template<typename T>
 void sigmf_source<T>::apply_endianness_swap() {
     // Only swap if file is big-endian and host is little-endian (or vice versa)
     // x86/x64 is always little-endian
     constexpr bool host_is_little_endian = (std::endian::native == std::endian::little);
 
-    if (m_format.is_big_endian == host_is_little_endian) {
-        // Need to swap
-        if (m_format.bitwidth == 16) {
-            byte_swap_16(m_file_data);
-            logger()->debug("sigmf_source: applied 16-bit byte swap for endianness");
-        } else if (m_format.bitwidth == 32) {
-            byte_swap_32(m_file_data);
-            logger()->debug("sigmf_source: applied 32-bit byte swap for endianness");
-        } else if (m_format.bitwidth == 64) {
-            // For 64-bit, swap as two 32-bit values then swap them
-            auto* bytes = reinterpret_cast<uint8_t*>(m_file_data.data());
-            const std::size_t num_bytes = m_file_data.size() * sizeof(T);
-            for (std::size_t i = 0; i + 7 < num_bytes; i += 8) {
-                std::swap(bytes[i], bytes[i + 7]);
-                std::swap(bytes[i + 1], bytes[i + 6]);
-                std::swap(bytes[i + 2], bytes[i + 5]);
-                std::swap(bytes[i + 3], bytes[i + 4]);
-            }
-            logger()->debug("sigmf_source: applied 64-bit byte swap for endianness");
+    if (!m_mmap || !m_mmap->valid()) {
+        return;
+    }
+
+    if (m_format.is_big_endian != host_is_little_endian) {
+        // Same endianness, no swap needed
+        return;
+    }
+
+    auto* bytes = reinterpret_cast<uint8_t*>(m_mmap->data());
+    const std::size_t num_bytes = m_mmap->file_size();
+
+    if (m_format.bitwidth == 16) {
+        for (std::size_t i = 0; i + 1 < num_bytes; i += 2) {
+            std::swap(bytes[i], bytes[i + 1]);
         }
+        logger()->debug("sigmf_source: applied 16-bit byte swap for endianness on mmap region");
+    } else if (m_format.bitwidth == 32) {
+        for (std::size_t i = 0; i + 3 < num_bytes; i += 4) {
+            std::swap(bytes[i], bytes[i + 3]);
+            std::swap(bytes[i + 1], bytes[i + 2]);
+        }
+        logger()->debug("sigmf_source: applied 32-bit byte swap for endianness on mmap region");
+    } else if (m_format.bitwidth == 64) {
+        for (std::size_t i = 0; i + 7 < num_bytes; i += 8) {
+            std::swap(bytes[i], bytes[i + 7]);
+            std::swap(bytes[i + 1], bytes[i + 6]);
+            std::swap(bytes[i + 2], bytes[i + 5]);
+            std::swap(bytes[i + 3], bytes[i + 4]);
+        }
+        logger()->debug("sigmf_source: applied 64-bit byte swap for endianness on mmap region");
     }
 }
 
@@ -235,6 +229,19 @@ void sigmf_source<T>::calculate_timing() {
 }
 
 template<typename T>
+void sigmf_source<T>::send_metadata_to_port() {
+    composite::metadata meta;
+    meta.annotations["stream_id"] = std::to_string(m_stream_id);
+    meta.sample_rate = m_sample_rate;
+    meta.center_frequency = m_center_frequency;
+    meta.bandwidth = m_sample_rate;  // Default bandwidth to sample rate
+    if (!m_description.empty()) {
+        meta.annotations["description"] = m_description;
+    }
+    m_out_port.send_metadata(meta);
+}
+
+template<typename T>
 auto sigmf_source<T>::initialize() -> void {
     if (m_file_path.empty()) {
         throw std::runtime_error("sigmf_source: file_path property is required");
@@ -250,32 +257,25 @@ auto sigmf_source<T>::initialize() -> void {
         data_path = data_path + ".sigmf-data";
     }
 
-    // Get file size
+    // Verify file exists
     if (!std::filesystem::exists(data_path)) {
         throw std::runtime_error(std::format("sigmf_source: data file not found: {}", data_path));
     }
-    auto file_size = std::filesystem::file_size(data_path);
-    m_total_samples = file_size / sizeof(T);
 
-    // For endianness handling, we need to preload the file if byte swapping is needed
+    // Determine if we need to byte-swap for endianness
     constexpr bool host_is_little_endian = (std::endian::native == std::endian::little);
     bool needs_swap = (m_format.is_big_endian == host_is_little_endian) && (m_format.bitwidth >= 16);
 
+    // Memory-map the file
+    // Use writable=true if we need to swap bytes (MAP_PRIVATE allows in-place modification)
+    logger()->info("sigmf_source: memory-mapping file {} (writable={})", data_path, needs_swap);
+    m_mmap = std::make_shared<MmapRegion<T>>(data_path, needs_swap);
+    m_total_samples = m_mmap->size();
+
+    // Apply endianness conversion in-place if needed
     if (needs_swap) {
-        // Preload entire file for byte swapping
-        logger()->info("sigmf_source: preloading file for endianness conversion");
-        m_file_data.resize(m_total_samples);
-        std::ifstream in(data_path, std::ios::binary);
-        in.read(reinterpret_cast<char*>(m_file_data.data()), file_size);
+        logger()->info("sigmf_source: applying endianness swap on {} bytes", m_mmap->file_size());
         apply_endianness_swap();
-        m_data_preloaded = true;
-    } else {
-        // Open file for streaming reads
-        m_data_file.open(data_path, std::ios::binary);
-        if (!m_data_file) {
-            throw std::runtime_error(std::format("sigmf_source: cannot open data file: {}", data_path));
-        }
-        m_data_preloaded = false;
     }
 
     // Calculate rate control timing
@@ -283,39 +283,24 @@ auto sigmf_source<T>::initialize() -> void {
         calculate_timing();
     }
 
-    logger()->info("sigmf_source initialized: {} samples, sr={} Hz, cf={} Hz, rate_control={}",
-                  m_total_samples, m_sample_rate, m_center_frequency, m_rate_control);
-}
-
-template<typename T>
-void sigmf_source<T>::send_metadata_to_port() {
-    composite::metadata meta;
-    meta.annotations["stream_id"] = std::to_string(m_stream_id);
-    meta.sample_rate = m_sample_rate;
-    meta.center_frequency = m_center_frequency;
-    meta.bandwidth = m_sample_rate;  // Default bandwidth to sample rate
-    if (!m_description.empty()) {
-        meta.annotations["description"] = m_description;
-    }
-    m_out_port.send_metadata(meta);
+    logger()->info("sigmf_source initialized: {} samples ({} MB), sr={} Hz, cf={} Hz, rate_control={}",
+                  m_total_samples, m_mmap->file_size() / (1024 * 1024),
+                  m_sample_rate, m_center_frequency, m_rate_control);
 }
 
 template<typename T>
 auto sigmf_source<T>::start() -> void {
     logger()->info("sigmf_source starting playback");
-    m_samples_read = 0;
-    m_file_data_index = 0;
+    m_current_index = 0;
+    m_samples_sent = 0;
     m_eof = false;
-
-    if (!m_data_preloaded && m_data_file.is_open()) {
-        m_data_file.clear();
-        m_data_file.seekg(0, std::ios::beg);
-    }
 
     // Recalculate timing in case max_sample_rate changed
     if (m_rate_control) {
         calculate_timing();
-        m_next_send_time = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        m_start_time = now;
+        m_next_send_time = now;
     }
 
     send_metadata_to_port();
@@ -324,9 +309,7 @@ auto sigmf_source<T>::start() -> void {
 
 template<typename T>
 auto sigmf_source<T>::stop() -> void {
-    if (m_data_file.is_open()) {
-        m_data_file.close();
-    }
+    // mmap is cleaned up automatically via shared_ptr
     composite::component::stop();
 }
 
@@ -341,65 +324,38 @@ auto sigmf_source<T>::process_chunk() -> composite::retval {
     if (m_eof && m_loop) {
         // Reset to beginning for looping
         logger()->trace("sigmf_source: looping back to start");
-        if (m_data_preloaded) {
-            m_file_data_index = 0;
-        } else {
-            m_data_file.clear();
-            m_data_file.seekg(0, std::ios::beg);
-        }
-        m_samples_read = 0;
+        m_current_index = 0;
         m_eof = false;
         send_metadata_to_port();
     }
 
     // Calculate samples to read
-    std::size_t samples_remaining = m_total_samples - m_samples_read;
+    std::size_t samples_remaining = m_total_samples - m_current_index;
     std::size_t samples_to_read = std::min(m_chunk_samples, samples_remaining);
 
     if (samples_to_read == 0) {
         m_eof = true;
         if (!m_loop) {
-            logger()->info("sigmf_source: reached end of file after {} samples", m_samples_read);
+            logger()->info("sigmf_source: reached end of file after {} samples", m_samples_sent);
         }
         return NOOP;
     }
 
-    // Read data
-    auto data_vec = std::make_shared<std::vector<T>>(samples_to_read);
-    std::size_t actually_read = 0;
-
-    if (m_data_preloaded) {
-        // Copy from preloaded buffer
-        std::copy_n(m_file_data.begin() + m_file_data_index, samples_to_read, data_vec->begin());
-        m_file_data_index += samples_to_read;
-        actually_read = samples_to_read;
-    } else {
-        // Read from file
-        m_data_file.read(reinterpret_cast<char*>(data_vec->data()), samples_to_read * sizeof(T));
-        actually_read = m_data_file.gcount() / sizeof(T);
-    }
-
-    if (actually_read == 0) {
-        m_eof = true;
-        return NOOP;
-    }
-
-    if (actually_read < samples_to_read) {
-        data_vec->resize(actually_read);
-    }
-
-    m_samples_read += actually_read;
+    // Create zero-copy view into the mmap region
+    auto view = std::make_shared<MmapView<T>>(m_mmap, m_current_index, samples_to_read);
+    m_current_index += samples_to_read;
+    m_samples_sent += samples_to_read;
 
     // Create timestamp (sample-based)
     composite::timestamp ts;
     if (m_effective_sample_rate > 0) {
-        double total_seconds = static_cast<double>(m_samples_read) / m_effective_sample_rate;
+        double total_seconds = static_cast<double>(m_samples_sent) / m_effective_sample_rate;
         ts.seconds = static_cast<uint32_t>(total_seconds);
         ts.picoseconds = static_cast<uint64_t>((total_seconds - ts.seconds) * 1e12);
     }
 
-    // Send data
-    composite::immutable_buffer<T> buf(data_vec);
+    // Send data - zero-copy, the view keeps the mmap alive
+    composite::immutable_buffer<T> buf(view);
     m_out_port.send_data(std::move(buf), ts);
 
     return NORMAL;
@@ -414,29 +370,45 @@ auto sigmf_source<T>::process() -> composite::retval {
         return process_chunk();
     }
 
-    // Rate-controlled mode
+    // Rate-controlled mode with wall-clock tracking for long-term accuracy
     auto now = std::chrono::steady_clock::now();
 
-    // Wait until it's time to send
-    if (now < m_next_send_time) {
-        std::this_thread::sleep_until(m_next_send_time);
+    // Calculate how many samples we SHOULD have sent by now based on wall-clock time
+    auto elapsed = std::chrono::duration<double>(now - m_start_time).count();
+    auto expected_samples = static_cast<uint64_t>(elapsed * m_effective_sample_rate);
+
+    // If we're ahead of schedule, sleep until we should send more
+    if (m_samples_sent >= expected_samples) {
+        // Calculate when we should next send based on samples already sent
+        double next_send_time_sec = static_cast<double>(m_samples_sent) / m_effective_sample_rate;
+        auto wake_time = m_start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(next_send_time_sec));
+
+        // But don't sleep for less than the minimum interval
+        if (wake_time > now) {
+            std::this_thread::sleep_until(wake_time);
+        }
+
+        // Recalculate expected samples after sleeping
+        now = std::chrono::steady_clock::now();
+        elapsed = std::chrono::duration<double>(now - m_start_time).count();
+        expected_samples = static_cast<uint64_t>(elapsed * m_effective_sample_rate);
     }
 
-    // Send the bundled chunks
-    for (uint32_t i = 0; i < m_chunks_per_wakeup; ++i) {
+    // Send chunks until we've caught up to where we should be
+    // This compensates for sleep jitter and processing overhead
+    uint32_t chunks_sent = 0;
+    while (m_samples_sent < expected_samples || chunks_sent < m_chunks_per_wakeup) {
         auto result = process_chunk();
         if (result != NORMAL) {
             return result;
         }
-    }
+        chunks_sent++;
 
-    // Schedule next wakeup
-    m_next_send_time += m_chunk_interval;
-
-    // If we fell behind schedule, catch up
-    now = std::chrono::steady_clock::now();
-    if (m_next_send_time < now) {
-        m_next_send_time = now + m_chunk_interval;
+        // Safety: don't send more than 2x the normal bundle to avoid runaway
+        if (chunks_sent >= m_chunks_per_wakeup * 2) {
+            break;
+        }
     }
 
     return NORMAL;

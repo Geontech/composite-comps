@@ -2,8 +2,7 @@
  * Copyright (C) 2025 Geon Technologies, LLC
  *
  * SigMF file source component with rate-controlled playback.
- * Reads SigMF metadata and data files, outputs samples through a port
- * at the file's native sample rate (or a configurable max rate).
+ * Uses mmap for zero-copy file reading at high sample rates.
  */
 
 #pragma once
@@ -13,11 +12,14 @@
 #include <chrono>
 #include <complex>
 #include <cstdint>
-#include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /**
  * Parsed SigMF datatype format information.
@@ -26,7 +28,7 @@
 struct SigmfFormat {
     std::string datatype_str;
     bool is_complex{true};
-    bool is_big_endian{false};  // true = big endian, false = little endian
+    bool is_big_endian{false};
     enum class DataType { FLOAT, SIGNED_INT, UNSIGNED_INT } datatype{DataType::FLOAT};
     uint32_t bitwidth{32};
 
@@ -34,6 +36,144 @@ struct SigmfFormat {
         uint32_t bytes = bitwidth / 8;
         return is_complex ? bytes * 2 : bytes;
     }
+};
+
+/**
+ * RAII wrapper for memory-mapped file region.
+ * Handles mmap/munmap lifecycle and provides container-like interface.
+ */
+template<typename T>
+class MmapRegion {
+public:
+    using value_type = T;
+
+    MmapRegion() = default;
+
+    MmapRegion(const std::string& path, bool writable = false) {
+        int flags = writable ? O_RDWR : O_RDONLY;
+        m_fd = ::open(path.c_str(), flags);
+        if (m_fd < 0) {
+            throw std::runtime_error("MmapRegion: failed to open file: " + path);
+        }
+
+        // Get file size
+        m_file_size = ::lseek(m_fd, 0, SEEK_END);
+        ::lseek(m_fd, 0, SEEK_SET);
+
+        if (m_file_size == 0) {
+            ::close(m_fd);
+            m_fd = -1;
+            throw std::runtime_error("MmapRegion: file is empty: " + path);
+        }
+
+        // Map the file
+        int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+        int mflags = writable ? MAP_PRIVATE : MAP_SHARED;  // MAP_PRIVATE allows in-place modification
+        m_data = static_cast<T*>(::mmap(nullptr, m_file_size, prot, mflags, m_fd, 0));
+
+        if (m_data == MAP_FAILED) {
+            ::close(m_fd);
+            m_fd = -1;
+            m_data = nullptr;
+            throw std::runtime_error("MmapRegion: mmap failed for: " + path);
+        }
+
+        m_size = m_file_size / sizeof(T);
+
+        // Advise kernel we'll be reading sequentially
+        ::madvise(m_data, m_file_size, MADV_SEQUENTIAL);
+    }
+
+    ~MmapRegion() {
+        if (m_data && m_data != MAP_FAILED) {
+            ::munmap(m_data, m_file_size);
+        }
+        if (m_fd >= 0) {
+            ::close(m_fd);
+        }
+    }
+
+    // Non-copyable
+    MmapRegion(const MmapRegion&) = delete;
+    MmapRegion& operator=(const MmapRegion&) = delete;
+
+    // Movable
+    MmapRegion(MmapRegion&& other) noexcept
+        : m_data(other.m_data), m_size(other.m_size),
+          m_file_size(other.m_file_size), m_fd(other.m_fd) {
+        other.m_data = nullptr;
+        other.m_size = 0;
+        other.m_file_size = 0;
+        other.m_fd = -1;
+    }
+
+    MmapRegion& operator=(MmapRegion&& other) noexcept {
+        if (this != &other) {
+            if (m_data && m_data != MAP_FAILED) {
+                ::munmap(m_data, m_file_size);
+            }
+            if (m_fd >= 0) {
+                ::close(m_fd);
+            }
+            m_data = other.m_data;
+            m_size = other.m_size;
+            m_file_size = other.m_file_size;
+            m_fd = other.m_fd;
+            other.m_data = nullptr;
+            other.m_size = 0;
+            other.m_file_size = 0;
+            other.m_fd = -1;
+        }
+        return *this;
+    }
+
+    T* data() noexcept { return m_data; }
+    const T* data() const noexcept { return m_data; }
+    std::size_t size() const noexcept { return m_size; }
+    std::size_t file_size() const noexcept { return m_file_size; }
+    bool valid() const noexcept { return m_data != nullptr && m_data != MAP_FAILED; }
+
+    T& operator[](std::size_t idx) { return m_data[idx]; }
+    const T& operator[](std::size_t idx) const { return m_data[idx]; }
+
+private:
+    T* m_data{nullptr};
+    std::size_t m_size{0};
+    std::size_t m_file_size{0};
+    int m_fd{-1};
+};
+
+/**
+ * Lightweight view into a portion of an MmapRegion.
+ * Satisfies ValidBufferContainer for use with immutable_buffer.
+ * Keeps the underlying MmapRegion alive via shared_ptr.
+ */
+template<typename T>
+class MmapView {
+public:
+    using value_type = T;
+
+    MmapView(std::shared_ptr<MmapRegion<T>> region, std::size_t offset, std::size_t count)
+        : m_region(std::move(region)), m_offset(offset), m_count(count) {}
+
+    MmapView(const MmapView&) = default;
+    MmapView& operator=(const MmapView&) = default;
+    MmapView(MmapView&&) = default;
+    MmapView& operator=(MmapView&&) = default;
+
+    T* data() noexcept { return m_region->data() + m_offset; }
+    const T* data() const noexcept { return m_region->data() + m_offset; }
+    std::size_t size() const noexcept { return m_count; }
+
+    T* begin() noexcept { return data(); }
+    T* end() noexcept { return data() + m_count; }
+    const T* begin() const noexcept { return data(); }
+    const T* end() const noexcept { return data() + m_count; }
+
+private:
+    std::shared_ptr<MmapRegion<T>> m_region;
+    std::size_t m_offset{0};
+    std::size_t m_count{0};
 };
 
 template<typename T>
@@ -58,26 +198,24 @@ private:
     // Datatype parsing
     static auto parse_datatype(std::string_view datatype_str) -> std::optional<SigmfFormat>;
 
-    // Endianness handling - swap bytes in loaded data buffer
+    // Endianness handling - swap bytes in mmap region (MAP_PRIVATE allows this)
     void apply_endianness_swap();
-    static void byte_swap_16(std::vector<T>& data);
-    static void byte_swap_32(std::vector<T>& data);
 
     output_port_t m_out_port{"data_out"};
 
     // Configuration properties
-    std::string m_file_path;              // Path to .sigmf-meta or base name
-    std::size_t m_chunk_samples{1024};    // Samples per output buffer
-    bool m_loop{false};                   // Loop file when EOF reached
-    uint32_t m_stream_id{0};              // Stream identifier
+    std::string m_file_path;
+    std::size_t m_chunk_samples{1024};
+    bool m_loop{false};
+    uint32_t m_stream_id{0};
 
     // Rate control properties
-    bool m_rate_control{true};            // Enable sample-rate pacing (default: enabled)
-    double m_max_sample_rate{-1.0};       // Max rate limit, -1 = use file's sample rate
+    bool m_rate_control{true};
+    double m_max_sample_rate{-1.0};
 
-    // File state
-    std::ifstream m_data_file;
-    std::size_t m_samples_read{0};
+    // Memory-mapped file
+    std::shared_ptr<MmapRegion<T>> m_mmap;
+    std::size_t m_current_index{0};
     std::size_t m_total_samples{0};
     bool m_eof{false};
 
@@ -89,14 +227,13 @@ private:
 
     // Rate control timing state
     double m_effective_sample_rate{0.0};
+    std::chrono::steady_clock::time_point m_start_time;
     std::chrono::steady_clock::time_point m_next_send_time;
     std::chrono::microseconds m_chunk_interval{0};
     uint32_t m_chunks_per_wakeup{1};
 
-    // Pre-loaded file data for endianness conversion
-    std::vector<T> m_file_data;
-    std::size_t m_file_data_index{0};
-    bool m_data_preloaded{false};
+    // Track samples sent for timestamp calculation
+    uint64_t m_samples_sent{0};
 };
 
 // Type aliases for common sample types
