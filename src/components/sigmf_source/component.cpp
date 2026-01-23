@@ -35,6 +35,12 @@ sigmf_source<T>::sigmf_source(std::string_view id)
     // Rate control
     add_property("rate_control", m_rate_control, RUNTIME);
     add_property("max_sample_rate", m_max_sample_rate, RUNTIME);
+
+    // Timestamp mode
+    add_property("wallclock_timestamps", m_wallclock_timestamps, RUNTIME);
+
+    // Metadata overrides
+    add_property("overrides", m_overrides, INITIALIZE);
 }
 
 template<typename T>
@@ -147,6 +153,17 @@ void sigmf_source<T>::parse_metadata() {
         logger()->error("sigmf_source: JSON parse error in '{}': {}", meta_path, e.what());
         throw std::runtime_error(std::format("sigmf_source: failed to parse metadata: {}", e.what()));
     }
+
+    // Apply property overrides (these take precedence over file metadata)
+    if (m_overrides.sample_rate.has_value()) {
+        logger()->info("sigmf_source: overriding sample_rate {} -> {}", m_sample_rate, *m_overrides.sample_rate);
+        m_sample_rate = *m_overrides.sample_rate;
+    }
+    if (m_overrides.center_frequency.has_value()) {
+        logger()->info("sigmf_source: overriding center_frequency {} -> {}", m_center_frequency, *m_overrides.center_frequency);
+        m_center_frequency = *m_overrides.center_frequency;
+    }
+    // Note: bandwidth override is applied in send_metadata_to_port()
 }
 
 template<typename T>
@@ -234,7 +251,8 @@ void sigmf_source<T>::send_metadata_to_port() {
     meta.annotations["stream_id"] = std::to_string(m_stream_id);
     meta.sample_rate = m_sample_rate;
     meta.center_frequency = m_center_frequency;
-    meta.bandwidth = m_sample_rate;  // Default bandwidth to sample rate
+    // Bandwidth: use override if set, otherwise default to sample rate
+    meta.bandwidth = m_overrides.bandwidth.value_or(m_sample_rate);
     if (!m_description.empty()) {
         meta.annotations["description"] = m_description;
     }
@@ -295,11 +313,13 @@ auto sigmf_source<T>::start() -> void {
     m_samples_sent = 0;
     m_eof = false;
 
+    // Always track start time (needed for wallclock_timestamps and rate_control)
+    auto now = std::chrono::steady_clock::now();
+    m_start_time = now;
+
     // Recalculate timing in case max_sample_rate changed
     if (m_rate_control) {
         calculate_timing();
-        auto now = std::chrono::steady_clock::now();
-        m_start_time = now;
         m_next_send_time = now;
     }
 
@@ -346,13 +366,25 @@ auto sigmf_source<T>::process_chunk() -> composite::retval {
     m_current_index += samples_to_read;
     m_samples_sent += samples_to_read;
 
-    // Create timestamp (sample-based)
+    // Create timestamp
     composite::timestamp ts;
-    if (m_effective_sample_rate > 0) {
-        double total_seconds = static_cast<double>(m_samples_sent) / m_effective_sample_rate;
-        ts.seconds = static_cast<uint32_t>(total_seconds);
-        ts.picoseconds = static_cast<uint64_t>((total_seconds - ts.seconds) * 1e12);
+    double total_seconds;
+
+    if (m_wallclock_timestamps) {
+        // Wall-clock mode: timestamp based on real elapsed time since start
+        auto now = std::chrono::steady_clock::now();
+        total_seconds = std::chrono::duration<double>(now - m_start_time).count();
+    } else {
+        // File-time mode (default): timestamp based on sample position
+        if (m_effective_sample_rate > 0) {
+            total_seconds = static_cast<double>(m_samples_sent) / m_effective_sample_rate;
+        } else {
+            total_seconds = 0.0;
+        }
     }
+
+    ts.seconds = static_cast<uint32_t>(total_seconds);
+    ts.picoseconds = static_cast<uint64_t>((total_seconds - ts.seconds) * 1e12);
 
     // Send data - zero-copy, the view keeps the mmap alive
     composite::immutable_buffer<T> buf(view);

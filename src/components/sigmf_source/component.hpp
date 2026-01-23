@@ -38,6 +38,22 @@ struct SigmfFormat {
     }
 };
 
+namespace struct_props {
+
+/**
+ * @brief Metadata override configuration for sigmf_source
+ *
+ * Allows manual override of SigMF file metadata.
+ * If a field has a value, it overrides what's in the .sigmf-meta file.
+ */
+struct sigmf_overrides {
+    std::optional<double> sample_rate;
+    std::optional<double> center_frequency;
+    std::optional<double> bandwidth;
+};
+
+} // namespace struct_props
+
 /**
  * RAII wrapper for memory-mapped file region.
  * Handles mmap/munmap lifecycle and provides container-like interface.
@@ -213,6 +229,12 @@ private:
     bool m_rate_control{true};
     double m_max_sample_rate{-1.0};
 
+    // Timestamp mode: false = file-time (sample-based), true = wall-clock
+    bool m_wallclock_timestamps{false};
+
+    // Metadata overrides (override values from .sigmf-meta file)
+    struct_props::sigmf_overrides m_overrides;
+
     // Memory-mapped file
     std::shared_ptr<MmapRegion<T>> m_mmap;
     std::size_t m_current_index{0};
@@ -242,6 +264,17 @@ using sigmf_source_ci16 = sigmf_source<std::complex<int16_t>>;
 using sigmf_source_ci8 = sigmf_source<std::complex<int8_t>>;
 using sigmf_source_f32 = sigmf_source<float>;
 using sigmf_source_i16 = sigmf_source<int16_t>;
+
+// Property traits for sigmf_overrides struct
+template<>
+struct composite::properties::property_traits<struct_props::sigmf_overrides> {
+    static void register_fields(composite::properties::property_set& ps, struct_props::sigmf_overrides& o) {
+        using enum composite::properties::config_type;
+        ps.add("sample_rate", o.sample_rate, RUNTIME);
+        ps.add("center_frequency", o.center_frequency, RUNTIME);
+        ps.add("bandwidth", o.bandwidth, RUNTIME);
+    }
+};
 
 #ifndef UNIT_TESTS
 extern "C" {
