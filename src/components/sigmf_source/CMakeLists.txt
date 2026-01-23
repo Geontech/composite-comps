@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # SPDX-FileCopyrightText: 2025 Geon Technologies, LLC
 
-# sigmf_source - Simple SigMF file source component for testing
+# sigmf_source - SigMF file source component with rate-controlled playback
+
+include(GNUInstallDirs)
 
 add_library(sigmf_source SHARED
     component.cpp
@@ -24,5 +26,5 @@ set_target_properties(sigmf_source PROPERTIES
 )
 
 install(TARGETS sigmf_source
-    LIBRARY DESTINATION lib/composite/components
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
