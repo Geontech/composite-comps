@@ -26,11 +26,14 @@ sigmf_source<T>::sigmf_source(std::string_view id)
     using enum composite::properties::config_type;
     add_port(&m_out_port);
 
-    // File configuration
-    add_property("file_path", m_file_path, INITIALIZE);
-    add_property("chunk_samples", m_chunk_samples, INITIALIZE);
+    // Enable control - starts disabled, set enabled=true after configuring
+    add_property("enabled", m_enabled, RUNTIME);
+
+    // File configuration (all RUNTIME so they can be set before enabling)
+    add_property("file_path", m_file_path, RUNTIME);
+    add_property("chunk_samples", m_chunk_samples, RUNTIME);
     add_property("loop", m_loop, RUNTIME);
-    add_property("stream_id", m_stream_id, INITIALIZE);
+    add_property("stream_id", m_stream_id, RUNTIME);
 
     // Rate control
     add_property("rate_control", m_rate_control, RUNTIME);
@@ -40,7 +43,7 @@ sigmf_source<T>::sigmf_source(std::string_view id)
     add_property("wallclock_timestamps", m_wallclock_timestamps, RUNTIME);
 
     // Metadata overrides
-    add_property("overrides", m_overrides, INITIALIZE);
+    add_property("overrides", m_overrides, RUNTIME);
 }
 
 template<typename T>
@@ -261,8 +264,34 @@ void sigmf_source<T>::send_metadata_to_port() {
 
 template<typename T>
 auto sigmf_source<T>::initialize() -> void {
+    // Component starts disabled - configure properties then set enabled=true
+    logger()->info("sigmf_source initialized (disabled, set enabled=true after configuring)");
+}
+
+template<typename T>
+auto sigmf_source<T>::property_change_handler() -> void {
+    if (m_enabled && !m_configured && !m_file_path.empty()) {
+        // Becoming enabled with a file path - configure the file
+        configure_file();
+    } else if (!m_enabled && m_configured) {
+        // Becoming disabled - release resources
+        logger()->info("sigmf_source: disabled, releasing file resources");
+        m_mmap.reset();
+        m_configured = false;
+        m_total_samples = 0;
+    }
+
+    // Recalculate timing if rate control settings changed
+    if (m_configured && m_rate_control) {
+        calculate_timing();
+    }
+}
+
+template<typename T>
+void sigmf_source<T>::configure_file() {
     if (m_file_path.empty()) {
-        throw std::runtime_error("sigmf_source: file_path property is required");
+        logger()->warn("sigmf_source: cannot configure - file_path is empty");
+        return;
     }
 
     parse_metadata();
@@ -301,14 +330,15 @@ auto sigmf_source<T>::initialize() -> void {
         calculate_timing();
     }
 
-    logger()->info("sigmf_source initialized: {} samples ({} MB), sr={} Hz, cf={} Hz, rate_control={}",
+    m_configured = true;
+    logger()->info("sigmf_source configured: {} samples ({} MB), sr={} Hz, cf={} Hz, rate_control={}",
                   m_total_samples, m_mmap->file_size() / (1024 * 1024),
                   m_sample_rate, m_center_frequency, m_rate_control);
 }
 
 template<typename T>
 auto sigmf_source<T>::start() -> void {
-    logger()->info("sigmf_source starting playback");
+    logger()->info("sigmf_source starting (enabled={}, configured={})", m_enabled, m_configured);
     m_current_index = 0;
     m_samples_sent = 0;
     m_eof = false;
@@ -317,13 +347,16 @@ auto sigmf_source<T>::start() -> void {
     auto now = std::chrono::steady_clock::now();
     m_start_time = now;
 
-    // Recalculate timing in case max_sample_rate changed
-    if (m_rate_control) {
-        calculate_timing();
-        m_next_send_time = now;
+    // Only do full setup if configured
+    if (m_configured) {
+        // Recalculate timing in case max_sample_rate changed
+        if (m_rate_control) {
+            calculate_timing();
+            m_next_send_time = now;
+        }
+        send_metadata_to_port();
     }
 
-    send_metadata_to_port();
     composite::component::start();
 }
 
@@ -396,6 +429,11 @@ auto sigmf_source<T>::process_chunk() -> composite::retval {
 template<typename T>
 auto sigmf_source<T>::process() -> composite::retval {
     using enum composite::retval;
+
+    // Don't process if not enabled or not configured
+    if (!m_enabled || !m_configured) {
+        return NOOP;
+    }
 
     if (!m_rate_control) {
         // Fast-as-possible mode - just process one chunk

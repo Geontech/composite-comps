@@ -204,10 +204,12 @@ public:
     auto start() -> void override;
     auto stop() -> void override;
     auto process() -> composite::retval override;
+    auto property_change_handler() -> void override;
 
 private:
     void parse_metadata();
     void send_metadata_to_port();
+    void configure_file();  // Load/mmap file when enabled
     void calculate_timing();
     auto process_chunk() -> composite::retval;
 
@@ -220,8 +222,9 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Configuration properties
+    bool m_enabled{false};
     std::string m_file_path;
-    std::size_t m_chunk_samples{1024};
+    std::size_t m_chunk_samples{8192};
     bool m_loop{false};
     uint32_t m_stream_id{0};
 
@@ -240,6 +243,7 @@ private:
     std::size_t m_current_index{0};
     std::size_t m_total_samples{0};
     bool m_eof{false};
+    bool m_configured{false};  // True once file is loaded and ready
 
     // Metadata from SigMF file
     double m_sample_rate{0.0};
