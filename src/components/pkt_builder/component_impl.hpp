@@ -67,10 +67,15 @@ namespace {
                 return 0x01;
         }
     }
+
+    // Calculate bytes per sample from format metadata
+    inline auto bytes_per_sample(const composite::data_format& fmt) -> size_t {
+        size_t bytes = fmt.bit_width / 8;
+        return fmt.is_complex ? bytes * 2 : bytes;
+    }
 } // anonymous namespace
 
-template<typename T>
-pkt_builder<T>::pkt_builder(std::string_view id) : composite::component(id) {
+pkt_builder::pkt_builder(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
     using enum composite::properties::config_type;
@@ -93,19 +98,13 @@ pkt_builder<T>::pkt_builder(std::string_view id) : composite::component(id) {
     add_property("include_timestamp", m_include_timestamp, RUNTIME);
     add_property("warn_on_missing_metadata", m_warn_on_missing_metadata, RUNTIME);
 
-    // Log the configured sample type
-    logger()->info("pkt_builder configured for {} {} samples ({}-bit)",
-                   traits::is_complex ? "complex" : "real",
-                   traits::data_type == composite::data_type::floating_point ? "float" :
-                   traits::data_type == composite::data_type::signed_integer ? "signed int" : "unsigned int",
-                   traits::bit_width);
+    logger()->info("pkt_builder initialized (datatype determined from incoming metadata)");
 }
 
-template<typename T>
-auto pkt_builder<T>::process() -> composite::retval {
+auto pkt_builder::process() -> composite::retval {
     using enum composite::retval;
 
-    // Get input data
+    // Get input data (as raw bytes with format metadata)
     auto [data, timestamp, metadata_opt] = m_in_port.get_data();
     if (!data) {
         return NORMAL;
@@ -125,7 +124,7 @@ auto pkt_builder<T>::process() -> composite::retval {
         metadata = state.last_metadata;
     }
 
-    // Apply default values and set format based on template type
+    // Apply default RF values (format comes from upstream metadata)
     apply_defaults(metadata);
 
     // Validate metadata and warn if necessary
@@ -142,12 +141,22 @@ auto pkt_builder<T>::process() -> composite::retval {
         state.context_packet_count = (state.context_packet_count + 1) % 16;
     }
 
+    // Calculate bytes per sample from format metadata
+    size_t sample_size = bytes_per_sample(metadata.format);
+    if (sample_size == 0) {
+        logger()->warn("pkt_builder: invalid format metadata (bytes_per_sample=0), skipping packet");
+        return NORMAL;
+    }
+
+    // max_payload_size is in samples, convert to bytes for chunking
+    size_t max_chunk_bytes = m_max_payload_size * sample_size;
+
     // Build and send data packet(s)
     // Split large payloads into multiple packets if needed
     size_t offset = 0;
     while (offset < data.size()) {
-        auto chunk_size = std::min(static_cast<size_t>(m_max_payload_size), data.size() - offset);
-        auto chunk = data.slice(offset, chunk_size);
+        auto chunk_bytes = std::min(max_chunk_bytes, data.size() - offset);
+        auto chunk = data.slice(offset, chunk_bytes);
 
         auto data_vec = build_data_packet(state, chunk, timestamp);
         auto data_buf = composite::immutable_buffer<uint8_t>(std::move(data_vec));
@@ -157,7 +166,7 @@ auto pkt_builder<T>::process() -> composite::retval {
 
         state.data_packet_count = (state.data_packet_count + 1) % 16;
 
-        offset += chunk_size;
+        offset += chunk_bytes;
     }
 
     // Update stream state
@@ -167,8 +176,7 @@ auto pkt_builder<T>::process() -> composite::retval {
     return NORMAL;
 }
 
-template<typename T>
-auto pkt_builder<T>::get_stream_id(const composite::metadata& metadata) -> uint32_t {
+auto pkt_builder::get_stream_id(const composite::metadata& metadata) -> uint32_t {
     if (auto it = metadata.annotations.find(m_stream_id_key); it != metadata.annotations.end()) {
         try {
             return static_cast<uint32_t>(std::stoul(it->second));
@@ -179,8 +187,7 @@ auto pkt_builder<T>::get_stream_id(const composite::metadata& metadata) -> uint3
     return m_default_stream_id;
 }
 
-template<typename T>
-auto pkt_builder<T>::get_or_create_stream_state(uint32_t stream_id) -> stream_state& {
+auto pkt_builder::get_or_create_stream_state(uint32_t stream_id) -> stream_state& {
     if (auto it = m_stream_states.find(stream_id); it != m_stream_states.end()) {
         return it->second;
     }
@@ -192,15 +199,9 @@ auto pkt_builder<T>::get_or_create_stream_state(uint32_t stream_id) -> stream_st
     return state;
 }
 
-template<typename T>
-auto pkt_builder<T>::apply_defaults(composite::metadata& metadata) -> void {
-    // Always set format based on template type - this ensures the context packet
-    // correctly describes the actual data format regardless of input metadata
-    metadata.format.is_complex = traits::is_complex;
-    metadata.format.type = traits::data_type;
-    metadata.format.bit_width = traits::bit_width;
-
-    // Apply default RF parameters if not set (zero indicates not set)
+auto pkt_builder::apply_defaults(composite::metadata& metadata) -> void {
+    // Format comes from upstream metadata (e.g., sigmf_source)
+    // Only apply default RF parameters if not set (zero indicates not set)
     if (metadata.center_frequency == 0.0 && m_default_center_frequency != 0.0) {
         metadata.center_frequency = m_default_center_frequency;
     }
@@ -212,8 +213,7 @@ auto pkt_builder<T>::apply_defaults(composite::metadata& metadata) -> void {
     }
 }
 
-template<typename T>
-auto pkt_builder<T>::validate_metadata(stream_state& state, const composite::metadata& metadata) -> void {
+auto pkt_builder::validate_metadata(stream_state& state, const composite::metadata& metadata) -> void {
     if (!m_warn_on_missing_metadata || state.warned_missing_metadata) {
         return;
     }
@@ -233,6 +233,10 @@ auto pkt_builder<T>::validate_metadata(stream_state& state, const composite::met
         warnings += "center_frequency=0 ";
         has_warnings = true;
     }
+    if (metadata.format.bit_width == 0) {
+        warnings += "format.bit_width=0 ";
+        has_warnings = true;
+    }
 
     if (has_warnings) {
         logger()->warn("stream_id={}: Context packet will have incomplete metadata: {}. "
@@ -242,8 +246,7 @@ auto pkt_builder<T>::validate_metadata(stream_state& state, const composite::met
     }
 }
 
-template<typename T>
-auto pkt_builder<T>::metadata_changed(const composite::metadata& current, const composite::metadata& previous) -> bool {
+auto pkt_builder::metadata_changed(const composite::metadata& current, const composite::metadata& previous) -> bool {
     return current.center_frequency != previous.center_frequency ||
            current.bandwidth != previous.bandwidth ||
            current.sample_rate != previous.sample_rate ||
@@ -253,8 +256,7 @@ auto pkt_builder<T>::metadata_changed(const composite::metadata& current, const 
            current.format.endianness != previous.format.endianness;
 }
 
-template<typename T>
-auto pkt_builder<T>::should_send_context(stream_state& state, const composite::metadata& metadata) -> bool {
+auto pkt_builder::should_send_context(stream_state& state, const composite::metadata& metadata) -> bool {
     // Always send on first packet
     if (state.first_packet) {
         return true;
@@ -277,8 +279,7 @@ auto pkt_builder<T>::should_send_context(stream_state& state, const composite::m
     return false;
 }
 
-template<typename T>
-auto pkt_builder<T>::build_context_packet(const stream_state& state, const composite::metadata& metadata) -> std::shared_ptr<std::vector<uint8_t>> {
+auto pkt_builder::build_context_packet(const stream_state& state, const composite::metadata& metadata) -> std::shared_ptr<std::vector<uint8_t>> {
     // Calculate packet size
     size_t packet_size = VITA49_HEADER_SIZE;
     packet_size += STREAM_ID_SIZE;
@@ -332,11 +333,10 @@ auto pkt_builder<T>::build_context_packet(const stream_state& state, const compo
     return vec;
 }
 
-template<typename T>
-auto pkt_builder<T>::build_data_packet(stream_state& state, const composite::immutable_buffer<T>& payload,
+auto pkt_builder::build_data_packet(stream_state& state, const composite::immutable_buffer<std::byte>& payload,
                                         const composite::timestamp& ts) -> std::shared_ptr<std::vector<uint8_t>> {
-    // Calculate packet size using actual sample type size
-    size_t payload_bytes = payload.size() * sizeof(T);
+    // Payload is already in bytes (raw data from upstream)
+    size_t payload_bytes = payload.size();
     size_t packet_size = VITA49_HEADER_SIZE;
     packet_size += STREAM_ID_SIZE;
     if (m_include_class_id) {
@@ -385,8 +385,7 @@ auto pkt_builder<T>::build_data_packet(stream_state& state, const composite::imm
     return vec;
 }
 
-template<typename T>
-auto pkt_builder<T>::write_header(uint8_t* dest, bool is_context, bool has_stream_id, bool has_class_id,
+auto pkt_builder::write_header(uint8_t* dest, bool is_context, bool has_stream_id, bool has_class_id,
                                    bool has_timestamp, uint16_t packet_size_words, uint16_t packet_count) -> size_t {
     uint32_t header = 0;
 
@@ -429,14 +428,12 @@ auto pkt_builder<T>::write_header(uint8_t* dest, bool is_context, bool has_strea
     return VITA49_HEADER_SIZE;
 }
 
-template<typename T>
-auto pkt_builder<T>::write_stream_id(uint8_t* dest, uint32_t stream_id) -> size_t {
+auto pkt_builder::write_stream_id(uint8_t* dest, uint32_t stream_id) -> size_t {
     write_u32_be(dest, stream_id);
     return STREAM_ID_SIZE;
 }
 
-template<typename T>
-auto pkt_builder<T>::write_class_id(uint8_t* dest) -> size_t {
+auto pkt_builder::write_class_id(uint8_t* dest) -> size_t {
     // Write OUI (upper 24 bits of first word) + reserved (lower 8 bits)
     uint32_t class_id_upper = (m_oui << 8);
     write_u32_be(dest, class_id_upper);
@@ -448,8 +445,7 @@ auto pkt_builder<T>::write_class_id(uint8_t* dest) -> size_t {
     return CLASS_ID_SIZE;
 }
 
-template<typename T>
-auto pkt_builder<T>::write_timestamp(uint8_t* dest, const composite::timestamp& ts) -> size_t {
+auto pkt_builder::write_timestamp(uint8_t* dest, const composite::timestamp& ts) -> size_t {
     // Integer timestamp (seconds since epoch)
     write_u32_be(dest, static_cast<uint32_t>(ts.seconds));
 
@@ -459,8 +455,7 @@ auto pkt_builder<T>::write_timestamp(uint8_t* dest, const composite::timestamp& 
     return INTEGER_TS_SIZE + FRACTIONAL_TS_SIZE;
 }
 
-template<typename T>
-auto pkt_builder<T>::write_context_fields(uint8_t* dest, const composite::metadata& metadata) -> size_t {
+auto pkt_builder::write_context_fields(uint8_t* dest, const composite::metadata& metadata) -> size_t {
     size_t offset = 0;
 
     // CIF0 (Context Indicator Field 0)

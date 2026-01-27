@@ -20,14 +20,13 @@
 #include <stdexcept>
 #include <thread>
 
-template<typename T>
-sigmf_source<T>::sigmf_source(std::string_view id)
+sigmf_source::sigmf_source(std::string_view id)
     : composite::component(id) {
     using enum composite::properties::config_type;
     add_port(&m_out_port);
 
-    // Enable control - starts disabled, set enabled=true after configuring
-    add_property("enabled", m_enabled, RUNTIME);
+    // Streaming control - starts disabled, set streaming=true after configuring file_path
+    add_property("streaming", m_streaming, RUNTIME);
 
     // File configuration (all RUNTIME so they can be set before enabling)
     add_property("file_path", m_file_path, RUNTIME);
@@ -46,8 +45,7 @@ sigmf_source<T>::sigmf_source(std::string_view id)
     add_property("overrides", m_overrides, RUNTIME);
 }
 
-template<typename T>
-auto sigmf_source<T>::parse_datatype(std::string_view sv) -> std::optional<SigmfFormat> {
+auto sigmf_source::parse_datatype(std::string_view sv) -> std::optional<SigmfFormat> {
     // Parse SigMF datatype format: [r|c][f|i|u]{bitwidth}[_le|_be]
     // Examples: cf32_le, ri16_be, cu8
     SigmfFormat fmt;
@@ -98,8 +96,28 @@ auto sigmf_source<T>::parse_datatype(std::string_view sv) -> std::optional<Sigmf
     return fmt;
 }
 
-template<typename T>
-void sigmf_source<T>::parse_metadata() {
+auto sigmf_source::to_composite_format(const SigmfFormat& fmt) -> composite::data_format {
+    composite::data_format df;
+    df.is_complex = fmt.is_complex;
+    df.bit_width = fmt.bitwidth;
+    df.endianness = fmt.is_big_endian ? std::endian::big : std::endian::little;
+
+    switch (fmt.datatype) {
+        case SigmfFormat::DataType::FLOAT:
+            df.type = composite::data_type::floating_point;
+            break;
+        case SigmfFormat::DataType::SIGNED_INT:
+            df.type = composite::data_type::signed_integer;
+            break;
+        case SigmfFormat::DataType::UNSIGNED_INT:
+            df.type = composite::data_type::unsigned_integer;
+            break;
+    }
+
+    return df;
+}
+
+void sigmf_source::parse_metadata() {
     std::string meta_path = m_file_path;
     if (meta_path.ends_with(".sigmf-data")) {
         meta_path = meta_path.substr(0, meta_path.length() - 11) + ".sigmf-meta";
@@ -169,8 +187,7 @@ void sigmf_source<T>::parse_metadata() {
     // Note: bandwidth override is applied in send_metadata_to_port()
 }
 
-template<typename T>
-void sigmf_source<T>::apply_endianness_swap() {
+void sigmf_source::apply_endianness_swap() {
     // Only swap if file is big-endian and host is little-endian (or vice versa)
     // x86/x64 is always little-endian
     constexpr bool host_is_little_endian = (std::endian::native == std::endian::little);
@@ -209,8 +226,7 @@ void sigmf_source<T>::apply_endianness_swap() {
     }
 }
 
-template<typename T>
-void sigmf_source<T>::calculate_timing() {
+void sigmf_source::calculate_timing() {
     // Determine effective sample rate
     m_effective_sample_rate = m_sample_rate;
     if (m_max_sample_rate > 0 && m_max_sample_rate < m_sample_rate) {
@@ -248,8 +264,7 @@ void sigmf_source<T>::calculate_timing() {
                   m_effective_sample_rate, m_chunk_samples, m_chunks_per_wakeup, m_chunk_interval.count());
 }
 
-template<typename T>
-void sigmf_source<T>::send_metadata_to_port() {
+void sigmf_source::send_metadata_to_port() {
     composite::metadata meta;
     meta.annotations["stream_id"] = std::to_string(m_stream_id);
     meta.sample_rate = m_sample_rate;
@@ -259,26 +274,35 @@ void sigmf_source<T>::send_metadata_to_port() {
     if (!m_description.empty()) {
         meta.annotations["description"] = m_description;
     }
+    // Include format info from the SigMF file so downstream knows the data type
+    meta.format = to_composite_format(m_format);
+    logger()->debug("sigmf_source: sending metadata with format: complex={}, type={}, bits={}",
+                   meta.format.is_complex, static_cast<int>(meta.format.type), meta.format.bit_width);
     m_out_port.send_metadata(meta);
 }
 
-template<typename T>
-auto sigmf_source<T>::initialize() -> void {
-    // Component starts disabled - configure properties then set enabled=true
-    logger()->info("sigmf_source initialized (disabled, set enabled=true after configuring)");
+auto sigmf_source::initialize() -> void {
+    // Component starts with streaming disabled - configure properties then set streaming=true
+    logger()->info("sigmf_source initialized (streaming disabled, set streaming=true after configuring file_path)");
 }
 
-template<typename T>
-auto sigmf_source<T>::property_change_handler() -> void {
-    if (m_enabled && !m_configured && !m_file_path.empty()) {
+auto sigmf_source::property_change_handler() -> void {
+    logger()->info("sigmf_source: property_change_handler called - streaming={}, configured={}, file_path='{}'",
+                   m_streaming, m_configured, m_file_path);
+
+    if (m_streaming && !m_configured && !m_file_path.empty()) {
         // Becoming enabled with a file path - configure the file
+        logger()->info("sigmf_source: triggering configure_file()");
         configure_file();
-    } else if (!m_enabled && m_configured) {
+    } else if (!m_streaming && m_configured) {
         // Becoming disabled - release resources
-        logger()->info("sigmf_source: disabled, releasing file resources");
+        logger()->info("sigmf_source: streaming disabled, releasing file resources");
         m_mmap.reset();
         m_configured = false;
         m_total_samples = 0;
+    } else {
+        logger()->info("sigmf_source: no action taken (streaming={}, configured={}, file_path_empty={})",
+                       m_streaming, m_configured, m_file_path.empty());
     }
 
     // Recalculate timing if rate control settings changed
@@ -287,13 +311,15 @@ auto sigmf_source<T>::property_change_handler() -> void {
     }
 }
 
-template<typename T>
-void sigmf_source<T>::configure_file() {
+void sigmf_source::configure_file() {
+    logger()->info("sigmf_source: configure_file() called with file_path='{}'", m_file_path);
+
     if (m_file_path.empty()) {
         logger()->warn("sigmf_source: cannot configure - file_path is empty");
         return;
     }
 
+    logger()->info("sigmf_source: calling parse_metadata()");
     parse_metadata();
 
     // Determine data file path
@@ -313,11 +339,19 @@ void sigmf_source<T>::configure_file() {
     constexpr bool host_is_little_endian = (std::endian::native == std::endian::little);
     bool needs_swap = (m_format.is_big_endian == host_is_little_endian) && (m_format.bitwidth >= 16);
 
-    // Memory-map the file
+    // Calculate bytes per sample from format
+    m_bytes_per_sample = m_format.bytes_per_sample();
+    if (m_bytes_per_sample == 0) {
+        throw std::runtime_error("sigmf_source: invalid format - bytes_per_sample is 0");
+    }
+
+    // Memory-map the file as raw bytes
     // Use writable=true if we need to swap bytes (MAP_PRIVATE allows in-place modification)
-    logger()->info("sigmf_source: memory-mapping file {} (writable={})", data_path, needs_swap);
-    m_mmap = std::make_shared<MmapRegion<T>>(data_path, needs_swap);
-    m_total_samples = m_mmap->size();
+    logger()->info("sigmf_source: memory-mapping file {} (writable={}, bytes_per_sample={})",
+                  data_path, needs_swap, m_bytes_per_sample);
+    m_mmap = std::make_shared<MmapRegion<std::byte>>(data_path, needs_swap);
+    m_total_samples = m_mmap->file_size() / m_bytes_per_sample;
+    m_current_byte_offset = 0;
 
     // Apply endianness conversion in-place if needed
     if (needs_swap) {
@@ -331,15 +365,17 @@ void sigmf_source<T>::configure_file() {
     }
 
     m_configured = true;
-    logger()->info("sigmf_source configured: {} samples ({} MB), sr={} Hz, cf={} Hz, rate_control={}",
+    logger()->info("sigmf_source configured: {} samples ({} MB), format={}, sr={} Hz, cf={} Hz, rate_control={}",
                   m_total_samples, m_mmap->file_size() / (1024 * 1024),
-                  m_sample_rate, m_center_frequency, m_rate_control);
+                  m_format.datatype_str, m_sample_rate, m_center_frequency, m_rate_control);
+
+    // Send metadata to downstream components
+    send_metadata_to_port();
 }
 
-template<typename T>
-auto sigmf_source<T>::start() -> void {
-    logger()->info("sigmf_source starting (enabled={}, configured={})", m_enabled, m_configured);
-    m_current_index = 0;
+auto sigmf_source::start() -> void {
+    logger()->info("sigmf_source starting (streaming={}, configured={})", m_streaming, m_configured);
+    m_current_byte_offset = 0;
     m_samples_sent = 0;
     m_eof = false;
 
@@ -360,14 +396,12 @@ auto sigmf_source<T>::start() -> void {
     composite::component::start();
 }
 
-template<typename T>
-auto sigmf_source<T>::stop() -> void {
+auto sigmf_source::stop() -> void {
     // mmap is cleaned up automatically via shared_ptr
     composite::component::stop();
 }
 
-template<typename T>
-auto sigmf_source<T>::process_chunk() -> composite::retval {
+auto sigmf_source::process_chunk() -> composite::retval {
     using enum composite::retval;
 
     if (m_eof && !m_loop) {
@@ -377,13 +411,14 @@ auto sigmf_source<T>::process_chunk() -> composite::retval {
     if (m_eof && m_loop) {
         // Reset to beginning for looping
         logger()->trace("sigmf_source: looping back to start");
-        m_current_index = 0;
+        m_current_byte_offset = 0;
         m_eof = false;
         send_metadata_to_port();
     }
 
-    // Calculate samples to read
-    std::size_t samples_remaining = m_total_samples - m_current_index;
+    // Calculate samples to read (working in sample units, converting to bytes for mmap)
+    std::size_t current_sample = m_current_byte_offset / m_bytes_per_sample;
+    std::size_t samples_remaining = m_total_samples - current_sample;
     std::size_t samples_to_read = std::min(m_chunk_samples, samples_remaining);
 
     if (samples_to_read == 0) {
@@ -394,9 +429,12 @@ auto sigmf_source<T>::process_chunk() -> composite::retval {
         return NOOP;
     }
 
-    // Create zero-copy view into the mmap region
-    auto view = std::make_shared<MmapView<T>>(m_mmap, m_current_index, samples_to_read);
-    m_current_index += samples_to_read;
+    // Convert to bytes for the mmap view
+    std::size_t bytes_to_read = samples_to_read * m_bytes_per_sample;
+
+    // Create zero-copy view into the mmap region (in bytes)
+    auto view = std::make_shared<MmapView<std::byte>>(m_mmap, m_current_byte_offset, bytes_to_read);
+    m_current_byte_offset += bytes_to_read;
     m_samples_sent += samples_to_read;
 
     // Create timestamp
@@ -420,18 +458,17 @@ auto sigmf_source<T>::process_chunk() -> composite::retval {
     ts.picoseconds = static_cast<uint64_t>((total_seconds - ts.seconds) * 1e12);
 
     // Send data - zero-copy, the view keeps the mmap alive
-    composite::immutable_buffer<T> buf(view);
+    composite::immutable_buffer<std::byte> buf(view);
     m_out_port.send_data(std::move(buf), ts);
 
     return NORMAL;
 }
 
-template<typename T>
-auto sigmf_source<T>::process() -> composite::retval {
+auto sigmf_source::process() -> composite::retval {
     using enum composite::retval;
 
-    // Don't process if not enabled or not configured
-    if (!m_enabled || !m_configured) {
+    // Don't process if not streaming or not configured
+    if (!m_streaming || !m_configured) {
         return NOOP;
     }
 
@@ -484,28 +521,10 @@ auto sigmf_source<T>::process() -> composite::retval {
     return NORMAL;
 }
 
-// Explicit template instantiations
-template class sigmf_source<std::complex<float>>;
-template class sigmf_source<std::complex<int16_t>>;
-template class sigmf_source<std::complex<int8_t>>;
-template class sigmf_source<float>;
-template class sigmf_source<int16_t>;
-
 #ifndef UNIT_TESTS
 extern "C" {
-auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
-    if (type == "cf32" || type.empty()) {
-        return std::make_shared<sigmf_source_cf32>(id);
-    } else if (type == "ci16") {
-        return std::make_shared<sigmf_source_ci16>(id);
-    } else if (type == "ci8") {
-        return std::make_shared<sigmf_source_ci8>(id);
-    } else if (type == "f32") {
-        return std::make_shared<sigmf_source_f32>(id);
-    } else if (type == "i16") {
-        return std::make_shared<sigmf_source_i16>(id);
-    }
-    throw std::runtime_error(std::format("sigmf_source: unknown type '{}'", type));
+auto create(std::string_view id) -> std::shared_ptr<composite::component> {
+    return std::make_shared<sigmf_source>(id);
 }
 }
 #endif

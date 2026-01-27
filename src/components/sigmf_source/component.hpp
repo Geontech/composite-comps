@@ -192,9 +192,17 @@ private:
     std::size_t m_count{0};
 };
 
-template<typename T>
+/**
+ * @brief SigMF file source component with dynamic datatype support
+ *
+ * Reads SigMF files and outputs raw bytes with format metadata.
+ * The datatype is determined at runtime from the .sigmf-meta file,
+ * allowing dynamic file switching via REST API without recompilation.
+ *
+ * Output: immutable_buffer<std::byte> with metadata.format populated
+ */
 class sigmf_source : public composite::component {
-    using output_port_t = composite::output_port<composite::immutable_buffer<T>>;
+    using output_port_t = composite::output_port<composite::immutable_buffer<std::byte>>;
 
 public:
     explicit sigmf_source(std::string_view id = "sigmf_source");
@@ -219,10 +227,13 @@ private:
     // Endianness handling - swap bytes in mmap region (MAP_PRIVATE allows this)
     void apply_endianness_swap();
 
+    // Helper to convert SigmfFormat to composite::data_format
+    static auto to_composite_format(const SigmfFormat& fmt) -> composite::data_format;
+
     output_port_t m_out_port{"data_out"};
 
     // Configuration properties
-    bool m_enabled{false};
+    bool m_streaming{false};
     std::string m_file_path;
     std::size_t m_chunk_samples{8192};
     bool m_loop{false};
@@ -238,10 +249,11 @@ private:
     // Metadata overrides (override values from .sigmf-meta file)
     struct_props::sigmf_overrides m_overrides;
 
-    // Memory-mapped file
-    std::shared_ptr<MmapRegion<T>> m_mmap;
-    std::size_t m_current_index{0};
+    // Memory-mapped file (as raw bytes)
+    std::shared_ptr<MmapRegion<std::byte>> m_mmap;
+    std::size_t m_current_byte_offset{0};
     std::size_t m_total_samples{0};
+    std::size_t m_bytes_per_sample{0};
     bool m_eof{false};
     bool m_configured{false};  // True once file is loaded and ready
 
@@ -262,13 +274,6 @@ private:
     uint64_t m_samples_sent{0};
 };
 
-// Type aliases for common sample types
-using sigmf_source_cf32 = sigmf_source<std::complex<float>>;
-using sigmf_source_ci16 = sigmf_source<std::complex<int16_t>>;
-using sigmf_source_ci8 = sigmf_source<std::complex<int8_t>>;
-using sigmf_source_f32 = sigmf_source<float>;
-using sigmf_source_i16 = sigmf_source<int16_t>;
-
 // Property traits for sigmf_overrides struct
 template<>
 struct composite::properties::property_traits<struct_props::sigmf_overrides> {
@@ -282,6 +287,6 @@ struct composite::properties::property_traits<struct_props::sigmf_overrides> {
 
 #ifndef UNIT_TESTS
 extern "C" {
-auto create(std::string_view id, std::string_view type = "cf32") -> std::shared_ptr<composite::component>;
+auto create(std::string_view id) -> std::shared_ptr<composite::component>;
 }
 #endif

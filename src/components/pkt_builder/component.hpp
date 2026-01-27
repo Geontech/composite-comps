@@ -30,118 +30,18 @@
 #include <type_traits>
 #include <unordered_map>
 
-namespace pkt_builder_detail {
-
-// Type traits for sample type detection
-template<typename T>
-struct sample_traits {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::signed_integer;
-    static constexpr uint8_t bit_width = sizeof(T) * 8;
-    using scalar_type = T;
-};
-
-// Specialization for std::complex types
-template<typename T>
-struct sample_traits<std::complex<T>> {
-    static constexpr bool is_complex = true;
-    static constexpr composite::data_type data_type = sample_traits<T>::data_type;
-    static constexpr uint8_t bit_width = sizeof(T) * 8;
-    using scalar_type = T;
-};
-
-// Specialization for float
-template<>
-struct sample_traits<float> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::floating_point;
-    static constexpr uint8_t bit_width = 32;
-    using scalar_type = float;
-};
-
-// Specialization for double
-template<>
-struct sample_traits<double> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::floating_point;
-    static constexpr uint8_t bit_width = 64;
-    using scalar_type = double;
-};
-
-// Specialization for int8_t
-template<>
-struct sample_traits<int8_t> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::signed_integer;
-    static constexpr uint8_t bit_width = 8;
-    using scalar_type = int8_t;
-};
-
-// Specialization for uint8_t
-template<>
-struct sample_traits<uint8_t> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::unsigned_integer;
-    static constexpr uint8_t bit_width = 8;
-    using scalar_type = uint8_t;
-};
-
-// Specialization for int16_t
-template<>
-struct sample_traits<int16_t> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::signed_integer;
-    static constexpr uint8_t bit_width = 16;
-    using scalar_type = int16_t;
-};
-
-// Specialization for uint16_t
-template<>
-struct sample_traits<uint16_t> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::unsigned_integer;
-    static constexpr uint8_t bit_width = 16;
-    using scalar_type = uint16_t;
-};
-
-// Specialization for int32_t
-template<>
-struct sample_traits<int32_t> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::signed_integer;
-    static constexpr uint8_t bit_width = 32;
-    using scalar_type = int32_t;
-};
-
-// Specialization for uint32_t
-template<>
-struct sample_traits<uint32_t> {
-    static constexpr bool is_complex = false;
-    static constexpr composite::data_type data_type = composite::data_type::unsigned_integer;
-    static constexpr uint8_t bit_width = 32;
-    using scalar_type = uint32_t;
-};
-
-} // namespace pkt_builder_detail
-
 /**
- * @brief VITA-49 packet builder component
+ * @brief VITA-49 packet builder component with dynamic datatype support
  *
  * Converts signal data into VITA-49 formatted packets with proper headers,
- * timestamps, and context packets. Supports multiple data types via template.
+ * timestamps, and context packets. Datatype is determined at runtime from
+ * incoming metadata.format, allowing dynamic format changes via REST API.
  *
- * @tparam T Sample type (e.g., std::complex<float>, std::complex<int16_t>, float)
- *
- * Supported types:
- *   - std::complex<float>  - 32-bit complex float
- *   - std::complex<int16_t> - 16-bit complex signed integer
- *   - std::complex<int8_t>  - 8-bit complex signed integer
- *   - float, int16_t, int8_t - real data types
+ * Input: immutable_buffer<std::byte> with metadata.format describing the data
+ * Output: immutable_buffer<uint8_t> containing VITA-49 packets
  */
-template<typename T>
 class pkt_builder : public composite::component {
-    using traits = pkt_builder_detail::sample_traits<T>;
-    using input_port_t = composite::input_port<composite::immutable_buffer<T>>;
+    using input_port_t = composite::input_port<composite::immutable_buffer<std::byte>>;
     using output_port_t = composite::output_port<composite::immutable_buffer<uint8_t>>;
 
 public:
@@ -193,7 +93,7 @@ private:
     auto metadata_changed(const composite::metadata& current, const composite::metadata& previous) -> bool;
     auto should_send_context(stream_state& state, const composite::metadata& metadata) -> bool;
     auto build_context_packet(const stream_state& state, const composite::metadata& metadata) -> std::shared_ptr<std::vector<uint8_t>>;
-    auto build_data_packet(stream_state& state, const composite::immutable_buffer<T>& payload, const composite::timestamp& ts) -> std::shared_ptr<std::vector<uint8_t>>;
+    auto build_data_packet(stream_state& state, const composite::immutable_buffer<std::byte>& payload, const composite::timestamp& ts) -> std::shared_ptr<std::vector<uint8_t>>;
     auto write_header(uint8_t* dest, bool is_context, bool has_stream_id, bool has_class_id,
                       bool has_timestamp, uint16_t packet_size, uint16_t packet_count) -> size_t;
     auto write_stream_id(uint8_t* dest, uint32_t stream_id) -> size_t;
@@ -203,9 +103,8 @@ private:
 
 }; // class pkt_builder
 
-// Common type aliases for convenience
-using pkt_builder_cf32 = pkt_builder<std::complex<float>>;
-using pkt_builder_ci16 = pkt_builder<std::complex<int16_t>>;
-using pkt_builder_ci8 = pkt_builder<std::complex<int8_t>>;
-using pkt_builder_f32 = pkt_builder<float>;
-using pkt_builder_i16 = pkt_builder<int16_t>;
+#ifndef UNIT_TESTS
+extern "C" {
+auto create(std::string_view id) -> std::shared_ptr<composite::component>;
+}
+#endif

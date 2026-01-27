@@ -19,32 +19,10 @@
 
 #include "component_impl.hpp"
 
-#include <format>
-#include <stdexcept>
-
-// Explicit template instantiations for common types
-template class pkt_builder<std::complex<float>>;
-template class pkt_builder<std::complex<int16_t>>;
-template class pkt_builder<std::complex<int8_t>>;
-template class pkt_builder<float>;
-template class pkt_builder<int16_t>;
-
-// Factory function with type selector
 #ifndef UNIT_TESTS
 extern "C" {
-    auto create(std::string_view id, std::string_view type = "cf32") -> std::shared_ptr<composite::component> {
-        if (type == "cf32" || type.empty()) {
-            return std::make_shared<pkt_builder_cf32>(id);
-        } else if (type == "ci16") {
-            return std::make_shared<pkt_builder_ci16>(id);
-        } else if (type == "ci8") {
-            return std::make_shared<pkt_builder_ci8>(id);
-        } else if (type == "f32") {
-            return std::make_shared<pkt_builder_f32>(id);
-        } else if (type == "i16") {
-            return std::make_shared<pkt_builder_i16>(id);
-        }
-        throw std::runtime_error(std::format("unknown type '{}' for pkt_builder component", type));
-    }
+auto create(std::string_view id) -> std::shared_ptr<composite::component> {
+    return std::make_shared<pkt_builder>(id);
+}
 }
 #endif
