@@ -5,7 +5,6 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 
 #include "../component.hpp"
-#include "../component_impl.hpp"
 #include "../../pkt_debug/component.hpp"
 
 #include <composite/composite.hpp>
@@ -20,31 +19,60 @@ using Catch::Matchers::WithinAbs;
 // Test Fixture - Connects pkt_builder to pkt_debug for end-to-end testing
 // =============================================================================
 
+// Helper to get composite::data_format for a type
+template<typename T>
+auto get_data_format() -> composite::data_format {
+    composite::data_format fmt{};
+    if constexpr (std::is_same_v<T, std::complex<float>>) {
+        fmt.is_complex = true;
+        fmt.type = composite::data_type::floating_point;
+        fmt.bit_width = 32;
+    } else if constexpr (std::is_same_v<T, std::complex<int16_t>>) {
+        fmt.is_complex = true;
+        fmt.type = composite::data_type::signed_integer;
+        fmt.bit_width = 16;
+    } else if constexpr (std::is_same_v<T, std::complex<int8_t>>) {
+        fmt.is_complex = true;
+        fmt.type = composite::data_type::signed_integer;
+        fmt.bit_width = 8;
+    } else if constexpr (std::is_same_v<T, float>) {
+        fmt.is_complex = false;
+        fmt.type = composite::data_type::floating_point;
+        fmt.bit_width = 32;
+    } else if constexpr (std::is_same_v<T, int16_t>) {
+        fmt.is_complex = false;
+        fmt.type = composite::data_type::signed_integer;
+        fmt.bit_width = 16;
+    }
+    return fmt;
+}
+
+// Templated test fixture - internally uses non-templated pkt_builder
+// but provides typed interface for test convenience
 template<typename T>
 struct PktBuilderTestFixture {
     using sample_t = T;
-    using builder_t = pkt_builder<T>;
 
-    std::shared_ptr<builder_t> builder;
+    std::shared_ptr<pkt_builder> builder;
     std::shared_ptr<pkt_debug> debug;
 
-    // Source port to feed data into pkt_builder
-    std::shared_ptr<composite::output_port<composite::immutable_buffer<sample_t>>> source_port;
+    // Source port to feed data into pkt_builder (as std::byte)
+    std::shared_ptr<composite::output_port<composite::immutable_buffer<std::byte>>> source_port;
 
     // Intermediate port to capture raw packets (between builder and debug)
     std::shared_ptr<composite::input_port<composite::immutable_buffer<uint8_t>>> packet_capture_port;
 
     PktBuilderTestFixture() {
-        builder = std::make_shared<builder_t>("test_pkt_builder");
+        builder = std::make_shared<pkt_builder>("test_pkt_builder");
         debug = std::make_shared<pkt_debug>("test_pkt_debug");
         debug->set_properties({{"log_interval_sec", "1000"}});  // Disable frequent logging in tests
 
-        source_port = std::make_shared<composite::output_port<composite::immutable_buffer<sample_t>>>("source");
+        source_port = std::make_shared<composite::output_port<composite::immutable_buffer<std::byte>>>("source");
         packet_capture_port = std::make_shared<composite::input_port<composite::immutable_buffer<uint8_t>>>("capture");
 
         // Get ports from components
-        auto* builder_in = builder->template get_port<composite::input_port<composite::immutable_buffer<sample_t>>>("data_in");
-        auto* builder_out = builder->template get_port<composite::output_port<composite::immutable_buffer<uint8_t>>>("data_out");
+        auto* builder_in = builder->get_port<composite::input_port<composite::immutable_buffer<std::byte>>>("data_in");
+        auto* builder_out = builder->get_port<composite::output_port<composite::immutable_buffer<uint8_t>>>("data_out");
         auto* debug_in = debug->get_port<composite::input_port<composite::immutable_buffer<uint8_t>>>("data_in");
 
         REQUIRE(builder_in != nullptr);
@@ -63,9 +91,15 @@ struct PktBuilderTestFixture {
         debug->stop();  // Ensure metrics thread is terminated
     }
 
-    void send_data(const std::vector<sample_t>& data, const composite::metadata& meta = {}) {
-        auto data_vec = std::make_shared<std::vector<sample_t>>(data);
-        composite::immutable_buffer<sample_t> buf(data_vec);
+    void send_data(const std::vector<sample_t>& data, composite::metadata meta = {}) {
+        // Set format metadata for the sample type
+        meta.format = get_data_format<sample_t>();
+
+        // Convert typed data to bytes
+        auto byte_vec = std::make_shared<std::vector<std::byte>>(data.size() * sizeof(sample_t));
+        std::memcpy(byte_vec->data(), data.data(), byte_vec->size());
+
+        composite::immutable_buffer<std::byte> buf(byte_vec);
         source_port->send_metadata(meta);
         source_port->send_data(std::move(buf), composite::timestamp{123, 456000});
     }
