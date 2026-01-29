@@ -6,6 +6,7 @@
  */
 
 #include "component.hpp"
+#include "blue/BlueFile.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -154,6 +155,16 @@ void sigmf_source::parse_metadata() {
                 m_center_frequency = global.value("core:frequency", 0.0);
                 m_description = global.value("core:description", std::string{});
 
+                // Check for filetype extension (for MIDAS Blue support)
+                // Supports both namespaced and non-namespaced field names
+                for (const auto& key : {"filetype", "core:filetype"}) {
+                    if (global.contains(key)) {
+                        m_filetype = global[key].get<std::string>();
+                        logger()->debug("sigmf_source: found filetype '{}' in metadata", m_filetype);
+                        break;
+                    }
+                }
+
                 // Parse datatype for format/endianness info
                 if (global.contains("core:datatype")) {
                     std::string datatype = global["core:datatype"].get<std::string>();
@@ -200,6 +211,10 @@ void sigmf_source::parse_metadata() {
         } else {
             logger()->warn("sigmf_source: failed to parse override datatype '{}', keeping previous", *m_overrides.datatype);
         }
+    }
+    if (m_overrides.filetype.has_value()) {
+        logger()->info("sigmf_source: overriding filetype -> '{}'", *m_overrides.filetype);
+        m_filetype = *m_overrides.filetype;
     }
     // Note: bandwidth override is applied in send_metadata_to_port()
 }
@@ -328,6 +343,121 @@ auto sigmf_source::property_change_handler() -> void {
     }
 }
 
+auto sigmf_source::detect_filetype(const std::string& data_path) -> std::string {
+    // Priority: 1) override, 2) file extension, 3) file magic, 4) default to "raw"
+
+    // Override already applied in parse_metadata(), check if set
+    if (m_filetype != "raw") {
+        logger()->debug("sigmf_source: using filetype '{}' from metadata/override", m_filetype);
+        return m_filetype;
+    }
+
+    // Check file extension
+    if (data_path.ends_with(".blue")) {
+        logger()->info("sigmf_source: detected MIDAS Blue file by extension");
+        return "bluefile-1000";
+    }
+
+    // Check file magic (first 4 bytes = "BLUE")
+    if (blue::isBlueFile(data_path)) {
+        logger()->info("sigmf_source: detected MIDAS Blue file by magic");
+        return "bluefile-1000";
+    }
+
+    return "raw";
+}
+
+void sigmf_source::configure_blue_file() {
+    logger()->info("sigmf_source: configuring MIDAS Blue file");
+
+    // Determine the .blue file path
+    std::string blue_path = m_file_path;
+    if (blue_path.ends_with(".sigmf-meta")) {
+        blue_path = blue_path.substr(0, blue_path.length() - 11) + ".blue";
+    } else if (blue_path.ends_with(".sigmf-data")) {
+        blue_path = blue_path.substr(0, blue_path.length() - 11) + ".blue";
+    } else if (!blue_path.ends_with(".blue")) {
+        // Check if file exists as-is, otherwise try adding .blue
+        if (!std::filesystem::exists(blue_path) || !blue::isBlueFile(blue_path)) {
+            blue_path = blue_path + ".blue";
+        }
+    }
+
+    if (!std::filesystem::exists(blue_path)) {
+        throw std::runtime_error(std::format("sigmf_source: Blue file not found: {}", blue_path));
+    }
+
+    // Parse the Blue file header
+    auto blueInfo = blue::parseBlueFile(blue_path);
+    if (!blueInfo || !blueInfo->valid) {
+        throw std::runtime_error(std::format("sigmf_source: failed to parse Blue file: {}", blue_path));
+    }
+
+    // Convert Blue format to SigmfFormat
+    m_format.is_complex = blueInfo->format.isComplex;
+    m_format.bitwidth = blueInfo->format.scalarSize * 8;
+    m_format.is_big_endian = blueInfo->needsDataSwap;  // If needs swap, it's opposite endianness
+
+    // Map Blue type code to SigmfFormat::DataType
+    switch (blueInfo->format.typeCode) {
+        case 'F': m_format.datatype = SigmfFormat::DataType::FLOAT; break;
+        case 'D': m_format.datatype = SigmfFormat::DataType::FLOAT; break;  // Double is also float
+        case 'I': case 'L': case 'X':
+            m_format.datatype = SigmfFormat::DataType::SIGNED_INT; break;
+        case 'B': m_format.datatype = SigmfFormat::DataType::SIGNED_INT; break;
+        case 'O': case 'U': case 'V':
+            m_format.datatype = SigmfFormat::DataType::UNSIGNED_INT; break;
+        default:
+            m_format.datatype = SigmfFormat::DataType::FLOAT;
+    }
+
+    // Build datatype string for logging
+    char rc = m_format.is_complex ? 'c' : 'r';
+    char tc = (m_format.datatype == SigmfFormat::DataType::FLOAT) ? 'f' :
+              (m_format.datatype == SigmfFormat::DataType::SIGNED_INT) ? 'i' : 'u';
+    m_format.datatype_str = std::format("{}{}{}", rc, tc, m_format.bitwidth);
+
+    // Use sample rate from Blue header if not already set (and not overridden)
+    if (m_sample_rate <= 0 && blueInfo->sampleRate > 0) {
+        m_sample_rate = blueInfo->sampleRate;
+        logger()->info("sigmf_source: using sample rate {} Hz from Blue header", m_sample_rate);
+    }
+
+    // Calculate bytes per sample
+    m_bytes_per_sample = blueInfo->format.sampleSize;
+    if (m_bytes_per_sample == 0) {
+        throw std::runtime_error("sigmf_source: invalid Blue format - bytes_per_sample is 0");
+    }
+
+    // Memory-map the file
+    bool needs_swap = blueInfo->needsDataSwap && (m_format.bitwidth >= 16);
+    logger()->info("sigmf_source: memory-mapping Blue file {} (writable={}, data_offset={}, data_size={})",
+                  blue_path, needs_swap, blueInfo->dataOffset, blueInfo->dataSize);
+
+    m_mmap = std::make_shared<MmapRegion<std::byte>>(blue_path, needs_swap);
+    m_data_start_offset = blueInfo->dataOffset;
+    m_total_samples = blueInfo->sampleCount;
+    m_current_byte_offset = m_data_start_offset;
+
+    // Apply endianness conversion on the data portion only
+    if (needs_swap) {
+        logger()->info("sigmf_source: applying endianness swap on Blue data ({} bytes)", blueInfo->dataSize);
+        auto* data_start = reinterpret_cast<uint8_t*>(m_mmap->data()) + m_data_start_offset;
+        blue::byteswapData(data_start, blueInfo->dataSize / (m_format.bitwidth / 8),
+                          blueInfo->format.typeCode);
+    }
+
+    // Calculate rate control timing
+    if (m_rate_control) {
+        calculate_timing();
+    }
+
+    m_configured = true;
+    m_filetype = "bluefile-1000";
+    logger()->info("sigmf_source configured (Blue): {} samples, format={}, sr={} Hz, cf={} Hz",
+                  m_total_samples, m_format.datatype_str, m_sample_rate, m_center_frequency);
+}
+
 void sigmf_source::configure_file() {
     logger()->info("sigmf_source: configure_file() called with file_path='{}'", m_file_path);
 
@@ -346,6 +476,8 @@ void sigmf_source::configure_file() {
         data_path = data_path.substr(0, data_path.length() - 11) + ".sigmf-data";
     } else if (data_path.ends_with(".sigmf-data")) {
         // Already a data file path - use as-is
+    } else if (data_path.ends_with(".blue")) {
+        // Blue file - handle separately
     } else if (std::filesystem::exists(data_path) && !std::filesystem::is_directory(data_path)) {
         // File exists as-is (raw binary file without .sigmf- extension) - use directly
         logger()->info("sigmf_source: using raw data file directly: {}", data_path);
@@ -353,6 +485,20 @@ void sigmf_source::configure_file() {
         // Fall back to appending .sigmf-data
         data_path = data_path + ".sigmf-data";
     }
+
+    // Detect and handle file type
+    std::string detected_filetype = detect_filetype(data_path);
+
+    if (detected_filetype == "bluefile-1000") {
+        // Configure as MIDAS Blue file
+        configure_blue_file();
+        send_metadata_to_port();
+        return;
+    }
+
+    // Continue with raw/SigMF file handling
+    m_filetype = "raw";
+    m_data_start_offset = 0;  // Raw files start at byte 0
 
     // Verify file exists
     if (!std::filesystem::exists(data_path)) {
@@ -399,7 +545,7 @@ void sigmf_source::configure_file() {
 
 auto sigmf_source::start() -> void {
     logger()->info("sigmf_source starting (streaming={}, configured={})", m_streaming, m_configured);
-    m_current_byte_offset = 0;
+    m_current_byte_offset = m_data_start_offset;  // For Blue files, this skips the header
     m_samples_sent = 0;
     m_eof = false;
 
@@ -433,15 +579,16 @@ auto sigmf_source::process_chunk() -> composite::retval {
     }
 
     if (m_eof && m_loop) {
-        // Reset to beginning for looping
+        // Reset to beginning for looping (accounting for data offset in Blue files)
         logger()->trace("sigmf_source: looping back to start");
-        m_current_byte_offset = 0;
+        m_current_byte_offset = m_data_start_offset;
         m_eof = false;
         send_metadata_to_port();
     }
 
     // Calculate samples to read (working in sample units, converting to bytes for mmap)
-    std::size_t current_sample = m_current_byte_offset / m_bytes_per_sample;
+    // Account for data_start_offset (non-zero for Blue files where header precedes data)
+    std::size_t current_sample = (m_current_byte_offset - m_data_start_offset) / m_bytes_per_sample;
     std::size_t samples_remaining = m_total_samples - current_sample;
     std::size_t samples_to_read = std::min(m_chunk_samples, samples_remaining);
 

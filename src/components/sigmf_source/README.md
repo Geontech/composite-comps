@@ -1,16 +1,18 @@
 # sigmf_source
 
-A high-performance file source component that reads SigMF files or raw binary data files with rate-controlled playback. Uses memory-mapped I/O for zero-copy streaming at high sample rates.
+A high-performance file source component that reads SigMF files, MIDAS Blue files, or raw binary data files with rate-controlled playback. Uses memory-mapped I/O for zero-copy streaming at high sample rates.
 
 ## Features
 
 - **SigMF Format Support**: Automatically parses `.sigmf-meta` JSON files for sample rate, center frequency, and data format
+- **MIDAS Blue File Support**: Reads `.blue` files with automatic header parsing for format and sample rate extraction
 - **Raw Binary File Support**: Works with arbitrary binary files when metadata is provided via overrides
 - **Zero-Copy Streaming**: Uses `mmap()` for efficient file reading without memory copies
 - **Rate Control**: Accurate sample-rate-based playback timing with jitter compensation
 - **Automatic Endianness Conversion**: In-place byte swapping for big-endian files on little-endian hosts
 - **Looping**: Seamless file looping for continuous playback
 - **Flexible Timestamps**: Sample-based or wall-clock timestamp modes
+- **Auto-Detection**: Automatically detects file type from extension or magic bytes
 
 ## Output Port
 
@@ -60,10 +62,13 @@ The `overrides` struct allows manual specification or override of metadata value
 | `overrides.center_frequency` | double (optional) | unset | Override center frequency in Hz |
 | `overrides.bandwidth` | double (optional) | unset | Override bandwidth in Hz (defaults to sample_rate if unset) |
 | `overrides.datatype` | string (optional) | unset | Override data format string (see [Datatype Format](#datatype-format)) |
+| `overrides.filetype` | string (optional) | unset | Force file type: `"raw"` or `"bluefile-1000"` (auto-detected if unset) |
 
 ## File Path Handling
 
 The `file_path` property accepts several formats:
+
+### SigMF and Raw Files
 
 | Input | Meta File Searched | Data File Used |
 |-------|-------------------|----------------|
@@ -73,6 +78,21 @@ The `file_path` property accepts several formats:
 | `/path/to/recording.bin` (exists) | `/path/to/recording.bin.sigmf-meta` | `/path/to/recording.bin` |
 
 When the file exists as-is (without `.sigmf-` extension), it's used directly as the data file. This allows streaming arbitrary binary files when combined with the `overrides` properties.
+
+### MIDAS Blue Files
+
+MIDAS Blue files (`.blue`) are automatically detected by file extension or magic bytes ("BLUE" header).
+
+| Input | Data File Used |
+|-------|----------------|
+| `/path/to/file.blue` | `/path/to/file.blue` |
+| `/path/to/file` (with "BLUE" magic) | `/path/to/file` |
+
+The component reads the 512-byte Header Control Block to extract:
+- **Format code** (e.g., "CF" = complex float, "CI" = complex int16)
+- **Data offset** and size
+- **Sample rate** from xDelta (if available)
+- **Endianness** information
 
 ## Datatype Format
 
@@ -94,6 +114,33 @@ The datatype string follows the SigMF specification:
 - `ci16_le` - Complex signed int16, little-endian
 - `cu8` - Complex unsigned int8 (endianness irrelevant for 8-bit)
 - `rf32_be` - Real float32, big-endian
+
+## MIDAS Blue Format Codes
+
+MIDAS Blue files use a 2-character format code in the header: `[Rank][Type]`
+
+| Rank Code | Description |
+|-----------|-------------|
+| `C` | Complex (I/Q pairs) |
+| `R` | Real |
+| `S` | Scalar |
+
+| Type Code | Description | Size |
+|-----------|-------------|------|
+| `B` | Signed byte | 1 byte |
+| `O` | Unsigned byte | 1 byte |
+| `I` | Signed int16 | 2 bytes |
+| `U` | Unsigned int16 | 2 bytes |
+| `L` | Signed int32 | 4 bytes |
+| `V` | Unsigned int32 | 4 bytes |
+| `F` | Float32 | 4 bytes |
+| `D` | Float64 (double) | 8 bytes |
+| `X` | Signed int64 | 8 bytes |
+
+**Examples:**
+- `CF` - Complex float32 (most common)
+- `CI` - Complex signed int16
+- `SF` - Scalar (real) float32
 
 ## Usage Examples
 
@@ -188,6 +235,58 @@ Override specific values while using the rest from the metadata file:
     "properties": {
         "file_path": "/data/recording",
         "rate_control": false,
+        "streaming": true
+    }
+}
+```
+
+### MIDAS Blue File (Auto-Detected)
+
+MIDAS Blue files are automatically detected by extension or magic bytes:
+
+```json
+{
+    "id": "source",
+    "library": "libsigmf_source.so",
+    "properties": {
+        "file_path": "/data/capture.blue",
+        "streaming": true
+    }
+}
+```
+
+### MIDAS Blue File with Overrides
+
+Override sample rate or other metadata from the Blue header:
+
+```json
+{
+    "id": "source",
+    "library": "libsigmf_source.so",
+    "properties": {
+        "file_path": "/data/capture.blue",
+        "overrides": {
+            "sample_rate": 20000000.0,
+            "center_frequency": 2400000000.0
+        },
+        "streaming": true
+    }
+}
+```
+
+### Force File Type
+
+Use `overrides.filetype` to explicitly specify the file type:
+
+```json
+{
+    "id": "source",
+    "library": "libsigmf_source.so",
+    "properties": {
+        "file_path": "/data/recording.dat",
+        "overrides": {
+            "filetype": "bluefile-1000"
+        },
         "streaming": true
     }
 }

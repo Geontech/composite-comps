@@ -51,6 +51,7 @@ struct sigmf_overrides {
     std::optional<double> center_frequency;
     std::optional<double> bandwidth;
     std::optional<std::string> datatype;  // e.g., "cf32_le", "ri16_be", "cu8"
+    std::optional<std::string> filetype;  // "raw" or "bluefile-1000"
 };
 
 } // namespace struct_props
@@ -218,9 +219,11 @@ public:
 private:
     void parse_metadata();
     void send_metadata_to_port();
-    void configure_file();  // Load/mmap file when enabled
+    void configure_file();       // Load/mmap file when enabled
+    void configure_blue_file();  // Configure MIDAS Blue file
     void calculate_timing();
     auto process_chunk() -> composite::retval;
+    auto detect_filetype(const std::string& data_path) -> std::string;
 
     // Datatype parsing
     static auto parse_datatype(std::string_view datatype_str) -> std::optional<SigmfFormat>;
@@ -253,10 +256,12 @@ private:
     // Memory-mapped file (as raw bytes)
     std::shared_ptr<MmapRegion<std::byte>> m_mmap;
     std::size_t m_current_byte_offset{0};
+    std::size_t m_data_start_offset{0};  // Offset where sample data begins (0 for raw, 512+ for Blue)
     std::size_t m_total_samples{0};
     std::size_t m_bytes_per_sample{0};
     bool m_eof{false};
     bool m_configured{false};  // True once file is loaded and ready
+    std::string m_filetype{"raw"};  // "raw" or "bluefile-1000"
 
     // Metadata from SigMF file
     double m_sample_rate{0.0};
@@ -284,6 +289,7 @@ struct composite::properties::property_traits<struct_props::sigmf_overrides> {
         ps.add("center_frequency", o.center_frequency, RUNTIME);
         ps.add("bandwidth", o.bandwidth, RUNTIME);
         ps.add("datatype", o.datatype, RUNTIME);
+        ps.add("filetype", o.filetype, RUNTIME);
     }
 };
 
