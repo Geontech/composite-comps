@@ -50,6 +50,7 @@ struct sigmf_overrides {
     std::optional<double> sample_rate;
     std::optional<double> center_frequency;
     std::optional<double> bandwidth;
+    std::optional<std::string> datatype;  // e.g., "cf32_le", "ri16_be", "cu8"
 };
 
 } // namespace struct_props
@@ -282,6 +283,7 @@ struct composite::properties::property_traits<struct_props::sigmf_overrides> {
         ps.add("sample_rate", o.sample_rate, RUNTIME);
         ps.add("center_frequency", o.center_frequency, RUNTIME);
         ps.add("bandwidth", o.bandwidth, RUNTIME);
+        ps.add("datatype", o.datatype, RUNTIME);
     }
 };
 

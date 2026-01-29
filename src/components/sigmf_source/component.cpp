@@ -122,60 +122,68 @@ void sigmf_source::parse_metadata() {
     if (meta_path.ends_with(".sigmf-data")) {
         meta_path = meta_path.substr(0, meta_path.length() - 11) + ".sigmf-meta";
     } else if (!meta_path.ends_with(".sigmf-meta")) {
-        meta_path = meta_path + ".sigmf-meta";
+        // Check if the file exists as-is (raw binary file without .sigmf- extension)
+        if (!std::filesystem::exists(m_file_path) || std::filesystem::is_directory(m_file_path)) {
+            meta_path = meta_path + ".sigmf-meta";
+        } else {
+            // File exists as-is, derive meta path by appending .sigmf-meta
+            meta_path = m_file_path + ".sigmf-meta";
+        }
     }
 
     std::ifstream meta_file(meta_path);
     if (!meta_file) {
-        logger()->warn("sigmf_source: no metadata file found at {}, using defaults", meta_path);
-        return;
-    }
+        logger()->warn("sigmf_source: no metadata file found at {}, will use overrides/defaults", meta_path);
+        // Don't return - fall through to apply overrides
+    } else {
+        try {
+            nlohmann::json doc;
+            meta_file >> doc;
 
-    try {
-        nlohmann::json doc;
-        meta_file >> doc;
-
-        if (!doc.contains("global")) {
-            logger()->warn("sigmf_source: no 'global' section in metadata");
-            return;
-        }
-
-        auto& global = doc["global"];
-
-        // Required fields
-        m_sample_rate = global.at("core:sample_rate").get<double>();
-
-        // Optional fields with defaults
-        m_center_frequency = global.value("core:frequency", 0.0);
-        m_description = global.value("core:description", std::string{});
-
-        // Parse datatype for format/endianness info
-        if (global.contains("core:datatype")) {
-            std::string datatype = global["core:datatype"].get<std::string>();
-            auto parsed = parse_datatype(datatype);
-            if (parsed) {
-                m_format = *parsed;
-                logger()->debug("sigmf_source: parsed datatype '{}' - complex={}, big_endian={}, bits={}",
-                               datatype, m_format.is_complex, m_format.is_big_endian, m_format.bitwidth);
+            if (!doc.contains("global")) {
+                logger()->warn("sigmf_source: no 'global' section in metadata");
             } else {
-                logger()->warn("sigmf_source: failed to parse datatype '{}', using defaults", datatype);
-            }
-        }
+                auto& global = doc["global"];
 
-        // Check captures array for frequency override
-        if (doc.contains("captures") && doc["captures"].is_array() && !doc["captures"].empty()) {
-            auto& cap0 = doc["captures"][0];
-            if (cap0.contains("core:frequency")) {
-                m_center_frequency = cap0["core:frequency"].get<double>();
-            }
-        }
+                // Sample rate from file (may be overridden below)
+                if (global.contains("core:sample_rate")) {
+                    m_sample_rate = global["core:sample_rate"].get<double>();
+                }
 
-    } catch (const nlohmann::json::exception& e) {
-        logger()->error("sigmf_source: JSON parse error in '{}': {}", meta_path, e.what());
-        throw std::runtime_error(std::format("sigmf_source: failed to parse metadata: {}", e.what()));
+                // Optional fields with defaults
+                m_center_frequency = global.value("core:frequency", 0.0);
+                m_description = global.value("core:description", std::string{});
+
+                // Parse datatype for format/endianness info
+                if (global.contains("core:datatype")) {
+                    std::string datatype = global["core:datatype"].get<std::string>();
+                    auto parsed = parse_datatype(datatype);
+                    if (parsed) {
+                        m_format = *parsed;
+                        logger()->debug("sigmf_source: parsed datatype '{}' - complex={}, big_endian={}, bits={}",
+                                       datatype, m_format.is_complex, m_format.is_big_endian, m_format.bitwidth);
+                    } else {
+                        logger()->warn("sigmf_source: failed to parse datatype '{}', using defaults", datatype);
+                    }
+                }
+
+                // Check captures array for frequency override
+                if (doc.contains("captures") && doc["captures"].is_array() && !doc["captures"].empty()) {
+                    auto& cap0 = doc["captures"][0];
+                    if (cap0.contains("core:frequency")) {
+                        m_center_frequency = cap0["core:frequency"].get<double>();
+                    }
+                }
+            }
+
+        } catch (const nlohmann::json::exception& e) {
+            logger()->error("sigmf_source: JSON parse error in '{}': {}", meta_path, e.what());
+            throw std::runtime_error(std::format("sigmf_source: failed to parse metadata: {}", e.what()));
+        }
     }
 
     // Apply property overrides (these take precedence over file metadata)
+    // These are always applied, even if no metadata file was found
     if (m_overrides.sample_rate.has_value()) {
         logger()->info("sigmf_source: overriding sample_rate {} -> {}", m_sample_rate, *m_overrides.sample_rate);
         m_sample_rate = *m_overrides.sample_rate;
@@ -183,6 +191,15 @@ void sigmf_source::parse_metadata() {
     if (m_overrides.center_frequency.has_value()) {
         logger()->info("sigmf_source: overriding center_frequency {} -> {}", m_center_frequency, *m_overrides.center_frequency);
         m_center_frequency = *m_overrides.center_frequency;
+    }
+    if (m_overrides.datatype.has_value()) {
+        auto parsed = parse_datatype(*m_overrides.datatype);
+        if (parsed) {
+            logger()->info("sigmf_source: overriding datatype -> '{}'", *m_overrides.datatype);
+            m_format = *parsed;
+        } else {
+            logger()->warn("sigmf_source: failed to parse override datatype '{}', keeping previous", *m_overrides.datatype);
+        }
     }
     // Note: bandwidth override is applied in send_metadata_to_port()
 }
@@ -325,8 +342,15 @@ void sigmf_source::configure_file() {
     // Determine data file path
     std::string data_path = m_file_path;
     if (data_path.ends_with(".sigmf-meta")) {
+        // Explicit meta file path - derive data file
         data_path = data_path.substr(0, data_path.length() - 11) + ".sigmf-data";
-    } else if (!data_path.ends_with(".sigmf-data")) {
+    } else if (data_path.ends_with(".sigmf-data")) {
+        // Already a data file path - use as-is
+    } else if (std::filesystem::exists(data_path) && !std::filesystem::is_directory(data_path)) {
+        // File exists as-is (raw binary file without .sigmf- extension) - use directly
+        logger()->info("sigmf_source: using raw data file directly: {}", data_path);
+    } else {
+        // Fall back to appending .sigmf-data
         data_path = data_path + ".sigmf-data";
     }
 
