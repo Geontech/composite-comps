@@ -122,6 +122,9 @@ void sigmf_source::parse_metadata() {
     std::string meta_path = m_file_path;
     if (meta_path.ends_with(".sigmf-data")) {
         meta_path = meta_path.substr(0, meta_path.length() - 11) + ".sigmf-meta";
+    } else if (meta_path.ends_with(".blue")) {
+        // Blue file - derive meta path by replacing .blue with .sigmf-meta
+        meta_path = meta_path.substr(0, meta_path.length() - 5) + ".sigmf-meta";
     } else if (!meta_path.ends_with(".sigmf-meta")) {
         // Check if the file exists as-is (raw binary file without .sigmf- extension)
         if (!std::filesystem::exists(m_file_path) || std::filesystem::is_directory(m_file_path)) {
