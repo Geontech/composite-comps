@@ -457,6 +457,13 @@ void sigmf_source::configure_blue_file() {
 
     m_configured = true;
     m_filetype = "bluefile-1000";
+
+    // Reset rate control epoch so the catch-up logic doesn't see the time
+    // between start() and now as a deficit to fill, which causes a burst
+    // that OOM-kills the pod.
+    m_start_time = std::chrono::steady_clock::now();
+    m_samples_sent = 0;
+
     logger()->info("sigmf_source configured (Blue): {} samples, format={}, sr={} Hz, cf={} Hz",
                   m_total_samples, m_format.datatype_str, m_sample_rate, m_center_frequency);
 }
@@ -468,6 +475,18 @@ void sigmf_source::configure_file() {
         logger()->warn("sigmf_source: cannot configure - file_path is empty");
         return;
     }
+
+    // Reset all file-specific state so detection starts fresh.
+    // Without this, switching between raw and blue files leaves stale
+    // values (especially m_filetype) that corrupt the next detection.
+    m_filetype = "raw";
+    m_data_start_offset = 0;
+    m_sample_rate = 0.0;
+    m_center_frequency = 0.0;
+    m_description.clear();
+    m_format = SigmfFormat{};
+    m_bytes_per_sample = 0;
+    m_total_samples = 0;
 
     logger()->info("sigmf_source: calling parse_metadata()");
     parse_metadata();
@@ -538,6 +557,13 @@ void sigmf_source::configure_file() {
     }
 
     m_configured = true;
+
+    // Reset rate control epoch so the catch-up logic doesn't see the time
+    // between start() and now as a deficit to fill, which causes a burst
+    // that OOM-kills the pod.
+    m_start_time = std::chrono::steady_clock::now();
+    m_samples_sent = 0;
+
     logger()->info("sigmf_source configured: {} samples ({} MB), format={}, sr={} Hz, cf={} Hz, rate_control={}",
                   m_total_samples, m_mmap->file_size() / (1024 * 1024),
                   m_format.datatype_str, m_sample_rate, m_center_frequency, m_rate_control);
