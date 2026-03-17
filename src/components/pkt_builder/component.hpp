@@ -93,7 +93,7 @@ private:
     auto metadata_changed(const composite::metadata& current, const composite::metadata& previous) -> bool;
     auto should_send_context(stream_state& state, const composite::metadata& metadata) -> bool;
     auto build_context_packet(const stream_state& state, const composite::metadata& metadata) -> std::shared_ptr<std::vector<uint8_t>>;
-    auto build_data_packet(stream_state& state, const composite::immutable_buffer<std::byte>& payload, const composite::timestamp& ts) -> std::shared_ptr<std::vector<uint8_t>>;
+    auto build_data_packet(stream_state& state, const composite::immutable_buffer<std::byte>& payload, const composite::timestamp& ts, const composite::data_format& fmt) -> std::shared_ptr<std::vector<uint8_t>>;
     auto write_header(uint8_t* dest, bool is_context, bool has_stream_id, bool has_class_id,
                       bool has_timestamp, uint16_t packet_size, uint16_t packet_count) -> size_t;
     auto write_stream_id(uint8_t* dest, uint32_t stream_id) -> size_t;

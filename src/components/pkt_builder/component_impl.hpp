@@ -73,6 +73,32 @@ namespace {
         size_t bytes = fmt.bit_width / 8;
         return fmt.is_complex ? bytes * 2 : bytes;
     }
+
+    // Byte-swap payload in-place from source endianness to big-endian (VITA 49 wire format).
+    // Only swaps when the source data is not already big-endian and elements are > 8 bits.
+    inline auto swap_payload_to_be(uint8_t* data, size_t len, const composite::data_format& fmt) -> void {
+        if (fmt.endianness == std::endian::big || fmt.bit_width <= 8) {
+            return;
+        }
+
+        if (fmt.bit_width == 16) {
+            for (size_t i = 0; i + 1 < len; i += 2) {
+                std::swap(data[i], data[i + 1]);
+            }
+        } else if (fmt.bit_width == 32) {
+            for (size_t i = 0; i + 3 < len; i += 4) {
+                std::swap(data[i], data[i + 3]);
+                std::swap(data[i + 1], data[i + 2]);
+            }
+        } else if (fmt.bit_width == 64) {
+            for (size_t i = 0; i + 7 < len; i += 8) {
+                std::swap(data[i], data[i + 7]);
+                std::swap(data[i + 1], data[i + 6]);
+                std::swap(data[i + 2], data[i + 5]);
+                std::swap(data[i + 3], data[i + 4]);
+            }
+        }
+    }
 } // anonymous namespace
 
 pkt_builder::pkt_builder(std::string_view id) : composite::component(id) {
@@ -158,7 +184,7 @@ auto pkt_builder::process() -> composite::retval {
         auto chunk_bytes = std::min(max_chunk_bytes, data.size() - offset);
         auto chunk = data.slice(offset, chunk_bytes);
 
-        auto data_vec = build_data_packet(state, chunk, timestamp);
+        auto data_vec = build_data_packet(state, chunk, timestamp, metadata.format);
         auto data_buf = composite::immutable_buffer<uint8_t>(std::move(data_vec));
         // Forward input metadata to output for downstream routing (e.g., udp_sink)
         m_out_port.send_metadata(metadata);
@@ -334,7 +360,7 @@ auto pkt_builder::build_context_packet(const stream_state& state, const composit
 }
 
 auto pkt_builder::build_data_packet(stream_state& state, const composite::immutable_buffer<std::byte>& payload,
-                                        const composite::timestamp& ts) -> std::shared_ptr<std::vector<uint8_t>> {
+                                        const composite::timestamp& ts, const composite::data_format& fmt) -> std::shared_ptr<std::vector<uint8_t>> {
     // Payload is already in bytes (raw data from upstream)
     size_t payload_bytes = payload.size();
     size_t packet_size = VITA49_HEADER_SIZE;
@@ -373,8 +399,9 @@ auto pkt_builder::build_data_packet(stream_state& state, const composite::immuta
         offset += write_timestamp(dest + offset, ts);
     }
 
-    // Write payload
+    // Write payload and convert to big-endian (VITA 49 wire format)
     std::memcpy(dest + offset, payload.data(), payload_bytes);
+    swap_payload_to_be(dest + offset, payload_bytes, fmt);
     offset += payload_bytes;
 
     // Zero-pad to word boundary if needed
