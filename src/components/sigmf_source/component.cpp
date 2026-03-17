@@ -448,9 +448,6 @@ void sigmf_source::configure_blue_file() {
         auto* data_start = reinterpret_cast<uint8_t*>(m_mmap->data()) + m_data_start_offset;
         blue::byteswapData(data_start, blueInfo->dataSize / (m_format.bitwidth / 8),
                           blueInfo->format.typeCode);
-        // Data is now in host-native format — update the format so downstream
-        // doesn't re-swap already-corrected samples.
-        m_format.is_big_endian = (std::endian::native == std::endian::big);
     }
 
     // Calculate rate control timing
@@ -552,9 +549,6 @@ void sigmf_source::configure_file() {
     if (needs_swap) {
         logger()->info("sigmf_source: applying endianness swap on {} bytes", m_mmap->file_size());
         apply_endianness_swap();
-        // Data is now in host-native format — update the format so downstream
-        // doesn't re-swap already-corrected samples.
-        m_format.is_big_endian = (std::endian::native == std::endian::big);
     }
 
     // Calculate rate control timing
