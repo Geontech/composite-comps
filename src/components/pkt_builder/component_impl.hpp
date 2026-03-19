@@ -430,8 +430,10 @@ auto pkt_builder::write_header(uint8_t* dest, bool is_context, bool has_stream_i
         header |= (1U << 27);
     }
 
-    // TSM (Time Stamp Mode) (bit 24) - precise timestamp
-    if (has_timestamp) {
+    // TSM (Time Stamp Mode) (bit 24) - only applicable to context packets.
+    // For data packets, bit 24 is the Spectrum/Time indicator (SpT) per VITA 49.2;
+    // leave it 0 (time-domain data).
+    if (is_context && has_timestamp) {
         header |= (1U << 24);
     }
 

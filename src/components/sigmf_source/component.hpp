@@ -269,6 +269,9 @@ private:
     std::string m_description;
     SigmfFormat m_format;
 
+    // UTC epoch anchor (seconds since Unix epoch, captured from system_clock at start)
+    uint32_t m_utc_epoch_seconds{0};
+
     // Rate control timing state
     double m_effective_sample_rate{0.0};
     std::chrono::steady_clock::time_point m_start_time;

@@ -465,6 +465,11 @@ void sigmf_source::configure_blue_file() {
     m_start_time = std::chrono::steady_clock::now();
     m_samples_sent = 0;
 
+    // Capture UTC epoch for absolute timestamps
+    auto utc_now = std::chrono::system_clock::now();
+    m_utc_epoch_seconds = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(utc_now.time_since_epoch()).count());
+
     logger()->info("sigmf_source configured (Blue): {} samples, format={}, sr={} Hz, cf={} Hz",
                   m_total_samples, m_format.datatype_str, m_sample_rate, m_center_frequency);
 }
@@ -566,6 +571,11 @@ void sigmf_source::configure_file() {
     m_start_time = std::chrono::steady_clock::now();
     m_samples_sent = 0;
 
+    // Capture UTC epoch for absolute timestamps
+    auto utc_now = std::chrono::system_clock::now();
+    m_utc_epoch_seconds = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(utc_now.time_since_epoch()).count());
+
     logger()->info("sigmf_source configured: {} samples ({} MB), format={}, sr={} Hz, cf={} Hz, rate_control={}",
                   m_total_samples, m_mmap->file_size() / (1024 * 1024),
                   m_format.datatype_str, m_sample_rate, m_center_frequency, m_rate_control);
@@ -583,6 +593,11 @@ auto sigmf_source::start() -> void {
     // Always track start time (needed for wallclock_timestamps and rate_control)
     auto now = std::chrono::steady_clock::now();
     m_start_time = now;
+
+    // Capture UTC epoch for absolute timestamps
+    auto utc_now = std::chrono::system_clock::now();
+    m_utc_epoch_seconds = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(utc_now.time_since_epoch()).count());
 
     // Only do full setup if configured
     if (m_configured) {
@@ -639,25 +654,31 @@ auto sigmf_source::process_chunk() -> composite::retval {
     m_current_byte_offset += bytes_to_read;
     m_samples_sent += samples_to_read;
 
-    // Create timestamp
+    // Create timestamp (absolute UTC)
+    // Offset from start is computed as either elapsed wall-clock or sample-based time,
+    // then anchored to the UTC epoch captured at start.
     composite::timestamp ts;
-    double total_seconds;
+    double offset_seconds;
 
     if (m_wallclock_timestamps) {
-        // Wall-clock mode: timestamp based on real elapsed time since start
+        // Wall-clock mode: offset based on real elapsed time since start
         auto now = std::chrono::steady_clock::now();
-        total_seconds = std::chrono::duration<double>(now - m_start_time).count();
+        offset_seconds = std::chrono::duration<double>(now - m_start_time).count();
     } else {
-        // File-time mode (default): timestamp based on sample position
+        // File-time mode (default): offset based on sample position
         if (m_effective_sample_rate > 0) {
-            total_seconds = static_cast<double>(m_samples_sent) / m_effective_sample_rate;
+            offset_seconds = static_cast<double>(m_samples_sent) / m_effective_sample_rate;
         } else {
-            total_seconds = 0.0;
+            offset_seconds = 0.0;
         }
     }
 
-    ts.seconds = static_cast<uint32_t>(total_seconds);
-    ts.picoseconds = static_cast<uint64_t>((total_seconds - ts.seconds) * 1e12);
+    // Split offset into integer seconds and sub-second fractional part
+    auto offset_int = static_cast<uint32_t>(offset_seconds);
+    double offset_frac = offset_seconds - offset_int;
+
+    ts.seconds = m_utc_epoch_seconds + offset_int;
+    ts.picoseconds = static_cast<uint64_t>(offset_frac * 1e12);
 
     // Send data - zero-copy, the view keeps the mmap alive
     composite::immutable_buffer<std::byte> buf(view);
