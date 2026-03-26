@@ -71,6 +71,15 @@ auto sdds_parser::parse(
     parse_result result;
     result.metadata = current_metadata;
 
+    // Validate packet size before processing
+    if (data.size() < SDDS_PACKET_SIZE) {
+        result.warning = std::format(
+            "truncated SDDS packet: expected {} bytes, got {} (possible UDP fragmentation or MTU issue)",
+            SDDS_PACKET_SIZE, data.size());
+        result.should_send = false;
+        return result;
+    }
+
     // Overlay SDDS packet (read-only)
     auto packet = overlay::sdds(std::span{data.data(), data.size()});
 
