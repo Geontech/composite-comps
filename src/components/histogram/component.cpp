@@ -29,7 +29,6 @@
 histogram::histogram() : composite::component("histogram") {
     add_port(&m_in_port);
     add_port(&m_out_port);
-    add_property("transport", &m_transport);
     add_property("msg_size", &m_msg_size).units("bytes");
     add_property("byteswap", &m_byteswap);
     add_property("adc_bits", &m_adc_bits).units("bits");
@@ -105,9 +104,6 @@ auto histogram::process() -> composite::retval {
         auto samples_ptr = reinterpret_cast<const int16_t*>(data->data());
         auto num_samples = data->size() / sizeof(std::complex<int16_t>);
         auto total_samples = num_samples << 1;
-
-        // Hoist histogram size calculations out of loop
-        const auto hist_size = static_cast<int32_t>(m_histogram->size());
 
         // Histogram loop - only process real components
         for (size_t i = 0; i < total_samples; i+=2) {

@@ -167,6 +167,8 @@ auto ws_sink<T>::process() -> composite::retval {
     // === STREAM DATA ===
     auto [stream_data, stream_ts, stream_meta] = m_data_in_port.get_data();
     if (stream_data != nullptr) {
+        m_frame_size = stream_data->size();
+
         // Handle metadata changes
         if (stream_meta.has_value()) {
             logger()->trace("Received stream metadata:\n{}", stream_meta->to_string());
@@ -195,10 +197,13 @@ auto ws_sink<T>::process() -> composite::retval {
                 m_sample_rate = stream_meta->sample_rate;
                 m_bandwidth = stream_meta->bandwidth;
                 m_fft_size = meta_fft_size;
-                m_frame_size = stream_data->size();
             }
 
             m_stream_metadata = stream_meta.value();
+        }
+
+        if (m_frame_size != m_fft_size) {
+            logger()->warn("Frame size {} does not match FFT size {}", m_frame_size, m_fft_size);
         }
 
         // Create header JSON (once per frame)

@@ -45,6 +45,9 @@ public:
     auto process() -> composite::retval override;
 
 private:
+    auto start_stat_thread() -> void;
+    auto stop_stat_thread() -> void;
+
     // Ports
     output_port_t m_out_port{"data_out"};
 
@@ -67,5 +70,6 @@ private:
     std::jthread m_stat_thread;
     uint16_t m_pkt_count{};
     bool m_new_socket_required{true};
+    bool m_started{false};
 
 }; // class udp_source

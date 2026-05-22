@@ -45,7 +45,7 @@ public:
     fft() : composite::component("fft") {
         add_port(&m_in_port);
         add_port(&m_out_port);
-        add_property("window", &m_window_type).change_listener([this]() {
+        add_property("window", &m_window_type).configurability(RUNTIME).change_listener([this]() {
             return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
         });
         add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
@@ -72,6 +72,12 @@ public:
     }
 
     auto property_change_handler() -> void override {
+        // Flush input port to prevent inconsistent data sizing
+        m_in_port.clear();
+        {
+            auto lock = std::scoped_lock{m_mtx};
+            m_futures.clear();
+        }
         if (m_window_type == "BLACKMAN_HARRIS") {
             m_window = windows::blackman_harris<T>(m_fft_size);
         } else if (m_window_type == "HAMMING") {
@@ -81,6 +87,13 @@ public:
             m_task_queue.thread_name_prefix(id());
         }
         m_task_queue.resize(m_num_workers);
+
+        if (m_metadata.sample_rate > 0.0) {
+            m_metadata.annotations["fft_size"] = std::to_string(m_fft_size);
+            m_metadata.annotations["fft_window"] = m_window_type;
+            logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+            m_out_port.send_metadata(m_metadata);
+        }
     }
 
     auto start() -> void override {
@@ -94,6 +107,16 @@ public:
                 }
                 // Submit FFT task to pool
                 auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> input_tuple_t {
+                    // Validate the input and fft sizes match
+                    if (data->size() != m_fft_size) [[unlikely]] {
+                        if (!m_warned) [[unlikely]] {
+                            logger()->error("Input buffer size {} does not match fft_size {}, dropping data", data->size(), m_fft_size);
+                            m_warned = true;
+                        }
+                        return std::make_tuple(nullptr, ts, std::move(meta));
+                    } else {
+                        m_warned = false;
+                    }
                     // Create a thread_local plan
                     static thread_local std::unique_ptr<plan_t> fft_plan;
                     if (!fft_plan || fft_plan->size() != m_fft_size) {
@@ -156,14 +179,18 @@ public:
         auto [data, ts, meta] = fut.get();
         if (meta.has_value()) {
             logger()->trace("received metadata:\n{}", meta->to_string());
-            meta->annotations["fft_size"] = std::to_string(m_fft_size);
-            meta->annotations["fft_window"] = m_window_type;
-            logger()->trace("sending updated metadata:\n{}", meta->to_string());
-            m_out_port.send_metadata(meta.value());
+            m_metadata = meta.value();
+            m_metadata.annotations["fft_size"] = std::to_string(m_fft_size);
+            m_metadata.annotations["fft_window"] = m_window_type;
+            logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+            m_out_port.send_metadata(m_metadata);
         }
 
-        // Send data
-        m_out_port.send_data(std::move(data), ts);
+        if (data != nullptr) [[likely]] {
+            // Send data
+            m_out_port.send_data(std::move(data), ts);
+        }
+
         return NORMAL;
     }
 
@@ -249,5 +276,7 @@ private:
     std::condition_variable m_cv;
     std::jthread m_input_thread;
     task_queue m_task_queue;
+    composite::metadata m_metadata{};
+    bool m_warned{false};
 
 }; // class fft
