@@ -40,7 +40,6 @@ private:
     output_port_t m_out_port{"data_out"};
 
     // Properties
-    std::string m_transport;
     uint32_t m_msg_size{};
     bool m_byteswap{true};
     uint32_t m_adc_bits{};

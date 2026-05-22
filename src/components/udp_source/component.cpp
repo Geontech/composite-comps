@@ -55,6 +55,11 @@ udp_source::udp_source() : composite::component("udp_source") {
 
 auto udp_source::property_change_handler() -> void {
     logger()->trace(std::source_location::current().function_name());
+    const bool was_started = m_started;
+    if (was_started) {
+        stop_stat_thread();
+        m_receiver->stop_recv();
+    }
     m_receiver.reset();
     auto config = udp::config{
         .logger = logger(),
@@ -75,11 +80,27 @@ auto udp_source::property_change_handler() -> void {
     } else { // recvmmsg
         m_receiver = std::make_unique<udp::recvmmsg>(config);
     }
+    if (was_started) {
+        m_receiver->start_recv(&m_out_port);
+        start_stat_thread();
+    }
 }
 
 auto udp_source::start() -> void {
     component::start();
     m_receiver->start_recv(&m_out_port);
+    m_started = true;
+    start_stat_thread();
+}
+
+auto udp_source::stop() -> void {
+    m_started = false;
+    stop_stat_thread();
+    m_receiver->stop_recv();
+    component::stop();
+}
+
+auto udp_source::start_stat_thread() -> void {
     m_stat_thread = std::jthread([this](std::stop_token token) {
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -101,13 +122,11 @@ auto udp_source::start() -> void {
     pthread_setname_np(m_stat_thread.native_handle(), "udp_stats");
 }
 
-auto udp_source::stop() -> void {
+auto udp_source::stop_stat_thread() -> void {
     m_stat_thread.request_stop();
     if (m_stat_thread.joinable()) {
         m_stat_thread.join();
     }
-    m_receiver->stop_recv();
-    component::stop();
 }
 
 auto udp_source::process() -> composite::retval {

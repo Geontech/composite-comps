@@ -54,8 +54,15 @@ public:
         } else {
             m_converter = converter<int16_t, int16_t>(m_byteswap);
         }
-        // flush input port
+        // flush input port and reset output buffer state
         m_in_port.clear();
+        m_output_buf.reset();
+        m_output_idx = 0;
+        if (m_metadata.sample_rate > 0.0) {
+            m_metadata.format.endianness = m_byteswap ? ((m_endian == std::endian::big) ? std::endian::little : std::endian::big) : m_endian;
+            logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+            m_out_port.send_metadata(m_metadata);
+        }
     }
 
     auto process() -> composite::retval override {
@@ -66,8 +73,9 @@ public:
         }
         if (meta.has_value()) {
             logger()->trace("received metadata:\n{}", meta->to_string());
+            m_endian = meta->format.endianness;
             if (m_byteswap) {
-                meta->format.endianness = (meta->format.endianness == std::endian::big) ? std::endian::little : std::endian::big;
+                meta->format.endianness = (m_endian == std::endian::big) ? std::endian::little : std::endian::big;
             }
             meta->format.bit_width = sizeof(T) * 8;
             if (std::is_same_v<T, std::complex<float>> || std::is_same_v<T, std::complex<int16_t>>) {
@@ -170,5 +178,6 @@ private:
     uint32_t m_output_idx{};
     composite::timestamp m_output_ts;
     uint8_t m_pkt_count{};
+    std::endian m_endian = std::endian::native;
 
 }; // class stov

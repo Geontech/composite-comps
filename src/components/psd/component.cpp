@@ -39,6 +39,11 @@ psd<T>::psd() : composite::component("psd") {
 template <typename T>
 auto psd<T>::property_change_handler() -> void {
     initialize();
+    if (m_metadata.sample_rate > 0.0) {
+        m_metadata.annotations["psd_power_based_normalization"] = std::to_string(m_power_based_normalization);
+        logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
+        m_out_port.send_metadata(m_metadata);
+    }
 }
 
 template <typename T>
