@@ -56,7 +56,7 @@ function(add_pool_test TEST_NAME SOURCE_FILE)
     endif()
 endfunction()
 
-# NOTE: the overlapped framing ring was lifted into the framework (composite::overlap_ring) in M6;
+# NOTE: the overlapped framing ring was lifted into the framework (composite::overlap_ring);
 # its unit tests now live there as test_overlap_ring. Only framer-specific tests remain here.
 
 # Converter tests (variant-based converters)
