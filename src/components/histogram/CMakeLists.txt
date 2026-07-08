@@ -39,7 +39,6 @@ add_library(histogram MODULE
 target_link_libraries(histogram
     PRIVATE
     composite::composite
-    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS histogram

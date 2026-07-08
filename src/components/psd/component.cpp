@@ -20,184 +20,121 @@
 #include "component.hpp"
 #include "windows.hpp"
 
-#include <algorithm>
+#include <composite/core/register.hpp>
+
+#include <complex>
 #include <format>
+#include <functional>
+#include <memory>
 #include <numeric>
-#include <pthread.h>
+#include <string>
 #include <string_view>
 
 template <typename T>
-psd<T>::psd(std::string_view id) : composite::component(id) {
-    add_port(&m_in_port);
-    add_port(&m_out_port);
+psd<T>::psd(std::string_view id)
+    : base(id, "data_in", "data_out", /*default_workers=*/1) {
     using enum composite::properties::config_type;
-    add_property("num_workers", m_num_workers, RUNTIME).change_listener([this]() {
-        return m_num_workers <= 8u;
-    });
-    add_property("power_based_normalization", m_power_based_normalization, RUNTIME);
+    // num_workers is provided by pipeline_component.
+    this->add_property("power_based_normalization", m_power_based_normalization, RUNTIME);
+    m_pbn.store(m_power_based_normalization, std::memory_order_relaxed);
 }
 
 template <typename T>
-auto psd<T>::property_change_handler() -> void {
-    initialize();
+auto psd<T>::property_change_handler(const composite::properties::json& diff) -> void {
+    (void)diff;
+    // Publish the config snapshot read by the pool's work() (pool threads are not parked). A
+    // num_workers change is handled separately by pipeline_component.
+    m_pbn.store(m_power_based_normalization, std::memory_order_relaxed);
+    // prepare() stamps the normalization mode onto the shared metadata; tell the pipeline to
+    // rebuild it even though the incoming metadata instance is unchanged.
+    this->invalidate_prepared_metadata();
 }
 
 template <typename T>
-auto psd<T>::initialize() -> void {
-    // Setup task queue
-    if (m_task_queue.thread_name_prefix() != id()) {
-        m_task_queue.thread_name_prefix(id());
-    }
-    m_task_queue.resize(m_num_workers);
-    // Calculate normalization constant
-    m_work.norm_const(calculate_norm_const());
+auto psd<T>::prepare(composite::metadata& md) -> void {
+    // ARRIVAL order, main thread: record the normalization mode (from the snapshot) on the metadata.
+    md.annotations["psd_power_based_normalization"] =
+        std::to_string(m_pbn.load(std::memory_order_relaxed));
 }
 
 template <typename T>
-auto psd<T>::start() -> void {
-    m_input_thread = std::jthread([&](std::stop_token stoken) {
-        while (!stoken.stop_requested()) {
-            // Get data buffer
-            auto [data, ts, meta] = m_in_port.get_data();
-            if (!data) {
-                std::this_thread::yield();
-                continue;
-            }
-            if (meta.has_value()) {
-                logger()->trace("received metadata:\n{}", meta->to_string());
-                m_sample_rate = meta->sample_rate;
-                if (m_metadata.sample_rate != m_sample_rate) {
-                    // Calculate new normalization constant
-                    m_work.norm_const(calculate_norm_const());
-                }
-                // Check if we need to rebuild the window
-                auto curr_fft_size = std::size_t{};
-                auto curr_fft_window = std::string{};
-                if (m_metadata.annotations.contains("fft_size")) {
-                    try {
-                        curr_fft_size = std::stoul(m_metadata.annotations.at("fft_size"));
-                    } catch (...) {}
-                }
-                if (m_metadata.annotations.contains("fft_window")) {
-                    curr_fft_window = m_metadata.annotations.at("fft_window");
-                }
-                if (meta->annotations.contains("fft_size") && meta->annotations.contains("fft_window")) {
-                    auto meta_fft_size = std::size_t{};
-                    try {
-                        meta_fft_size = std::stoul(meta->annotations.at("fft_size"));
-                    } catch (...) {}
-                    auto meta_fft_window = meta->annotations.at("fft_window");
-                    if (curr_fft_size != meta_fft_size || curr_fft_window != meta_fft_window) {
-                        logger()->trace(
-                            "metadata fft properties differ from current known fft properties; curr=(size: {}, window={}) vs metadata=(size: {}, window: {})",
-                            curr_fft_size, curr_fft_window, meta_fft_size, meta_fft_window
-                        );
-                        // Create new window
-                        if (meta_fft_window == "BLACKMAN_HARRIS") {
-                            m_window = windows::blackman_harris<T>(meta_fft_size, false);
-                        } else if (meta_fft_window == "HAMMING") {
-                            m_window = windows::hamming<T>(meta_fft_size, false);
-                        } else {
-                            m_window.reset();
-                        }
-                        // Calculate new normalization constant
-                        m_work.norm_const(calculate_norm_const());
-                    }
-                }
-                meta->annotations["psd_power_based_normalization"] = std::to_string(m_power_based_normalization);
-                m_metadata = meta.value();
-            }
-            // Submit PSD task to pool
-            auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> output_tuple_t {
-                // Perform PSD
-                auto psd = m_work.process(data);
-                // Return modified data, meta, and original ts
-                return std::make_tuple(std::move(psd), ts, std::move(meta));
-            });
-            // Push future onto queue
-            {
-                auto lock = std::scoped_lock{m_mtx};
-                m_futures.push_back(std::move(fut));
-            }
-            m_cv.notify_one();
-        }
-    });
-    pthread_setname_np(m_input_thread.native_handle(), std::format("{}-in", id()).c_str());
-    composite::component::start();
-}
-
-template <typename T>
-auto psd<T>::stop() -> void {
-    m_input_thread.request_stop();
-    m_cv.notify_all();
-    composite::component::stop();
-}
-
-template <typename T>
-auto psd<T>::process() -> composite::retval {
-    using enum composite::retval;
-    // Pop a future from the queue
-    using namespace std::chrono_literals;
-    auto lock = std::unique_lock{m_mtx};
-    m_cv.wait_for(lock, 1s, [this]{ return !m_futures.empty(); });
-    if (m_futures.empty()) {
-        return NORMAL;
-    }
-    auto fut = std::move(m_futures.front());
-    m_futures.pop_front();
-    lock.unlock();
-
-    // Get result data from future
-    auto [data, ts, meta] = fut.get();
-    if (meta.has_value()) {
-        logger()->trace("sending updated metadata:\n{}", meta->to_string());
-        m_out_port.send_metadata(meta.value());
-    }
-
-    // Send data
-    m_out_port.send_data(std::move(data), ts);
-    return NORMAL;
-}
-
-template <typename T>
-auto psd<T>::calculate_norm_const() const -> T {
-    // If sample_rate is unknown, return 1
-    if (m_sample_rate == T{}) {
+auto psd<T>::compute_norm_const(const window_t* window, T sample_rate, bool power_based) -> T {
+    if (sample_rate == T{}) {
         return T{1};
     }
-    // Calculate window normalization constant
-    auto window_norm_const = T{1};
-    if (m_window) {
-        // Calculate sum of squared window values without modifying the window
+    T window_norm_const = T{1};
+    if (window != nullptr) {
         auto window_sum_sq = std::transform_reduce(
-            m_window->data(),
-            m_window->data() + m_window->size(),
-            T{0},
-            std::plus<>{},
-            [](T val) { return val * val; }
-        );
-        // Window normalization constant
+            window->data(), window->data() + window->size(), T{0}, std::plus<>{},
+            [](T val) { return val * val; });
         window_norm_const = window_sum_sq;
-        if (m_power_based_normalization) {
-            window_norm_const = window_norm_const / static_cast<T>(m_window->size());
+        if (power_based) {
+            window_norm_const = window_norm_const / static_cast<T>(window->size());
         }
-        logger()->trace("calculated window norm constant of: {}", window_norm_const);
     }
-    // Calculate normalization constant
-    return T{1} / (m_sample_rate * window_norm_const);
+    return T{1} / (sample_rate * window_norm_const);
+}
+
+template <typename T>
+auto psd<T>::work(composite::mutable_buffer<std::complex<T>> in, composite::timestamp ts,
+                  const composite::metadata& md) -> composite::mutable_buffer<T> {
+    (void)ts;
+    // Per-pool-worker state: the window + PSD kernel for this worker, rebuilt only when the FFT
+    // params / sample rate / mode actually change (consecutive packets usually share them).
+    thread_local std::unique_ptr<window_t> tl_window;
+    thread_local std::size_t tl_size{0};
+    thread_local std::string tl_wtype;
+    thread_local T tl_sample_rate{-1};
+    thread_local bool tl_pbn{true};
+    thread_local bool tl_have_key{false};
+    thread_local ::work<T> tl_work;  // ::work disambiguates the kernel class from this method
+
+    // FFT params + sample rate are stamped on the metadata by the upstream fft.
+    std::size_t fft_size{0};
+    std::string wtype;
+    if (md.annotations.contains("fft_size")) {
+        try { fft_size = std::stoul(md.annotations.at("fft_size").to_string()); } catch (...) {}
+    }
+    if (md.annotations.contains("fft_window")) {
+        wtype = md.annotations.at("fft_window").to_string();
+    }
+    const T sample_rate = static_cast<T>(md.sample_rate);
+    const bool pbn = m_pbn.load(std::memory_order_relaxed);
+
+    // Rebuild the window only when (size, type) changes.
+    if (!tl_have_key || fft_size != tl_size || wtype != tl_wtype) {
+        if (wtype == "BLACKMAN_HARRIS") {
+            tl_window = windows::blackman_harris<T>(fft_size, false);
+        } else if (wtype == "HAMMING") {
+            tl_window = windows::hamming<T>(fft_size, false);
+        } else {
+            tl_window.reset();
+        }
+        tl_size = fft_size;
+        tl_wtype = wtype;
+        tl_have_key = true;
+        tl_sample_rate = T{-1};  // force a norm-const recompute below
+    }
+    // Recompute the norm const only when window / sample_rate / mode changes.
+    if (sample_rate != tl_sample_rate || pbn != tl_pbn) {
+        tl_work.norm_const(compute_norm_const(tl_window.get(), sample_rate, pbn));
+        tl_sample_rate = sample_rate;
+        tl_pbn = pbn;
+    }
+    return tl_work.process(in);
 }
 
 // Explicit template instantiations
 template class psd<float>;
 template class psd<double>;
 
-extern "C" {
-    auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
-        if (type == "f32") {
-            return std::make_shared<psd<float>>(id);
-        } else if (type == "f64") {
-            return std::make_shared<psd<double>>(id);
-        }
-        throw std::runtime_error(std::format("unknown type '{}' for psd component", type));
+COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
+                                 -> std::shared_ptr<composite::component> {
+    const auto type = args.type();
+    if (type == "f32") {
+        return std::make_shared<psd<float>>(id);
+    } else if (type == "f64") {
+        return std::make_shared<psd<double>>(id);
     }
-}
+    throw std::runtime_error(std::format("unknown type '{}' for psd component", type));
+})

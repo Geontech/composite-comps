@@ -41,6 +41,9 @@ public:
         const composite::metadata& current_metadata
     ) -> parse_result override;
     auto name() const -> std::string_view override { return "vita49.1"; }
+    // Delegates parsing (and thus metadata change-tracking) to the inner V49 parser, so the
+    // (re)activation latch must be forwarded to it.
+    auto on_activated() -> void override { m_vita49_parser.on_activated(); }
 
 private:
     struct_props::signal_overrides m_overrides;

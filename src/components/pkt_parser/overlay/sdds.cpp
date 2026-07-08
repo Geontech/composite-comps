@@ -20,9 +20,28 @@
 #include "sdds.hpp"
 
 #include <bit>
+#include <cstring>
 #include <immintrin.h>
+#include <stdexcept>
 
 namespace overlay {
+
+namespace {
+// Big-endian field read via memcpy (not reinterpret_cast) to avoid misaligned-
+// load / strict-aliasing UB, with a defensive bounds check. SDDS is fixed at
+// 1080 bytes and the parser re-validates that before constructing this overlay,
+// so for valid traffic these reads are always in-bounds; the check only fires if
+// the overlay is ever built on a short buffer (then caught by the component).
+template <typename U>
+auto read_be(std::span<const uint8_t> d, std::size_t off) -> U {
+    if (sizeof(U) > d.size() || off > d.size() - sizeof(U)) {
+        throw std::out_of_range("sdds: field read past end of packet");
+    }
+    U v{};
+    std::memcpy(&v, d.data() + off, sizeof(U));
+    return std::byteswap(v);
+}
+} // namespace
 
 sdds::sdds(std::span<const uint8_t> data) : m_data(data) {}
 
@@ -51,7 +70,7 @@ auto sdds::complex() const -> bool {
 }
 
 auto sdds::seq_num() const -> uint16_t {
-    return std::byteswap(*reinterpret_cast<const uint16_t*>(m_data.data() + 2));
+    return read_be<uint16_t>(m_data, 2);
 }
 
 auto sdds::ttv() const -> bool {
@@ -59,19 +78,19 @@ auto sdds::ttv() const -> bool {
 }
 
 auto sdds::ttag() const -> uint64_t {
-    return std::byteswap(*reinterpret_cast<const uint64_t*>(m_data.data() + 8));
+    return read_be<uint64_t>(m_data, 8);
 }
 
 auto sdds::ttage() const -> uint32_t {
-    return std::byteswap(*reinterpret_cast<const uint32_t*>(m_data.data() + 16));
+    return read_be<uint32_t>(m_data, 16);
 }
 
 auto sdds::dfdt() const -> int32_t {
-    return std::byteswap(*reinterpret_cast<const int32_t*>(m_data.data() + 20));
+    return read_be<int32_t>(m_data, 20);
 }
 
 auto sdds::frequency() const -> uint64_t {
-    return std::byteswap(*reinterpret_cast<const uint64_t*>(m_data.data() + 24));
+    return read_be<uint64_t>(m_data, 24);
 }
 
 auto sdds::sample_rate() const -> double {

@@ -47,6 +47,10 @@ struct dpdk_config {
 
 } // namespace struct_props
 
+COMPOSITE_STRUCT(struct_props::overrides, msg_size);
+COMPOSITE_STRUCT(struct_props::dpdk_config,
+    port_id, queue_id, mempool_name, burst_size, igmp_respond_to_queries, src_ip);
+
 class udp_source : public composite::component {
     static constexpr std::string_view RECVMMSG = "recvmmsg";
     static constexpr std::string_view PACKET_MMAP = "packet_mmap";
@@ -56,7 +60,7 @@ class udp_source : public composite::component {
 public:
     explicit udp_source(std::string_view id);
     ~udp_source() override = default;
-    auto property_change_handler() -> void override;
+    auto property_change_handler(const composite::properties::json& diff) -> void override;
     auto start() -> void override;
     auto stop() -> void override;
     auto process() -> composite::retval override;
@@ -95,26 +99,8 @@ private:
     auto stop_receiver_locked() -> void;
     auto create_metrics() -> udp::metrics;
 
+    // MUST be last: stops the worker + (via stop()) the receiver and the stats jthread before any
+    // member above destructs (the base ~component stops too late). See fft for rationale.
+    composite::component::auto_stop m_auto_stop{*this};
+
 }; // class udp_source
-
-// Struct property trait specializations
-template<>
-struct composite::properties::property_traits<struct_props::overrides> {
-    static void register_fields(composite::properties::property_set& ps, struct_props::overrides& prop) {
-        using enum composite::properties::config_type;
-        ps.add("msg_size", prop.msg_size, RUNTIME);
-    }
-};
-
-template<>
-struct composite::properties::property_traits<struct_props::dpdk_config> {
-    static void register_fields(composite::properties::property_set& ps, struct_props::dpdk_config& prop) {
-        using enum composite::properties::config_type;
-        ps.add("port_id", prop.port_id);
-        ps.add("queue_id", prop.queue_id);
-        ps.add("mempool_name", prop.mempool_name);
-        ps.add("burst_size", prop.burst_size);
-        ps.add("igmp_respond_to_queries", prop.igmp_respond_to_queries);
-        ps.add("src_ip", prop.src_ip);
-    }
-};

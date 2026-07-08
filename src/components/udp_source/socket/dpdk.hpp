@@ -31,7 +31,7 @@
 #include <optional>
 #include <vector>
 #include <chrono>
-#include <spdlog/spdlog.h>
+#include <composite/core/logger.hpp>
 
 // Forward declarations to avoid pulling in DPDK headers in header file
 struct rte_mempool;
@@ -47,7 +47,7 @@ namespace udp {
 class dpdk final : public interface {
 public:
     struct config {
-        std::shared_ptr<spdlog::logger> logger;
+        std::shared_ptr<composite::logger> logger;
 
         // High-level user configuration (matches other socket types)
         std::string interface;            // Interface name (e.g., "eth0", "mlx5_0")

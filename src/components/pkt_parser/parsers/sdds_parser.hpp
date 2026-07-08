@@ -43,10 +43,15 @@ public:
         const composite::metadata& current_metadata
     ) -> parse_result override;
     auto name() const -> std::string_view override { return "sdds"; }
+    auto on_activated() -> void override {
+        m_emitted = false;
+        m_pkt_count = 0;  // sequence restarts; the first packet skips the gap check
+    }
 
 private:
     struct_props::signal_overrides m_overrides;
     uint16_t m_pkt_count{0};
+    bool m_emitted{false};  ///< false until this parser has published metadata since (re)activation
 
 }; // class sdds_parser
 

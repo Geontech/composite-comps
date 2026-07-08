@@ -53,9 +53,14 @@ target_include_directories(pkt_parser
 target_link_libraries(pkt_parser
     PRIVATE
     composite::composite
-    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS pkt_parser
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+
+# Untrusted-input parser fuzz/regression (built only when testing is enabled).
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

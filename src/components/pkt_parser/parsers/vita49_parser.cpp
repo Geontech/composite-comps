@@ -30,11 +30,32 @@ namespace {
     // VITA 49 Data Item Format ranges (per spec section 9.5.7)
     constexpr uint32_t MAX_SIGNED_FORMAT = 0x07;    // Formats 0x00-0x07 are signed integer
     constexpr uint32_t MIN_UNSIGNED_FORMAT = 0x10;  // Formats 0x10-0x17 are unsigned integer
-                                                     // Formats 0x08-0x0F are floating point
+                                                    // Formats 0x08-0x0F are floating point
 } // anonymous namespace
 
-vita49_parser::vita49_parser(const struct_props::signal_overrides& overrides)
-    : m_overrides(overrides) {}
+vita49_parser::vita49_parser(const struct_props::signal_overrides& overrides,
+                             std::string_view transport_annotation)
+    : m_overrides(overrides), m_transport(transport_annotation) {
+    // Resolve the string-valued overrides to enums here, once, off the per-packet path.
+    // parse() then applies them with a plain branch + assign instead of re-parsing these
+    // strings (== "signed_integer", == "big", ...) on every packet.
+    if (!m_overrides.data_format.type.empty()) {
+        if (m_overrides.data_format.type == "signed_integer") {
+            m_ov_type = composite::data_type::signed_integer;
+        } else if (m_overrides.data_format.type == "unsigned_integer") {
+            m_ov_type = composite::data_type::unsigned_integer;
+        } else if (m_overrides.data_format.type == "floating_point") {
+            m_ov_type = composite::data_type::floating_point;
+        }
+    }
+    if (!m_overrides.data_format.endianness.empty()) {
+        if (m_overrides.data_format.endianness == "big") {
+            m_ov_endianness = std::endian::big;
+        } else if (m_overrides.data_format.endianness == "little") {
+            m_ov_endianness = std::endian::little;
+        }
+    }
+}
 
 auto vita49_parser::can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool {
     // Minimum VITA 49 packet size (header only)
@@ -52,7 +73,21 @@ auto vita49_parser::parse(
     const composite::metadata& current_metadata
 ) -> parse_result {
     parse_result result;
-    result.metadata = current_metadata;
+
+    // Apply the (constant) signal overrides onto a metadata value. Called only when we
+    // (re)build metadata, never on the steady-state data path. The string-valued overrides
+    // (type, endianness) were resolved to enums once at construction (m_ov_type/m_ov_endianness).
+    auto apply_overrides = [this](composite::metadata& m) {
+        if (m_overrides.data_format.is_complex.has_value()) {
+            m.format.is_complex = *m_overrides.data_format.is_complex;
+        }
+        if (m_ov_type.has_value()) { m.format.type = *m_ov_type; }
+        if (m_overrides.data_format.bit_width > 0) { m.format.bit_width = m_overrides.data_format.bit_width; }
+        if (m_ov_endianness.has_value()) { m.format.endianness = *m_ov_endianness; }
+        if (m_overrides.center_frequency.has_value()) { m.center_frequency = *m_overrides.center_frequency; }
+        if (m_overrides.bandwidth.has_value()) { m.bandwidth = *m_overrides.bandwidth; }
+        if (m_overrides.sample_rate.has_value()) { m.sample_rate = *m_overrides.sample_rate; }
+    };
 
     // Overlay VITA 49 packet (read-only, no IQ swap)
     auto packet = overlay::v49(std::span{data.data(), data.size()});
@@ -84,69 +119,57 @@ auto vita49_parser::parse(
         result.payload = data.slice(payload_start, payload_size);
 
         result.should_send = true;
+
+        // Data packets carry the current signal metadata unchanged (format / center_frequency
+        // / bandwidth / sample_rate come from context packets). Republish only on the first
+        // packet after (re)activation; steady-state data packets do no metadata work here.
+        if (!m_emitted) [[unlikely]] {
+            result.metadata = current_metadata;
+            apply_overrides(result.metadata);
+            result.metadata.annotations["protocol"] = m_transport;
+            result.metadata_changed = true;
+            m_emitted = true;
+        }
     } else if (packet.is_context()) {
-        // Extract metadata from context packet
+        // Build the metadata this context packet implies, then publish it only if it actually
+        // differs from the current value (context packets are rare, so a full compare is fine).
+        auto candidate = current_metadata;
         if (auto format = packet.signal_data_format()) {
-            result.metadata.format.is_complex = format->real_complex_type() != vrtgen::packing::DataSampleType::REAL;
+            candidate.format.is_complex = format->real_complex_type() != vrtgen::packing::DataSampleType::REAL;
 
             // Determine data type from VITA 49 format encoding
             auto format_code = std::to_underlying(format->data_item_format());
             if (format_code <= MAX_SIGNED_FORMAT) {
-                result.metadata.format.type = composite::data_type::signed_integer;
+                candidate.format.type = composite::data_type::signed_integer;
             } else if (format_code >= MIN_UNSIGNED_FORMAT) {
-                result.metadata.format.type = composite::data_type::unsigned_integer;
+                candidate.format.type = composite::data_type::unsigned_integer;
             } else {
-                result.metadata.format.type = composite::data_type::floating_point;
+                candidate.format.type = composite::data_type::floating_point;
             }
-            result.metadata.format.bit_width = format->data_item_size();
-            result.metadata.format.endianness = packet.endianness();
+            candidate.format.bit_width = format->data_item_size();
+            candidate.format.endianness = packet.endianness();
         }
 
-        result.metadata.center_frequency = packet.rf_frequency().value_or(0);
-        result.metadata.bandwidth = packet.bandwidth().value_or(0);
-        result.metadata.sample_rate = packet.sample_rate().value_or(0);
+        candidate.center_frequency = packet.rf_frequency().value_or(0);
+        candidate.bandwidth = packet.bandwidth().value_or(0);
+        candidate.sample_rate = packet.sample_rate().value_or(0);
+        apply_overrides(candidate);
+        candidate.annotations["protocol"] = m_transport;
+
+        if (!m_emitted || candidate != current_metadata) {
+            result.metadata = std::move(candidate);
+            result.metadata_changed = true;
+            m_emitted = true;
+        }
 
         result.should_send = false;  // Context packets don't carry data
     }
 
-    // Apply overrides
-    if (m_overrides.data_format.is_complex.has_value()) {
-        result.metadata.format.is_complex = m_overrides.data_format.is_complex.value();
-    }
-    if (!m_overrides.data_format.type.empty()) {
-        if (m_overrides.data_format.type == "signed_integer") {
-            result.metadata.format.type = composite::data_type::signed_integer;
-        } else if (m_overrides.data_format.type == "unsigned_integer") {
-            result.metadata.format.type = composite::data_type::unsigned_integer;
-        } else if (m_overrides.data_format.type == "floating_point") {
-            result.metadata.format.type = composite::data_type::floating_point;
-        }
-    }
-    if (m_overrides.data_format.bit_width > 0) {
-        result.metadata.format.bit_width = m_overrides.data_format.bit_width;
-    }
-    if (!m_overrides.data_format.endianness.empty()) {
-        if (m_overrides.data_format.endianness == "big") {
-            result.metadata.format.endianness = std::endian::big;
-        } else if (m_overrides.data_format.endianness == "little") {
-            result.metadata.format.endianness = std::endian::little;
-        }
-    }
-    if (m_overrides.center_frequency.has_value()) {
-        result.metadata.center_frequency = m_overrides.center_frequency.value();
-    }
-    if (m_overrides.bandwidth.has_value()) {
-        result.metadata.bandwidth = m_overrides.bandwidth.value();
-    }
-    if (m_overrides.sample_rate.has_value()) {
-        result.metadata.sample_rate = m_overrides.sample_rate.value();
-    }
-
-    result.metadata.annotations["protocol"] = "v49";
-
-    // Adjust fractional timestamp if in sample count mode
+    // Adjust fractional timestamp if in sample count mode. Reads the effective current sample
+    // rate (result.metadata is only populated when metadata changed on this packet).
     if (is_tsf_sc) {
-        if (result.metadata.sample_rate == 0.0) {
+        const double eff_sample_rate = m_overrides.sample_rate.value_or(current_metadata.sample_rate);
+        if (eff_sample_rate == 0.0) {
             if (!m_tsf_warn) {
                 result.warning = "unable to set fractional timestamp: unknown sample rate in SAMPLE_COUNT mode; dropping data until sample rate discovered";
                 m_tsf_warn = true;
@@ -155,7 +178,7 @@ auto vita49_parser::parse(
         } else {
             // Convert sample count to picoseconds: samples / sample_rate * 1e12
             auto samples = static_cast<double>(result.timestamp.picoseconds);
-            auto picoseconds_per_sample = 1e12 / result.metadata.sample_rate;
+            auto picoseconds_per_sample = 1e12 / eff_sample_rate;
             auto picoseconds = samples * picoseconds_per_sample;
 
             // Clamp to uint64_t range to prevent overflow

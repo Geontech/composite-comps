@@ -25,7 +25,7 @@
 #include <composite/buffers/external_buffer.hpp>
 #include <composite/dpdk/manager.hpp>
 
-#include <spdlog/spdlog.h>
+#include <composite/core/logger.hpp>
 
 #include <rte_mbuf.h>
 #include <rte_ethdev.h>
@@ -44,7 +44,9 @@
 namespace {
 struct mbuf_release {
     rte_mbuf* mbuf{};
-    void operator()() {
+    // external_buffer<uint8_t> invokes its deleter as release(uint8_t*) (the data pointer). The
+    // mbuf to free is captured as a member, so the pointer argument is unused.
+    void operator()(uint8_t* /*data*/) {
         if (mbuf) {
             rte_pktmbuf_free(mbuf);
             mbuf = nullptr;
@@ -305,6 +307,10 @@ auto dpdk::receive(std::stop_token token) -> void {
         // Record batch size metric
         m_metrics.batch_sizes.record(static_cast<double>(nb_rx));
 
+        // Accumulate the per-packet counts in locals and record them with one atomic add each
+        // after the burst, instead of a locked RMW per packet on the hot path.
+        uint64_t acc_recv = 0, acc_bytes = 0, acc_dropped = 0;
+
         // Process each received packet
         for (uint16_t i = 0; i < nb_rx; i++) {
             struct rte_mbuf* mbuf = pkts[i];
@@ -318,10 +324,14 @@ auto dpdk::receive(std::stop_token token) -> void {
             // Extract UDP payload from packet
             auto payload = extract_udp_payload(mbuf);
 
+            // "Total UDP packets received": count EVERY observed packet as received; a
+            // dropped/filtered one was received then dropped, so it is also counted in
+            // packets_dropped. This matches the packet_mmap backend so the metric means the same
+            // thing regardless of socket type (received = forwarded + dropped).
+            ++acc_recv;
+
             if (payload.valid) {
-                m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
-                m_metrics.packets_received.inc();
-                m_metrics.bytes_received.add(payload.length);
+                acc_bytes += payload.length;
 
                 // Wrap payload in external_buffer with DPDK mbuf release callback (zero-allocation)
                 auto buffer = composite::external_buffer<uint8_t>(
@@ -331,10 +341,20 @@ auto dpdk::receive(std::stop_token token) -> void {
                 );
                 m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
             } else {
-                m_pkts_dropped.fetch_add(1, std::memory_order_relaxed);
-                m_metrics.packets_dropped.inc();
+                ++acc_dropped;
                 rte_pktmbuf_free(mbuf);
             }
+        }
+
+        // One atomic add per counter for the whole burst (a burst of only IGMP queries adds none).
+        if (acc_recv != 0) {
+            m_pkts_recvd.fetch_add(acc_recv, std::memory_order_relaxed);
+            m_metrics.packets_received.add(acc_recv);
+        }
+        if (acc_bytes != 0) { m_metrics.bytes_received.add(acc_bytes); }
+        if (acc_dropped != 0) {
+            m_pkts_dropped.fetch_add(acc_dropped, std::memory_order_relaxed);
+            m_metrics.packets_dropped.add(acc_dropped);
         }
 
         if (m_igmp_mgr) {
@@ -396,7 +416,7 @@ auto dpdk::extract_udp_payload(rte_mbuf* mbuf) -> udp_payload {
     // We only handle IPv4 for now
     if (ether_type != RTE_ETHER_TYPE_IPV4) {
         // Log first 32 bytes of packet for diagnostics
-        if (m_logger->should_log(spdlog::level::debug)) {
+        if (m_logger->should_log(composite::log_level::debug)) {
             std::string hex_dump;
             for (uint32_t i = 0; i < std::min(32u, pkt_len); i++) {
                 char buf[4];
@@ -428,7 +448,7 @@ auto dpdk::extract_udp_payload(rte_mbuf* mbuf) -> udp_payload {
 
     // Optional: Filter by destination IP
     if (m_dst_ip_be.has_value() && ip_hdr->dst_addr != m_dst_ip_be.value()) {
-        if (m_logger->should_log(spdlog::level::trace)) {
+        if (m_logger->should_log(composite::log_level::trace)) {
             char ip_str[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &ip_hdr->dst_addr, ip_str, sizeof(ip_str));
             m_logger->trace("IP mismatch: {} != {}", ip_str, m_config.ip_addr);

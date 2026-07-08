@@ -27,7 +27,7 @@
 #include <map>
 #include <memory>
 #include <memory_resource>
-#include <spdlog/spdlog.h>
+#include <composite/core/logger.hpp>
 
 namespace udp {
 
@@ -56,7 +56,7 @@ struct config {
     /**
      * @brief Logger instance
      */
-    std::shared_ptr<spdlog::logger> logger;
+    std::shared_ptr<composite::logger> logger;
 
     /**
      * @brief Network interface name (e.g., "eth0").
@@ -162,13 +162,13 @@ protected:
      * @param logger spdlog logger instance
      * @param metrics metrics for recording
      */
-    interface(std::shared_ptr<spdlog::logger> logger, udp::metrics metrics)
+    interface(std::shared_ptr<composite::logger> logger, udp::metrics metrics)
         : m_logger(logger), m_metrics(metrics) {}
 
     /**
      * @brief Logger instance
      */
-    std::shared_ptr<spdlog::logger> m_logger;
+    std::shared_ptr<composite::logger> m_logger;
 
     /**
      * @brief Metrics for recording

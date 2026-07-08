@@ -20,6 +20,8 @@
 #include "component.hpp"
 #include "windows.hpp"
 
+#include <composite/core/register.hpp>
+
 #include <bit>
 #include <fftw3.h>
 #include <format>
@@ -27,32 +29,37 @@
 #include <pthread.h>
 
 template <typename T>
-fft<T>::fft(std::string_view id) : composite::component(id) {
+fft<T>::fft(std::string_view id)
+    : base(id, "data_in", "data_out", /*default_workers=*/1) {
     using enum composite::properties::config_type;
 
-    add_port(&m_in_port);
-    add_port(&m_out_port);
-    add_property("window", m_window_type).change_listener([this]() {
-        return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING") || m_window_type.empty();
+    // Ports + num_workers are provided by pipeline_component; register fft's own config here.
+    this->add_property("window", m_window_type).validate([](const std::string& v) {
+        return (v == "BLACKMAN_HARRIS") || (v == "HAMMING") || v.empty();
     });
-    add_property("fft_size", m_fft_size).configurability(RUNTIME).change_listener([this]() {
-        return std::has_single_bit(m_fft_size);
+    this->add_property("fft_size", m_fft_size, RUNTIME).validate([](const std::uint32_t& v) {
+        return std::has_single_bit(v);
     });
-    add_property("num_workers", m_num_workers).configurability(RUNTIME).change_listener([this]() {
-        return m_num_workers <= 8u;
-    });
-    add_property("fftw_threads", m_fftw_threads);
-    add_property("shift", m_shift).configurability(RUNTIME);
+    this->add_property("fftw_threads", m_fftw_threads);
+    this->add_property("shift", m_shift, RUNTIME);
 
     if constexpr (std::is_same_v<scalar_t, float>) {
         fftwf_init_threads();
     } else {
         fftw_init_threads();
     }
+
+    // Publish an initial snapshot so a pool worker always loads a valid config even if no
+    // properties are set before start() (property_change_handler republishes on every change).
+    m_task_cfg.store(make_task_config());
 }
 
 template <typename T>
 fft<T>::~fft() {
+    // Stop the pipeline (main worker + pool) BEFORE releasing FFTW's global thread state: the dtor
+    // body runs before members, so a pool worker could otherwise still be in work() using a plan
+    // when fftw_cleanup_threads() frees FFTW's threading bookkeeping.
+    this->stop();
     if constexpr (std::is_same_v<scalar_t, float>) {
         fftwf_cleanup_threads();
     } else {
@@ -61,108 +68,86 @@ fft<T>::~fft() {
 }
 
 template <typename T>
-auto fft<T>::property_change_handler() -> void {
+auto fft<T>::property_change_handler(const composite::properties::json& diff) -> void {
+    (void)diff;
+    // Publish a fresh immutable snapshot (incl. a newly-allocated window). Pool workers already in
+    // flight keep their previously-loaded snapshot alive, so the old window is freed only once the
+    // last worker using it finishes — no use-after-free even though the pool is not parked. (A
+    // num_workers change is applied separately by pipeline_component.)
+    m_task_cfg.store(make_task_config());
+    // prepare() stamps fft_size/fft_window from this snapshot onto the shared metadata; tell
+    // the pipeline to rebuild it even though the incoming metadata instance is unchanged.
+    this->invalidate_prepared_metadata();
+}
+
+template <typename T>
+auto fft<T>::make_task_config() const -> std::shared_ptr<const task_config> {
+    auto cfg = std::make_shared<task_config>();
+    cfg->fft_size = m_fft_size;
+    cfg->shift = m_shift;
+    cfg->fftw_threads = m_fftw_threads;
+    cfg->window_type = m_window_type;
     if (m_window_type == "BLACKMAN_HARRIS") {
-        m_window = windows::blackman_harris<scalar_t>(m_fft_size);
+        cfg->window = windows::blackman_harris<scalar_t>(m_fft_size);
     } else if (m_window_type == "HAMMING") {
-        m_window = windows::hamming<scalar_t>(m_fft_size);
+        cfg->window = windows::hamming<scalar_t>(m_fft_size);
+    }
+    return cfg;
+}
+
+template <typename T>
+auto fft<T>::prepare(composite::metadata& md) -> void {
+    // ARRIVAL order, main thread: stamp the FFT params from the published snapshot so the
+    // metadata that travels with this packet matches the config work() will use.
+    auto cfg = m_task_cfg.load();
+    // Keep the prior annotation wire format (string), so this refactor doesn't incidentally
+    // change the fft_size annotation type; psd parses it with stoul either way.
+    md.annotations["fft_size"] = std::to_string(cfg->fft_size);
+    md.annotations["fft_window"] = cfg->window_type;
+}
+
+template <typename T>
+auto fft<T>::work(composite::immutable_buffer<T> in, composite::timestamp ts,
+                  const composite::metadata& md) -> composite::immutable_buffer<T> {
+    (void)ts;
+    (void)md;
+    // Load a consistent config snapshot for this work item (runs on a pool thread, not parked).
+    auto cfg = m_task_cfg.load();
+
+    // The working/output buffers below are sized to in.size(), but the FFTW plan reads AND writes
+    // exactly cfg->fft_size elements. If in.size() != fft_size the plan runs off the end of those
+    // buffers: a smaller frame is an out-of-bounds WRITE (heap corruption); a larger frame also
+    // walks the window buffer (sized fft_size) out of bounds. A framer/fft size mismatch must be a
+    // loud error, not silent corruption — throw so pipeline_component logs it and drops the packet
+    // (work() exceptions are captured per-slot) rather than executing the plan.
+    if (in.size() != cfg->fft_size) {
+        throw std::runtime_error(
+            "fft: input frame size (" + std::to_string(in.size()) +
+            ") does not match configured fft_size (" + std::to_string(cfg->fft_size) +
+            "); check the upstream framer's frame_size");
+    }
+
+    // Per-pool-worker FFTW plan, rebuilt when the size changes (thread_local => one per worker).
+    thread_local std::unique_ptr<plan_t> fft_plan;
+    if (!fft_plan || fft_plan->size() != cfg->fft_size) {
+        fft_plan = std::make_unique<plan_t>(cfg->fft_size, cfg->fftw_threads);
+    }
+
+    // Fused copy + window (or just copy if no window) into a working buffer.
+    auto working_buf = composite::make_aligned_buffer<T>(ALIGNMENT, in.size());
+    if (cfg->window) {
+        copy_and_window(in, working_buf, cfg->window.get());
     } else {
-        m_window.reset();
-    }
-    if (m_task_queue.thread_name_prefix() != id()) {
-        m_task_queue.thread_name_prefix(id());
-    }
-    m_task_queue.resize(m_num_workers);
-}
-
-template <typename T>
-auto fft<T>::start() -> void {
-    m_input_thread = std::jthread([&](std::stop_token stoken) {
-        while (!stoken.stop_requested()) {
-            auto [data, ts, meta] = m_in_port.get_data();
-            if (!data) {
-                std::this_thread::yield();
-                continue;
-            }
-
-            auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> output_tuple_t {
-                thread_local std::unique_ptr<plan_t> fft_plan;
-                if (!fft_plan || fft_plan->size() != m_fft_size) {
-                    fft_plan = std::make_unique<plan_t>(m_fft_size, m_fftw_threads);
-                }
-
-                // Allocate working buffer for windowed input data
-                auto working_buf = composite::make_aligned_buffer<T>(ALIGNMENT, data.size());
-
-                // Fused copy + window (or just copy if no window)
-                if (m_window) {
-                    copy_and_window(data, working_buf, m_window.get());
-                } else {
-                    std::copy(data.begin(), data.end(), working_buf.begin());
-                }
-
-                // Allocate output buffer for FFT result
-                auto output_buf = composite::make_aligned_buffer<T>(ALIGNMENT, data.size());
-
-                // Execute out-of-place FFT: working -> output
-                fft_plan->execute(working_buf.data(), output_buf.data());
-
-                // Apply fftshift if configured
-                if (m_shift) {
-                    std::rotate(
-                        output_buf.begin(),
-                        output_buf.begin() + (output_buf.size() / 2),
-                        output_buf.end()
-                    );
-                }
-
-                // Convert to immutable for output
-                return std::make_tuple(std::move(output_buf).to_immutable(), ts, std::move(meta));
-            });
-
-            {
-                auto lock = std::scoped_lock{m_mtx};
-                m_futures.push_back(std::move(fut));
-            }
-            m_cv.notify_one();
-        }
-    });
-    pthread_setname_np(m_input_thread.native_handle(), std::format("{}-in", id()).c_str());
-    composite::component::start();
-}
-
-template <typename T>
-auto fft<T>::stop() -> void {
-    m_input_thread.request_stop();
-    m_cv.notify_all();
-    composite::component::stop();
-}
-
-template <typename T>
-auto fft<T>::process() -> composite::retval {
-    using enum composite::retval;
-    using namespace std::chrono_literals;
-
-    auto lock = std::unique_lock{m_mtx};
-    m_cv.wait_for(lock, 1s, [this]{ return !m_futures.empty(); });
-    if (m_futures.empty()) {
-        return NORMAL;
-    }
-    auto fut = std::move(m_futures.front());
-    m_futures.pop_front();
-    lock.unlock();
-
-    auto [data, ts, meta] = fut.get();
-    if (meta.has_value()) {
-        logger()->trace("received metadata:\n{}", meta->to_string());
-        meta->annotations["fft_size"] = std::to_string(m_fft_size);
-        meta->annotations["fft_window"] = m_window_type;
-        logger()->trace("sending updated metadata:\n{}", meta->to_string());
-        m_out_port.send_metadata(meta.value());
+        std::copy(in.begin(), in.end(), working_buf.begin());
     }
 
-    m_out_port.send_data(std::move(data), ts);
-    return NORMAL;
+    // Out-of-place FFT: working -> output, with optional fftshift.
+    auto output_buf = composite::make_aligned_buffer<T>(ALIGNMENT, in.size());
+    fft_plan->execute(working_buf.data(), output_buf.data());
+    if (cfg->shift) {
+        std::rotate(output_buf.begin(), output_buf.begin() + (output_buf.size() / 2), output_buf.end());
+    }
+    return std::move(output_buf).to_immutable();
 }
 
 // Fused copy + window: scalar fallback
@@ -256,13 +241,13 @@ auto fft<T>::copy_and_window(
     }
 }
 
-extern "C" {
-    auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
-        if (type == "cf32") {
-            return std::make_shared<fft<std::complex<float>>>(id);
-        } else if (type == "cf64") {
-            return std::make_shared<fft<std::complex<double>>>(id);
-        }
-        throw std::runtime_error(std::format("unknown type '{}' for fft component", type));
+COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
+                                 -> std::shared_ptr<composite::component> {
+    const auto type = args.type();
+    if (type == "cf32") {
+        return std::make_shared<fft<std::complex<float>>>(id);
+    } else if (type == "cf64") {
+        return std::make_shared<fft<std::complex<double>>>(id);
     }
-}
+    throw std::runtime_error(std::format("unknown type '{}' for fft component", type));
+})

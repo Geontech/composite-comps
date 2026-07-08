@@ -65,7 +65,7 @@ This ensures the filter reaches 98% of its steady-state value after `num_average
         {
             "name": "exp_smooth",
             "id": "smoother_f32",
-            "create_arg": "f32",
+            "args": { "type": "f32" },
             "properties": {
                 "num_averages": 50
             }
@@ -76,12 +76,15 @@ This ensures the filter reaches 98% of its steady-state value after `num_average
 
 ## Factory Types
 
-The component supports two data types via the factory `create()` function:
+The component is templated on its sample type, selected at construction via the `"type"` field of
+the config's `"args"` object:
 
 - `"f32"`: Single-precision floating-point (`float`)
 - `"f64"`: Double-precision floating-point (`double`)
 
-> Specify the type when configuring the component via `"create_arg"`: The framework calls `create("f32")` or `create("f64")`.
+The factory is registered with `COMPOSITE_REGISTER_COMPONENT`; the loader calls the uniform
+`create(id, args)` ABI and the factory dispatches on `args.type()`. The legacy scalar form
+`"create_arg": "f32"` is still accepted (mapped to `{"type": "f32"}`).
 
 
 ## Performance Characteristics

@@ -22,7 +22,10 @@ project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
 include(GNUInstallDirs)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-enable_testing()
+# include(CTest) defines the BUILD_TESTING option (default ON) AND calls enable_testing(), so the
+# component test dirs guarded by if(BUILD_TESTING) build by default. Plain enable_testing() left
+# BUILD_TESTING undefined, so `ctest` found no tests unless -DBUILD_TESTING=ON was passed.
+include(CTest)
 
 # Use FetchContent for dependencies
 include(FetchContent)
@@ -30,7 +33,5 @@ include(FetchContent)
 include(cmake/composite.cmake)
 # vrtgen dependency
 include(cmake/vrtgen.cmake)
-# spdlog dependency
-include(cmake/spdlog.cmake)
 
 add_subdirectory(src)

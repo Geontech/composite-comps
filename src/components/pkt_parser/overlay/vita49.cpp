@@ -20,55 +20,83 @@
 #include "vita49.hpp"
 
 #include <bit>
+#include <cstring>
 #include <immintrin.h>
+#include <stdexcept>
 
 namespace overlay {
+
+namespace {
+// The packet bytes are UNTRUSTED (raw UDP). Every read is bounds-checked: a
+// field that would extend past the datagram throws std::out_of_range, which the
+// pkt_parser component catches and turns into a counted drop (instead of an OOB
+// read / crash). require_bytes guards a fixed-size unpack at an offset; read_be
+// also fixes the prior strict-aliasing/misaligned-load UB by using memcpy.
+auto require_bytes(std::span<const uint8_t> d, std::size_t off, std::size_t n) -> void {
+    if (n > d.size() || off > d.size() - n) {
+        throw std::out_of_range("vita49: field read past end of packet");
+    }
+}
+template <typename U>
+auto read_be(std::span<const uint8_t> d, std::size_t off) -> U {
+    require_bytes(d, off, sizeof(U));
+    U v{};
+    std::memcpy(&v, d.data() + off, sizeof(U));
+    return std::byteswap(v);
+}
+} // namespace
 
 v49::v49(std::span<const uint8_t> data) : m_data(data) {
     auto curr_idx = std::size_t{};
 
     // Parse VITA49 header (assumes big-endian packet)
-    auto v49_header_pos = curr_idx;
+    require_bytes(m_data, curr_idx, m_header.size());
     m_header.unpack_from(m_data.data() + curr_idx);
     curr_idx += m_header.size();
 
     // Check for stream id
     if (m_header.packet_type() != vrtgen::packing::PacketType::SIGNAL_DATA) {
-        auto stream_id = *reinterpret_cast<const uint32_t*>(m_data.data() + curr_idx);
-        m_stream_id = std::byteswap(stream_id);
-        curr_idx += sizeof(stream_id);
+        m_stream_id = read_be<uint32_t>(m_data, curr_idx);
+        curr_idx += sizeof(uint32_t);
     }
     // Check for class id
     if (m_header.class_id_enable()) {
         m_class_id = vrtgen::packing::ClassIdentifier{};
+        require_bytes(m_data, curr_idx, m_class_id->size());
         m_class_id->unpack_from(m_data.data() + curr_idx);
         curr_idx += m_class_id->size();
     }
 
     // Check and get integer timestamp
     if (m_header.tsi() != vrtgen::packing::TSI::NONE) {
-        auto ts = *reinterpret_cast<const uint32_t*>(m_data.data() + curr_idx);
-        m_int_ts = std::byteswap(ts);
-        curr_idx += sizeof(ts);
+        m_int_ts = read_be<uint32_t>(m_data, curr_idx);
+        curr_idx += sizeof(uint32_t);
     }
 
     // Check and get fractional timestamp
     if (m_header.tsf() != vrtgen::packing::TSF::NONE) {
-        auto ts = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
-        m_frac_ts = std::byteswap(ts);
-        curr_idx += sizeof(ts);
+        m_frac_ts = read_be<uint64_t>(m_data, curr_idx);
+        curr_idx += sizeof(uint64_t);
     }
     if (is_data()) {
-        m_positions["payload"] = curr_idx;
-        auto data_header = vrtgen::packing::DataHeader{};
-        data_header.unpack_from(m_data.data() + v49_header_pos);
-        if (data_header.trailer_included()) {
-            m_trailer = vrtgen::packing::Trailer{};
-            auto pos = (m_header.packet_size() - 1) * sizeof(uint32_t)/*word size*/;
-            m_trailer->unpack_from(m_data.data() + pos);
+        m_payload_pos = curr_idx;
+        m_has_payload = true;
+        // m_header is a DataHeader already decoded from the one header word above, so the
+        // trailer-included bit is available directly — no second unpack of the same bytes.
+        if (m_header.trailer_included()) {
+            // packet_size() is an untrusted uint16_t word count; packet_size()==0
+            // would underflow (0-1)*4 to a wild offset. Compute in size_t and
+            // bounds-check the trailer before unpacking.
+            if (m_header.packet_size() != 0) {
+                m_trailer = vrtgen::packing::Trailer{};
+                auto pos = static_cast<std::size_t>(m_header.packet_size() - 1) * sizeof(uint32_t)/*word size*/;
+                require_bytes(m_data, pos, m_trailer->size());
+                m_trailer->unpack_from(m_data.data() + pos);
+            }
         }
     } else if (is_context()) {
         m_cif0 = vrtgen::packing::CIF0{};
+        require_bytes(m_data, curr_idx, m_cif0->size());
         m_cif0->unpack_from(m_data.data() + curr_idx);
         curr_idx += m_cif0->size();
 
@@ -77,18 +105,16 @@ v49::v49(std::span<const uint8_t> data) : m_data(data) {
         }
 
         if (m_cif0->bandwidth()) {
-            auto bw = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
-            m_bandwidth = vrtgen::fixed::to_fp<44,20>(std::byteswap(bw));
-            curr_idx += sizeof(bw);
+            m_bandwidth = vrtgen::fixed::to_fp<44,20>(read_be<uint64_t>(m_data, curr_idx));
+            curr_idx += sizeof(uint64_t);
         }
         if (m_cif0->if_ref_frequency()) {
             curr_idx += sizeof(uint64_t); // advance past
         }
 
         if (m_cif0->rf_ref_frequency()) {
-            auto freq = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
-            m_rf_frequency = vrtgen::fixed::to_fp<44,20>(std::byteswap(freq));
-            curr_idx += sizeof(freq);
+            m_rf_frequency = vrtgen::fixed::to_fp<44,20>(read_be<uint64_t>(m_data, curr_idx));
+            curr_idx += sizeof(uint64_t);
         }
 
         if (m_cif0->rf_ref_frequency_offset()) {
@@ -108,9 +134,8 @@ v49::v49(std::span<const uint8_t> data) : m_data(data) {
         }
 
         if (m_cif0->sample_rate()) {
-            auto sr = *reinterpret_cast<const uint64_t*>(m_data.data() + curr_idx);
-            m_sample_rate = vrtgen::fixed::to_fp<44,20>(std::byteswap(sr));
-            curr_idx += sizeof(sr);
+            m_sample_rate = vrtgen::fixed::to_fp<44,20>(read_be<uint64_t>(m_data, curr_idx));
+            curr_idx += sizeof(uint64_t);
         }
         if (m_cif0->timestamp_adjustment()) {
             curr_idx += sizeof(uint32_t); // advance past
@@ -130,6 +155,7 @@ v49::v49(std::span<const uint8_t> data) : m_data(data) {
 
         if (m_cif0->signal_data_format()) {
             m_signal_data_format = vrtgen::packing::PayloadFormat{};
+            require_bytes(m_data, curr_idx, m_signal_data_format->size());
             m_signal_data_format->unpack_from(m_data.data() + curr_idx);
             curr_idx += m_signal_data_format->size();
         }
@@ -174,31 +200,42 @@ auto v49::fractional_timestamp() const -> std::optional<uint64_t> {
 
 template<typename T>
 auto v49::payload() -> std::span<const T> {
-    if (!m_positions.contains("payload")) {
+    if (!m_has_payload) {
         return {};
     }
-    auto pos = m_positions.at("payload");
+    auto pos = m_payload_pos;
     auto data = reinterpret_cast<const T*>(m_data.data() + pos);
     return std::span<const T>(data, payload_size() / sizeof(T));
 }
 
 auto v49::payload_size() const -> size_t {
-    if (!m_positions.contains("payload")) {
+    if (!m_has_payload) {
         return {};
     }
-    auto pos = m_positions.at("payload");
-    auto size = (m_header.packet_size() * sizeof(uint32_t)/*word size*/) - pos;
+    auto pos = m_payload_pos;
+    // packet_size() is an untrusted uint16_t word count. Compute the total claimed
+    // byte length in size_t and validate it against pos AND the actual datagram
+    // before subtracting — otherwise total < pos underflows to ~SIZE_MAX, which the
+    // caller would feed to slice() as a giant out-of-bounds count.
+    auto total = static_cast<std::size_t>(m_header.packet_size()) * sizeof(uint32_t)/*word size*/;
+    if (total <= pos || total > m_data.size()) {
+        return 0;
+    }
+    auto size = total - pos;
     if (m_trailer.has_value()) {
+        if (size < sizeof(uint32_t)) {
+            return 0;
+        }
         size -= sizeof(uint32_t);
     }
     return size;
 }
 
 auto v49::payload_start() const -> size_t {
-    if (!m_positions.contains("payload")) {
+    if (!m_has_payload) {
         return {};
     }
-    return m_positions.at("payload");
+    return m_payload_pos;
 }
 
 auto v49::endianness() const -> std::endian {

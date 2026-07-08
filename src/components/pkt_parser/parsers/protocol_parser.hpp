@@ -42,13 +42,23 @@ public:
      */
     struct parse_result {
         composite::immutable_buffer<uint8_t> payload;  ///< Header-stripped data (zero-copy slice)
-        composite::metadata metadata;                   ///< Extracted/updated metadata
+        composite::metadata metadata;                   ///< New metadata; only valid when metadata_changed
         composite::timestamp timestamp;                 ///< Packet timestamp
         bool should_send{true};                         ///< false for context-only packets
+        bool metadata_changed{false};                   ///< true only when this packet's metadata differs
+                                                        ///< from the previous; the component rebuilds the
+                                                        ///< shared instance (and `metadata` is populated)
+                                                        ///< ONLY then — steady state leaves it untouched
         std::optional<std::string> warning;             ///< Warnings (dropped packets, etc)
     };
 
     virtual ~protocol_parser() = default;
+
+    /// Called by the component when this parser becomes the active one (initial detection or
+    /// re-detection after a framing change). Clears the "already published metadata" latch so
+    /// the next parsed packet republishes its metadata even if its scalar fields happen to
+    /// coincide with the previously-active parser's (e.g. an A->B->A protocol ping-pong).
+    virtual auto on_activated() -> void {}
 
     /**
      * @brief Attempt to detect if this protocol matches the data

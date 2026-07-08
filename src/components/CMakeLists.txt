@@ -18,13 +18,11 @@
 #
 
 # add_subdirectory(aligned_mem_writer)
-# add_subdirectory(exp_smooth)
+add_subdirectory(exp_smooth)
 add_subdirectory(fft)
-# add_subdirectory(file_writer)
+add_subdirectory(file_writer)
 add_subdirectory(framer)
-add_subdirectory(halfrate)
-# add_subdirectory(histogram)
-add_subdirectory(pfbc)
+add_subdirectory(histogram)
 add_subdirectory(pkt_parser)
 add_subdirectory(psd)
 add_subdirectory(udp_source)

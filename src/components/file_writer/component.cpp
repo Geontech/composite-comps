@@ -18,61 +18,53 @@
  */
 
 #include "component.hpp"
-#include "overlay.hpp"
+
+#include <composite/core/register.hpp>
 
 #include <fcntl.h>
-#include <fstream>
-#include <sys/uio.h>
+#include <unistd.h>
 
-file_writer::file_writer() : composite::component("file_writer") {
-    add_port(m_in_port.get());
-    add_property("filename", &m_filename);
-    add_property("num_bytes", &m_num_bytes);
+file_writer::file_writer(std::string_view id) : composite::component(id) {
+    add_port(&m_in_port);
+    add_property("filename", m_filename);
+    add_property("num_bytes", m_num_bytes).units("bytes");
 }
 
 file_writer::~file_writer() {
-    close(m_file);
+    if (m_file != -1) {
+        ::close(m_file);
+    }
 }
 
 auto file_writer::initialize() -> void {
-    m_file = open(m_filename.c_str(), O_CREAT|O_TRUNC|O_WRONLY, 0644);
+    m_file = ::open(m_filename.c_str(), O_CREAT|O_TRUNC|O_WRONLY, 0644);
 }
 
 auto file_writer::process() -> composite::retval {
-    auto [data, ts] = m_in_port->get_data();
-    if (data == nullptr) {
-        return composite::retval::NOOP;
+    using enum composite::retval;
+    auto pkt = m_in_port.try_get();
+    if (!pkt) {
+        return NOOP;  // base promotes NOOP-at-end-of-stream to FINISH; nothing buffered to flush
     }
-    auto curr_total = m_total_bytes;
-    using iovec_t = struct iovec;
-    auto iovecs = std::vector<iovec_t>{};
-    for (auto& v : *data) {
-        auto packet = overlay::v49::overlay(v);
-        auto& header = packet.header();
-        if (!overlay::v49::is_data(header)) {
-            continue;
-        }
-        auto payload = packet.payload<uint8_t>();
-        iovecs.emplace_back(const_cast<uint8_t*>(payload.data()), payload.size_bytes());
-        curr_total += payload.size_bytes();
-        if (curr_total >= m_num_bytes) {
-            iovecs.back().iov_len -= (curr_total - m_num_bytes);
-            break;
+    auto& [data, ts, meta] = *pkt;
+    (void)ts;
+    (void)meta;
+    // Append the incoming byte stream, honoring the optional num_bytes cap. The cap can land
+    // mid-buffer, so clamp the write to the remaining budget before issuing it.
+    std::size_t to_write = data.size();  // immutable_buffer<uint8_t>: 1 byte per element
+    if (m_num_bytes > 0) {
+        const uint64_t remaining = m_num_bytes - m_total_bytes;
+        if (to_write > remaining) {
+            to_write = static_cast<std::size_t>(remaining);
         }
     }
-    if (auto num_written = writev(m_file, iovecs.data(), iovecs.size()); num_written != -1) {
-        m_total_bytes += num_written;
-        if (m_total_bytes >= m_num_bytes) {
-            m_in_port->clear();
-            m_in_port.reset();
-            return composite::retval::FINISH;
-        }
+    if (auto num_written = ::write(m_file, data.data(), to_write); num_written != -1) {
+        m_total_bytes += static_cast<uint64_t>(num_written);
     }
-    return composite::retval::NORMAL;
+    if (m_num_bytes > 0 && m_total_bytes >= m_num_bytes) {
+        return FINISH;
+    }
+    return NORMAL;
 }
 
-extern "C" {
-    auto create() -> std::shared_ptr<composite::component> {
-        return std::make_shared<file_writer>();
-    }
-}
+COMPOSITE_REGISTER_SIMPLE(file_writer)

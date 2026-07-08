@@ -47,7 +47,6 @@ target_include_directories(psd
 target_link_libraries(psd
     PRIVATE
     composite::composite
-    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS psd

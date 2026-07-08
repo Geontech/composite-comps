@@ -47,7 +47,6 @@ target_include_directories(framer
 target_link_libraries(framer
     PRIVATE
     composite::composite
-    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS framer

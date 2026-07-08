@@ -19,38 +19,56 @@
 
 #include "component.hpp"
 
+#include <composite/core/register.hpp>
+
+#include <algorithm>
 #include <complex>
-#include <cstring>
 #include <format>
+#include <string>
 #include <string_view>
+#include <thread>
 
 template <typename T>
 framer<T>::framer(std::string_view id) : composite::component(id) {
     add_port(&m_in_port);
     add_port(&m_out_port);
 
-    add_property("frame_size", m_frame_size)
-        .units("samples")
-        .change_listener([this]() {
-            return m_frame_size > 0;
-        });
+    // Cross-field invariants run on the proposed whole-struct candidate (so a single-field
+    // PATCH that would make overlap >= frame_size is rejected against the combined state, not
+    // a stale sibling). Set validators + reaction BEFORE add_config — the binding snapshots
+    // the validators at registration.
+    m_cfg.validate([](const framer_detail::framer_config& c) { return c.frame_size > 0; },
+                   "frame_size must be > 0")
+         .validate([](const framer_detail::framer_config& c) { return c.overlap < c.frame_size; },
+                   "overlap must be < frame_size")
+         .validate([](const framer_detail::framer_config& c) { return c.frame_count >= 2; },
+                   "frame_count must be >= 2");
+    m_cfg.on_apply([this](const framer_detail::framer_config&,
+                          const composite::changes<framer_detail::framer_config>&) {
+        // Any field change rebuilds the pool (frame geometry is structural). Runs at the
+        // worker loop-top, or inline at INITIALIZE-time when there is no worker yet.
+        initialize_pool();
+    });
+    add_config(m_cfg);
 
-    add_property("overlap", m_overlap)
-        .units("samples")
-        .change_listener([this]() {
-            return m_overlap < m_frame_size;
-        });
-
-    add_property("frame_count", m_frame_count)
-        .change_listener([this]() {
-            return m_frame_count >= 2;
-        });
+    // Drop statistics live in the shared metrics registry so operators can see sample loss
+    // (gaps in downstream FFT/PSD integration) without scraping logs. The base helper
+    // labels each series with this component's id and ~component removes them by label.
+    m_samples_dropped = &create_counter(
+        "framer.samples_dropped", "Input samples dropped instead of framed");
+    m_drops_batch_too_large = &create_counter(
+        "framer.drops_batch_too_large", "Write batches dropped because they exceed the ring size");
+    m_drops_backpressure = &create_counter(
+        "framer.drops_backpressure",
+        "Write batches dropped because downstream held frames past the backpressure timeout");
 }
 
 template <typename T>
 auto framer<T>::reset_state() -> void {
     m_in_port.clear();
     m_metadata_ready = false;
+    m_last_input_meta = nullptr;  // force full metadata handling on the next packet
+    m_out_metadata = nullptr;
     m_input_format = {};  // Reset to default
     m_input_stride = 0;
     m_next_frame_start = 0;
@@ -59,23 +77,26 @@ auto framer<T>::reset_state() -> void {
 
 template <typename T>
 auto framer<T>::initialize_pool() -> void {
-    if (m_frame_size == 0) {
+    const auto frame_size = m_cfg->frame_size;
+    const auto overlap = m_cfg->overlap;
+
+    if (frame_size == 0) {
         logger()->error("framer: frame_size must be > 0");
         return;
     }
 
-    if (m_overlap >= m_frame_size) {
-        logger()->error("framer: overlap ({}) must be < frame_size ({})", m_overlap, m_frame_size);
+    if (overlap >= frame_size) {
+        logger()->error("framer: overlap ({}) must be < frame_size ({})", overlap, frame_size);
         return;
     }
 
     try {
-        auto frames = std::max<uint32_t>(m_frame_count, 2);
-        m_pool = std::make_shared<framer_pool<T>>(m_frame_size, m_overlap, frames);
+        auto frames = std::max<uint32_t>(m_cfg->frame_count, 2);
+        m_pool = std::make_shared<composite::overlap_ring<T>>(frame_size, overlap, frames);
         logger()->debug("framer: initialized pool with frame_size={}, overlap={}, frame_count={}, "
                        "hop_size={}, ring_size={}",
-                       m_frame_size, m_overlap, frames,
-                       m_frame_size - m_overlap, frames * (m_frame_size - m_overlap) + m_overlap);
+                       frame_size, overlap, frames,
+                       frame_size - overlap, frames * (frame_size - overlap) + overlap);
     } catch (const std::exception& e) {
         logger()->error("framer: failed to initialize pool: {}", e.what());
         m_pool.reset();
@@ -83,68 +104,6 @@ auto framer<T>::initialize_pool() -> void {
     }
 
     reset_state();
-}
-
-template <typename T>
-auto framer<T>::property_change_handler() -> void {
-    initialize_pool();
-}
-
-template <typename T>
-auto framer<T>::is_supported_input_format(const composite::data_format& fmt) const -> bool {
-    const auto bit_width = fmt.bit_width;
-    const auto type = fmt.type;
-    const auto is_complex = fmt.is_complex;
-
-    // Real i8
-    if (!is_complex && bit_width == 8 && type == composite::data_type::signed_integer) {
-        return true;
-    }
-
-    // Complex i8
-    if (is_complex && bit_width == 8 && type == composite::data_type::signed_integer) {
-        return true;
-    }
-
-    // Complex i16
-    if (is_complex && bit_width == 16 && type == composite::data_type::signed_integer) {
-        return true;
-    }
-
-    // Complex cf32
-    if (is_complex && bit_width == 32 && type == composite::data_type::floating_point) {
-        return true;
-    }
-
-    return false;
-}
-
-template <typename T>
-auto framer<T>::bytes_per_input_sample() const -> std::size_t {
-    const auto bit_width = m_input_format.bit_width;
-    const auto is_complex = m_input_format.is_complex;
-
-    // Real i8: 1 byte
-    if (!is_complex && bit_width == 8) {
-        return 1;
-    }
-
-    // Complex i8: 2 bytes (I + Q)
-    if (is_complex && bit_width == 8) {
-        return 2;
-    }
-
-    // Complex i16: 4 bytes (I + Q)
-    if (is_complex && bit_width == 16) {
-        return 4;
-    }
-
-    // Complex cf32: 8 bytes (I + Q as floats)
-    if (is_complex && bit_width == 32) {
-        return 8;
-    }
-
-    return 0;
 }
 
 template <typename T>
@@ -161,75 +120,60 @@ auto framer<T>::configure_output_metadata() -> void {
 }
 
 template <typename T>
-auto framer<T>::create_converter() -> void {
-    using scalar_t = typename T::value_type;  // float or int16_t from complex<T>
-
-    // Automatically determine if byte swapping is needed based on INPUT endianness
-    bool needs_swap = (m_input_format.endianness != std::endian::native);
-
-    const auto bit_width = m_input_format.bit_width;
-    const auto type = m_input_format.type;
-    const auto is_complex = m_input_format.is_complex;
-
-    // Create appropriate converter based on input format and output type
-    if constexpr (std::is_same_v<scalar_t, float>) {
-        // Output type is float
-        if (bit_width == 8 && type == composite::data_type::signed_integer) {
-            // i8 -> float (handles both real and complex)
-            m_converter = converter<int8_t, float>(needs_swap);
-        } else if (is_complex && bit_width == 16 && type == composite::data_type::signed_integer) {
-            // complex i16 -> float
-            m_converter = converter<int16_t, float>(needs_swap);
-        } else if (is_complex && bit_width == 32 && type == composite::data_type::floating_point) {
-            // complex cf32 -> float (passthrough)
-            m_converter = converter<uint32_t, float>(needs_swap);
-        } else {
-            m_converter = std::nullopt;
-        }
-    } else if constexpr (std::is_same_v<scalar_t, int16_t>) {
-        // Output type is int16_t
-        if (bit_width == 8 && type == composite::data_type::signed_integer) {
-            // i8 -> int16_t (handles both real and complex)
-            m_converter = converter<int8_t, int16_t>(needs_swap);
-        } else if (is_complex && bit_width == 16 && type == composite::data_type::signed_integer) {
-            // complex i16 -> int16_t (passthrough)
-            m_converter = converter<int16_t, int16_t>(needs_swap);
-        } else {
-            m_converter = std::nullopt;
-        }
+auto framer<T>::handle_metadata(const composite::metadata_ptr& meta) -> void {
+    // Metadata rides on every packet as a shared instance the producer latches: the steady
+    // state is the SAME pointer, so this early-out is one pointer compare — no copy, no
+    // deep compare, no converter rebuild on the hot path.
+    if (meta == m_last_input_meta) {
+        return;
     }
-}
+    // Different instance but equal value (a producer that doesn't latch): adopt the new
+    // instance so subsequent packets hit the pointer fast path, but re-process nothing.
+    if (m_last_input_meta != nullptr && *meta == *m_last_input_meta) {
+        m_last_input_meta = meta;
+        return;
+    }
+    const bool rate_changed =
+        m_last_input_meta == nullptr || meta->sample_rate != m_last_input_meta->sample_rate;
+    m_last_input_meta = meta;
 
-template <typename T>
-auto framer<T>::handle_metadata(const composite::metadata& meta) -> void {
-    if (!is_supported_input_format(meta.format)) {
-        logger()->warn("framer: unsupported input format (bit_width={}, type={}, complex={})",
-                       meta.format.bit_width, static_cast<int>(meta.format.type), meta.format.is_complex);
+    using scalar_t = typename T::value_type;
+    const auto* support = find_input_format<scalar_t>(meta->format);
+    if (support == nullptr) {
+        // One warn per metadata change (the early-out above swallows repeats), so a
+        // misconfigured flow is visible without flooding the log at packet rate.
+        logger()->warn("framer: unsupported input format for {} output "
+                       "(bit_width={}, type={}, complex={}); dropping data until a supported "
+                       "format arrives",
+                       std::is_same_v<scalar_t, float> ? "complex<float>" : "complex<int16_t>",
+                       meta->format.bit_width, static_cast<int>(meta->format.type),
+                       meta->format.is_complex);
         m_metadata_ready = false;
         return;
     }
-
-    auto changed = (!m_metadata_ready) || (meta.format != m_input_format) || (meta != m_metadata);
 
     // Save input format before overwriting metadata
-    m_input_format = meta.format;
-    m_metadata = meta;
+    m_input_format = meta->format;
+    m_metadata = *meta;
     m_metadata_ready = true;
-
-    m_input_stride = bytes_per_input_sample();
-    if (m_input_stride == 0) {
-        logger()->error("framer: computed input stride is zero");
-        m_metadata_ready = false;
-        return;
-    }
+    m_input_stride = support->bytes_per_sample;
 
     configure_output_metadata();
-    create_converter();
+    // Publish the output metadata as one shared instance; every emitted frame attaches it
+    // with a refcount bump until the next input-metadata change.
+    m_out_metadata = composite::make_metadata(m_metadata);
 
-    if (changed) {
-        logger()->trace("framer: updated metadata:\n{}", m_metadata.to_string());
-        m_out_port.send_metadata(m_metadata);
+    // Byte swapping is determined by INPUT endianness vs native.
+    const bool needs_swap = (m_input_format.endianness != std::endian::native);
+    m_converter = support->make(needs_swap);
+
+    if (rate_changed) {
+        // The sample-index -> wall-time mapping changed; re-anchor from the next buffer's
+        // timestamp instead of extrapolating the new rate across the old origin.
+        m_timestamp_initialized = false;
     }
+
+    logger()->trace("framer: updated metadata:\n{}", m_metadata.to_string());
 }
 
 template <typename T>
@@ -253,20 +197,47 @@ auto framer<T>::process_buffer(const composite::immutable_buffer<uint8_t>& buffe
     std::size_t complete_samples = byte_count / m_input_stride;
 
     if (complete_samples > 0) {
-        if (!m_pool->write_samples(bytes, complete_samples, &m_converter.value(), m_input_stride, is_complex)) {
+        using scalar_t = typename T::value_type;
+        // Produce/convert samples directly into the ring's destination (zero-copy). The overlap_ring
+        // hands us the contiguous destination and the source-sample offset of each (wrap-split)
+        // chunk; we convert the raw input bytes into complex T in place.
+        auto produce = [&](T* dst, std::size_t src_sample_index, std::size_t count) {
+            const uint8_t* src = bytes + src_sample_index * m_input_stride;
+            if (is_complex) {
+                convert(m_converter.value(), src, reinterpret_cast<scalar_t*>(dst), count * 2);
+            } else {
+                // Real input: convert into the back half of the destination, then expand
+                // forward in place to complex (imag = 0). Iteration i writes scalar slots
+                // 2i and 2i+1 and reads slot count+i, which it has not yet overwritten
+                // (2i+1 < count+i+1 for all i < count), so no scratch buffer is needed.
+                auto* dst_scalars = reinterpret_cast<scalar_t*>(dst);
+                convert(m_converter.value(), src, dst_scalars + count, count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    const auto value = dst_scalars[count + i];
+                    dst[i] = T{value, scalar_t{0}};
+                }
+            }
+        };
+
+        if (!m_pool->write(complete_samples, produce)) {
             auto diag = m_pool->get_diagnostics();
 
-            m_samples_dropped += complete_samples;
+            m_samples_dropped->add(complete_samples);
+
+            // Dropped samples break the sample-index -> wall-time mapping (the ring head did
+            // not advance but real time did); re-anchor from the next buffer's timestamp so
+            // subsequent frame timestamps stay correct.
+            m_timestamp_initialized = false;
 
             switch (diag.last_drop_reason) {
-                case decltype(m_pool)::element_type::drop_reason::BATCH_TOO_LARGE:
-                    ++m_drops_batch_too_large;
+                case composite::overlap_ring<T>::drop_reason::BATCH_TOO_LARGE:
+                    m_drops_batch_too_large->inc();
                     logger()->error("framer: failed to write {} samples (BATCH TOO LARGE) - "
                                    "batch size exceeds ring_size ({}). Dropping samples.",
                                    complete_samples, diag.ring_size);
                     break;
-                case decltype(m_pool)::element_type::drop_reason::BACKPRESSURE_TIMEOUT:
-                    ++m_drops_backpressure;
+                case composite::overlap_ring<T>::drop_reason::BACKPRESSURE_TIMEOUT:
+                    m_drops_backpressure->inc();
                     logger()->warn("framer: failed to write {} samples (BACKPRESSURE TIMEOUT) - "
                                   "downstream holding frames. Dropping samples. "
                                   "Slots in use: {}/{}, available space: {} samples, write_head: {}, "
@@ -295,19 +266,58 @@ auto framer<T>::try_emit_frames() -> void {
         return;
     }
 
-    std::size_t head = m_pool->head();
-    std::size_t hop = m_pool->hop_size();
+    const std::size_t head = m_pool->head();
+    const std::size_t hop = m_pool->hop_size();
+    const std::size_t frame_size = m_pool->frame_size();
 
-    while (head >= m_next_frame_start + m_frame_size) {
+    while (head >= m_next_frame_start + frame_size) {
         auto buffer_opt = m_pool->try_emit_frame(m_next_frame_start);
         if (!buffer_opt.has_value()) {
             break;  // Slot busy, stop emitting
         }
 
         auto ts = compute_frame_timestamp(m_next_frame_start);
-        m_out_port.send_data(std::move(buffer_opt.value()), ts);
+        m_out_port.send_data(std::move(buffer_opt.value()), ts, m_out_metadata);
 
         m_next_frame_start += hop;
+    }
+}
+
+template <typename T>
+auto framer<T>::on_end_of_stream() -> void {
+    // Flush the residue: a tail of fewer than frame_size samples past m_next_frame_start stays
+    // buffered in the ring and would otherwise be dropped at end-of-stream. Zero-pad the ring up to
+    // exactly one full frame, then emit it via the normal path. Nothing to do if no metadata was
+    // ever seen (no ring / nothing buffered) or if the ring sits on a frame boundary (no residue).
+    if (!m_pool || !m_metadata_ready) { return; }
+    const std::size_t head = m_pool->head();
+    if (head <= m_next_frame_start) { return; }              // no partial residue buffered
+    const std::size_t frame_size = m_pool->frame_size();
+    const std::size_t have = head - m_next_frame_start;      // samples in the final partial frame
+    if (have >= frame_size) { return; }                      // defensive: a full frame already emitted
+    const std::size_t pad = frame_size - have;
+    // Append `pad` zero samples so the residue completes exactly one frame, then emit it.
+    const bool ok = m_pool->write(pad, [](T* dst, std::size_t /*src_sample_index*/, std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) { dst[i] = T{}; }
+    });
+    if (!ok) {
+        logger()->warn("framer: could not zero-pad the final {}-sample partial frame at end-of-stream; "
+                       "residue dropped", have);
+        return;
+    }
+    try_emit_frames();  // emits the now-complete zero-padded final frame
+
+    // This flush is one-shot (the worker will not call process() again), so if the frame's
+    // slot is still held downstream, retry briefly rather than silently losing the final
+    // frame — and say so if it still cannot be emitted.
+    constexpr int MAX_EMIT_RETRIES = 100;
+    for (int i = 0; i < MAX_EMIT_RETRIES && m_pool->head() >= m_next_frame_start + frame_size; ++i) {
+        std::this_thread::yield();
+        try_emit_frames();
+    }
+    if (m_pool->head() >= m_next_frame_start + frame_size) {
+        logger()->warn("framer: final zero-padded frame could not be emitted at end-of-stream "
+                       "(downstream still holding its frame slot); residue dropped");
     }
 }
 
@@ -324,13 +334,20 @@ auto framer<T>::compute_frame_timestamp(std::size_t start_sample) const -> compo
         return m_timestamp_origin;
     }
 
-    auto delta_samples = static_cast<long double>(start_sample - m_timestamp_origin_sample);
-    auto ps_per_sample = static_cast<long double>(framer_detail::PS_PER_SEC) / m_metadata.sample_rate;
-    auto ps_total = static_cast<uint64_t>(delta_samples * ps_per_sample);
+    // Split the elapsed time into whole seconds plus a sub-second remainder BEFORE converting
+    // to picoseconds: a single delta_samples * ps_per_sample product overflows uint64 after
+    // ~213 days of continuous streaming, while the remainder term here stays under one second.
+    const auto rate = static_cast<long double>(m_metadata.sample_rate);
+    const auto delta_samples = static_cast<long double>(start_sample - m_timestamp_origin_sample);
+    const auto whole_seconds = static_cast<uint64_t>(delta_samples / rate);
+    const auto remainder_samples =
+        std::max(delta_samples - static_cast<long double>(whole_seconds) * rate, 0.0L);
+    const auto ps_per_sample = static_cast<long double>(framer_detail::PS_PER_SEC) / rate;
+    const auto ps_rem = static_cast<uint64_t>(remainder_samples * ps_per_sample);
 
     auto ts = m_timestamp_origin;
-    ts.seconds += ps_total / framer_detail::PS_PER_SEC;
-    auto picoseconds = ts.picoseconds + (ps_total % framer_detail::PS_PER_SEC);
+    ts.seconds += whole_seconds + ps_rem / framer_detail::PS_PER_SEC;
+    auto picoseconds = ts.picoseconds + (ps_rem % framer_detail::PS_PER_SEC);
     if (picoseconds >= framer_detail::PS_PER_SEC) {
         ts.seconds += 1;
         picoseconds -= framer_detail::PS_PER_SEC;
@@ -344,13 +361,17 @@ template <typename T>
 auto framer<T>::process() -> composite::retval {
     using enum composite::retval;
 
-    auto [buffer, ts, meta] = m_in_port.get_data();
-    if (!buffer) {
-        return NORMAL;
+    auto pkt = m_in_port.try_get();
+    if (!pkt) {
+        // No input: NOOP so the worker parks on the read-doorbell until upstream delivers,
+        // rather than busy-spinning process() while idle. At end-of-stream the base promotes this
+        // NOOP to FINISH (see on_end_of_stream() for the residue flush).
+        return NOOP;
     }
+    auto& [buffer, ts, meta] = *pkt;
 
-    if (meta.has_value()) {
-        handle_metadata(meta.value());
+    if (meta != nullptr) {
+        handle_metadata(meta);
     }
 
     if (!m_metadata_ready) {
@@ -363,13 +384,19 @@ auto framer<T>::process() -> composite::retval {
     return NORMAL;
 }
 
-extern "C" {
-    auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
-        if (type == "cf32") {
-            return std::make_shared<framer<std::complex<float>>>(id);
-        } else if (type == "ci16") {
-            return std::make_shared<framer<std::complex<int16_t>>>(id);
-        }
-        throw std::runtime_error(std::format("unknown type '{}' for framer component", type));
+// Explicit instantiations so the out-of-line member definitions (e.g. the
+// constructor) are emitted as linkable symbols for translation units that
+// construct framer<T> directly (such as the integration tests).
+template class framer<std::complex<float>>;
+template class framer<std::complex<int16_t>>;
+
+COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
+                                 -> std::shared_ptr<composite::component> {
+    const auto type = args.type();
+    if (type == "cf32") {
+        return std::make_shared<framer<std::complex<float>>>(id);
+    } else if (type == "ci16") {
+        return std::make_shared<framer<std::complex<int16_t>>>(id);
     }
-}
+    throw std::runtime_error(std::format("unknown type '{}' for framer component", type));
+})

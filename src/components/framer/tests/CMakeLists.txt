@@ -56,12 +56,8 @@ function(add_pool_test TEST_NAME SOURCE_FILE)
     endif()
 endfunction()
 
-# Pool test suite (comprehensive)
-add_pool_test(pool_basic_tests pool_basic_tests.cpp)
-add_pool_test(pool_multiframe_tests pool_multiframe_tests.cpp)
-add_pool_test(pool_wraparound_tests pool_wraparound_tests.cpp)
-add_pool_test(pool_conflict_tests pool_conflict_tests.cpp)
-add_pool_test(pool_edge_cases_tests pool_edge_cases_tests.cpp)
+# NOTE: the overlapped framing ring was lifted into the framework (composite::overlap_ring) in M6;
+# its unit tests now live there as test_overlap_ring. Only framer-specific tests remain here.
 
 # Converter tests (variant-based converters)
 add_pool_test(converter_tests converter_tests.cpp)
@@ -72,7 +68,6 @@ target_link_libraries(framer_integration_tests
     PRIVATE
         Catch2::Catch2WithMain
         composite::composite
-        spdlog::spdlog_header_only
         Threads::Threads
 )
 target_include_directories(framer_integration_tests
@@ -92,24 +87,11 @@ endif()
 include(CTest)
 include(Catch)
 
-# Pool test suite
-catch_discover_tests(pool_basic_tests)
-catch_discover_tests(pool_multiframe_tests)
-catch_discover_tests(pool_wraparound_tests)
-catch_discover_tests(pool_conflict_tests)
-catch_discover_tests(pool_edge_cases_tests)
-
-# Additional tests
 catch_discover_tests(converter_tests)
 catch_discover_tests(framer_integration_tests)
 
 # Install test executables (optional)
 install(TARGETS
-    pool_basic_tests
-    pool_multiframe_tests
-    pool_wraparound_tests
-    pool_conflict_tests
-    pool_edge_cases_tests
     converter_tests
     framer_integration_tests
     RUNTIME DESTINATION bin/tests

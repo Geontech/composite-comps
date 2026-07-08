@@ -22,7 +22,9 @@
 #include "vita49_parser.hpp"
 
 #include <bit>
+#include <cstring>
 #include <format>
+#include <stdexcept>
 
 namespace parsers {
 
@@ -33,7 +35,11 @@ constexpr std::size_t MIN_V491_PACKET_SIZE = 12; // VRL header + minimal V49 hea
 
 vita49dot1_parser::vita49dot1_parser(const struct_props::signal_overrides& overrides) :
   m_overrides(overrides),
-  m_vita49_parser(overrides) {}
+  // The inner parser stamps the transport annotation itself, so its metadata change
+  // detection compares like-for-like with what the component publishes. Rewriting the
+  // annotation here after the fact would make every context packet's candidate ("v49")
+  // differ from the published value ("v49.1") — a spurious republish per context packet.
+  m_vita49_parser(overrides, "v49.1") {}
 
 auto vita49dot1_parser::can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool {
     // Need at least VRL header + minimal V49 header
@@ -41,8 +47,10 @@ auto vita49dot1_parser::can_parse(const composite::immutable_buffer<uint8_t>& da
         return false;
     }
 
-    // Check for VRLP magic word (big or little endian)
-    auto first_word = *reinterpret_cast<const uint32_t*>(data.data());
+    // Check for VRLP magic word (big or little endian). memcpy avoids the
+    // misaligned-load / strict-aliasing UB of a reinterpret_cast.
+    uint32_t first_word{};
+    std::memcpy(&first_word, data.data(), sizeof(first_word));
     return (first_word == VRLP_MAGIC) || (first_word == std::byteswap(VRLP_MAGIC));
 }
 
@@ -50,11 +58,21 @@ auto vita49dot1_parser::parse(
     const composite::immutable_buffer<uint8_t>& data,
     const composite::metadata& current_metadata
 ) -> parse_result {
-    // Check for PLRV (little-endian, needs byteswap)
-    auto first_word = *reinterpret_cast<const uint32_t*>(data.data());
+    // Untrusted input: protocol lock-in does NOT trust later packets. Re-validate
+    // the minimum size before reading the VRL magic word and stripping the 8-byte
+    // VRL header — otherwise data.size() - VRL_HEADER_SIZE underflows to ~SIZE_MAX
+    // and is fed to slice() as a giant count. Caught by the component -> drop.
+    if (data.size() < MIN_V491_PACKET_SIZE) {
+        throw std::out_of_range("vita49dot1_parser: packet smaller than minimum V49.1 size");
+    }
+
+    // Check for PLRV (little-endian, needs byteswap). memcpy, not reinterpret_cast,
+    // to avoid a misaligned-load / strict-aliasing UB.
+    uint32_t first_word{};
+    std::memcpy(&first_word, data.data(), sizeof(first_word));
     bool is_little_endian = (first_word == VRLP_MAGIC);  // VRLP in memory = PLRV on wire
 
-    // Slice off VRL framing
+    // Slice off VRL framing (size >= MIN_V491_PACKET_SIZE guarantees no underflow)
     auto inner_v49_packet = data.slice(VRL_HEADER_SIZE, data.size() - VRL_HEADER_SIZE);
 
     // If PLRV (little-endian), byteswap entire inner packet to big-endian
@@ -70,23 +88,18 @@ auto vita49dot1_parser::parse(
             std::span{byteswapped_packet.data(), byteswapped_packet.size()}
         );
 
-        packet_to_parse = composite::immutable_buffer<uint8_t>(std::move(std::make_shared<std::vector<uint8_t>>(byteswapped_packet)));
+        // move (not copy) the byteswapped bytes into the shared buffer — the prior
+        // make_shared(byteswapped_packet) copied the whole vector per PLRV packet.
+        packet_to_parse = composite::immutable_buffer<uint8_t>(std::make_shared<std::vector<uint8_t>>(std::move(byteswapped_packet)));
     } else {
         packet_to_parse = inner_v49_packet;
     }
 
-    // Delegate to vita49_parser for parsing the inner V49 packet (now big-endian)
-    auto result = m_vita49_parser.parse(packet_to_parse, current_metadata);
-
-    // For PLRV packets, ensure metadata reflects the byteswap transformation
-    if (is_little_endian) {
-        result.metadata.format.endianness = std::endian::big;
-    }
-
-    // Update protocol annotation
-    result.metadata.annotations["protocol"] = "v49.1";
-
-    return result;
+    // Delegate to vita49_parser for parsing the inner V49 packet (now big-endian). No
+    // metadata fix-up is needed here: the inner parser stamps the "v49.1" transport
+    // annotation itself (constructor parameter), and it only ever sees big-endian bytes
+    // (PLRV packets were byteswapped above), so the endianness it extracts is already big.
+    return m_vita49_parser.parse(packet_to_parse, current_metadata);
 }
 
 } // namespace parsers

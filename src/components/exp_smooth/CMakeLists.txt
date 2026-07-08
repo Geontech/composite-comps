@@ -48,7 +48,6 @@ target_include_directories(exp_smooth
 target_link_libraries(exp_smooth
     PRIVATE
     composite::composite
-    spdlog::spdlog_header_only
 )
 # Install
 install(TARGETS exp_smooth

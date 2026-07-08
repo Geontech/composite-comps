@@ -20,25 +20,28 @@
 #pragma once
 
 #include "fft_plan.hpp"
-#include "task_queue.hpp"
 
-#include <composite/composite.hpp>
+#include <composite/core/pipeline_component.hpp>
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/aligned_mem.hpp>
-#include <complex>
-#include <deque>
-#include <future>
-#include <memory>
 
-// T is expected to be std::complex<float> or std::complex<double>
+#include <atomic>
+#include <complex>
+#include <memory>
+#include <string>
+
+// T is expected to be std::complex<float> or std::complex<double>.
+//
+// fft is a pipeline_component: the framework's single worker ingests in order and the bounded
+// slot ring re-serialises output to submission order, while the parallel FFT runs on a worker
+// pool (num_workers). This replaces the hand-rolled input-thread + task_queue + ordered-future
+// drain (and integrates with the park coordinator, so config writes / stop quiesce promptly).
 template <typename T>
-class fft : public composite::component {
+class fft : public composite::pipeline_component<composite::immutable_buffer<T>, composite::immutable_buffer<T>> {
+    using base = composite::pipeline_component<composite::immutable_buffer<T>, composite::immutable_buffer<T>>;
     using scalar_t = typename T::value_type;  // float or double
     using plan_t = fft_plan<T>;
     using window_t = composite::aligned_mem<scalar_t>;
-    using input_port_t = composite::input_port<composite::immutable_buffer<T>>;
-    using output_port_t = composite::output_port<composite::immutable_buffer<T>>;
-    using output_tuple_t = std::tuple<composite::immutable_buffer<T>, composite::timestamp, std::optional<composite::metadata>>;
 
     static constexpr std::size_t ALIGNMENT = 64;
 
@@ -46,51 +49,50 @@ public:
     explicit fft(std::string_view id);
     ~fft() override;
 
-    auto property_change_handler() -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
-    auto process() -> composite::retval override;
+    auto property_change_handler(const composite::properties::json& diff) -> void override;
+
+protected:
+    // ARRIVAL order, main thread: stamp the FFT params onto the metadata that travels with the
+    // packet (read from the published config snapshot, so it is consistent with work()).
+    auto prepare(composite::metadata& md) -> void override;
+
+    // The parallel stage (pool worker, concurrent across packets): window + FFT + optional shift.
+    auto work(composite::immutable_buffer<T> in, composite::timestamp ts,
+              const composite::metadata& md) -> composite::immutable_buffer<T> override;
 
 private:
-    // Fused copy + window with SIMD variants
+    // Fused copy + window with SIMD variants (use only their arguments — thread-safe in work()).
     [[gnu::target("default")]]
-    auto copy_and_window(
-      const composite::immutable_buffer<T>& input,
-      composite::mutable_buffer<T>& output,
-      const window_t* window
-    ) -> void;
-
+    auto copy_and_window(const composite::immutable_buffer<T>& input,
+                         composite::mutable_buffer<T>& output, const window_t* window) -> void;
     [[gnu::target("avx512f")]]
-    auto copy_and_window(
-      const composite::immutable_buffer<T>& input,
-      composite::mutable_buffer<T>& output,
-      const window_t* window
-    ) -> void;
-
+    auto copy_and_window(const composite::immutable_buffer<T>& input,
+                         composite::mutable_buffer<T>& output, const window_t* window) -> void;
     [[gnu::target("avx2")]]
-    auto copy_and_window(
-      const composite::immutable_buffer<T>& input,
-      composite::mutable_buffer<T>& output,
-      const window_t* window
-    ) -> void;
+    auto copy_and_window(const composite::immutable_buffer<T>& input,
+                         composite::mutable_buffer<T>& output, const window_t* window) -> void;
 
-    // Ports
-    input_port_t m_in_port{"data_in"};
-    output_port_t m_out_port{"data_out"};
+    // #39: immutable per-task config snapshot. property_change_handler runs under park (the main
+    // ingest/retire worker quiesced), but the POOL workers running work() do NOT park — so they
+    // must not read the live config members (m_window free-while-used is a UAF; the scalar reads
+    // are torn). PCH builds a fresh snapshot and publishes it atomically; work() loads it, getting
+    // a consistent {fft_size, window, shift} and a window buffer kept alive by the shared_ptr.
+    struct task_config {
+        std::size_t fft_size{1024};
+        bool shift{true};
+        uint32_t fftw_threads{1};
+        std::string window_type;                 // for the output metadata annotation
+        std::shared_ptr<const window_t> window;  // null => no windowing
+    };
+    auto make_task_config() const -> std::shared_ptr<const task_config>;
 
-    // Properties
+    // Properties (num_workers is owned by pipeline_component). Live config, written by the engine
+    // under park; read only by property_change_handler/make_task_config (park-synchronized).
     std::string m_window_type;
     uint32_t m_fft_size{1024};
     uint32_t m_fftw_threads{1};
-    uint32_t m_num_workers{1};
     bool m_shift{true};
 
-    // Members
-    std::unique_ptr<window_t> m_window{nullptr};
-    std::deque<std::future<output_tuple_t>> m_futures;
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::jthread m_input_thread;
-    task_queue m_task_queue;
+    std::atomic<std::shared_ptr<const task_config>> m_task_cfg{};
 
 }; // class fft

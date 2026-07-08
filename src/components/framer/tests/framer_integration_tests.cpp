@@ -8,6 +8,7 @@
 
 #include "component.hpp"
 #include <composite/composite.hpp>
+#include <composite/metrics/registry.hpp>
 #include <composite/ports/input_port.hpp>
 #include <composite/ports/output_port.hpp>
 
@@ -28,19 +29,37 @@ struct FramerTestFixture {
     std::shared_ptr<composite::output_port<composite::immutable_buffer<uint8_t>>> source_port;
     std::shared_ptr<composite::input_port<composite::immutable_buffer<std::complex<float>>>> sink_port;
 
-    FramerTestFixture() {
-        uut = std::make_shared<framer<std::complex<float>>>("test");
-        source_port = std::make_shared<composite::output_port<composite::immutable_buffer<uint8_t>>>("source");
-        sink_port = std::make_shared<composite::input_port<composite::immutable_buffer<std::complex<float>>>>("sink");
-
-        // Connect ports now that we have friend access
-        source_port->connect(&uut->m_in_port);
-        uut->m_out_port.connect(sink_port.get());
+    // Each framer instance gets a globally-unique component id. Component ids must
+    // be unique (the app registry enforces this); reusing one id across instances
+    // with overlapping lifetimes makes them share metric series by label, so
+    // destroying one frees the other's gauges (a real same-id reload-overlap UAF).
+    static auto next_id() -> std::string {
+        static std::atomic<int> n{0};
+        return "framer_test_" + std::to_string(n.fetch_add(1, std::memory_order_relaxed));
     }
 
-    void reset() {
-        // Create fresh component and reconnect ports
-        uut = std::make_shared<framer<std::complex<float>>>("test");
+    FramerTestFixture() { rebuild(); }
+
+    void reset() { rebuild(); }
+
+    // Configure the framer through the real property path: set_properties
+    // validates the whole struct and, with no running worker, drains the on_apply reaction
+    // inline — which rebuilds the pool. Replaces the old direct-member poke + manual
+    // property_change_handler() call.
+    void configure(uint32_t frame_size, uint32_t overlap, uint32_t frame_count) {
+        uut->set_properties(composite::properties::json{
+                                {"frame_size", frame_size},
+                                {"overlap", overlap},
+                                {"frame_count", frame_count},
+                            },
+                            composite::properties::config_type::INITIALIZE);
+    }
+
+    void rebuild() {
+        // Build the new component BEFORE dropping the old (the old is replaced by
+        // assignment); with unique ids the two never share a metric series.
+        auto fresh = std::make_shared<framer<std::complex<float>>>(next_id());
+        uut = std::move(fresh);
         source_port = std::make_shared<composite::output_port<composite::immutable_buffer<uint8_t>>>("source");
         sink_port = std::make_shared<composite::input_port<composite::immutable_buffer<std::complex<float>>>>("sink");
         source_port->connect(&uut->m_in_port);
@@ -49,10 +68,7 @@ struct FramerTestFixture {
 
     void run_real_i8_test() {
         // 1. Set properties
-        uut->m_frame_size = 16;
-        uut->m_overlap = 8;
-        uut->m_frame_count = 4;
-        uut->property_change_handler(); // Manually trigger initialization
+        configure(16, 8, 4);
 
         // 2. Create metadata and input data
         auto meta = create_metadata(false, 8, composite::data_type::signed_integer);
@@ -62,9 +78,8 @@ struct FramerTestFixture {
         composite::immutable_buffer<uint8_t> input_buffer(input_vec);
         composite::timestamp ts{0, 0};
 
-        // 3. Send metadata and data
-        source_port->send_metadata(meta);
-        source_port->send_data(input_buffer, ts);
+        // 3. Send data with metadata (metadata travels with the packet)
+        source_port->send_data(input_buffer, ts, meta);
 
         // 4. Process
         REQUIRE(uut->process() == composite::retval::NORMAL);
@@ -103,10 +118,7 @@ struct FramerTestFixture {
     void run_complex_i8_test() {
         reset();
 
-        uut->m_frame_size = 8;
-        uut->m_overlap = 4;
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(8, 4, 4);
 
         // Create complex i8 data: [0+0i, 1+1i, 2+2i, ..., 15+15i] = 32 bytes (16 complex samples)
         auto meta = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
@@ -118,8 +130,7 @@ struct FramerTestFixture {
         composite::immutable_buffer<uint8_t> input_buffer(input_vec);
         composite::timestamp ts{1, 0};
 
-        source_port->send_metadata(meta);
-        source_port->send_data(input_buffer, ts);
+        source_port->send_data(input_buffer, ts, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 3 frames: [0-7], [4-11], [8-15]
@@ -156,10 +167,7 @@ struct FramerTestFixture {
     void run_complex_i16_test() {
         reset();
 
-        uut->m_frame_size = 4;
-        uut->m_overlap = 2;
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(4, 2, 4);
 
         // Create complex i16 data: [1000+1000i, 2000+2000i, ..., 8000+8000i] = 32 bytes (8 complex samples)
         auto meta = create_metadata(true, 16, composite::data_type::signed_integer, 2e6);
@@ -173,8 +181,7 @@ struct FramerTestFixture {
         composite::immutable_buffer<uint8_t> input_buffer(input_vec);
         composite::timestamp ts{2, 500'000'000'000}; // 2.5 seconds
 
-        source_port->send_metadata(meta);
-        source_port->send_data(input_buffer, ts);
+        source_port->send_data(input_buffer, ts, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 3 frames: [0-3], [2-5], [4-7]
@@ -214,10 +221,7 @@ struct FramerTestFixture {
     void run_complex_cf32_test() {
         reset();
 
-        uut->m_frame_size = 4;
-        uut->m_overlap = 0; // No overlap for simplicity
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(4, 0, 4);
 
         // Create complex float data: [1.5+2.5i, 3.5+4.5i, 5.5+6.5i, 7.5+8.5i] = 32 bytes (4 complex samples)
         auto meta = create_metadata(true, 32, composite::data_type::floating_point, 5e6);
@@ -230,8 +234,7 @@ struct FramerTestFixture {
         composite::immutable_buffer<uint8_t> input_buffer(input_vec);
         composite::timestamp ts{5, 0};
 
-        source_port->send_metadata(meta);
-        source_port->send_data(input_buffer, ts);
+        source_port->send_data(input_buffer, ts, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 1 frame: [0-3]
@@ -248,19 +251,15 @@ struct FramerTestFixture {
     void run_multiple_batches_test() {
         reset();
 
-        uut->m_frame_size = 8;
-        uut->m_overlap = 4;
-        uut->m_frame_count = 8;
-        uut->property_change_handler();
+        configure(8, 4, 8);
 
         auto meta = create_metadata(false, 8, composite::data_type::signed_integer, 1e6);
-        source_port->send_metadata(meta);
 
         // Send first batch: 0-15 (16 samples)
         // With frame_size=8, overlap=4 (hop=4), should emit frames at: 0, 4, 8
         auto input1 = std::make_shared<std::vector<uint8_t>>(16);
         std::iota(input1->begin(), input1->end(), 0);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {0, 0});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {0, 0}, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 3 frames: [0-7], [4-11], [8-15]
@@ -297,7 +296,7 @@ struct FramerTestFixture {
         // Should emit frames at: 12, 16, 20, 24 (but we only have data up to 31, so: 12, 16, 20, 24)
         auto input2 = std::make_shared<std::vector<uint8_t>>(16);
         std::iota(input2->begin(), input2->end(), 16);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {0, 16'000'000}); // 16 µs later
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {0, 16'000'000}, meta); // 16 µs later
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 4 more frames: [12-19], [16-23], [20-27], [24-31]
@@ -343,22 +342,17 @@ struct FramerTestFixture {
     void run_timestamp_test() {
         reset();
 
-        uut->m_frame_size = 4;
-        uut->m_overlap = 0; // No overlap for easier timestamp calculation
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(4, 0, 4);
 
         // Use 1 MHz sample rate for easy picosecond calculations
         // 1 sample @ 1 MHz = 1 microsecond = 1,000,000 picoseconds
         auto meta = create_metadata(false, 8, composite::data_type::signed_integer, 1e6);
         composite::timestamp ts_origin{100, 0}; // Start at 100 seconds
 
-        source_port->send_metadata(meta);
-
         // Send 12 samples (should produce 3 frames of 4 samples each)
         auto input = std::make_shared<std::vector<uint8_t>>(12);
         std::iota(input->begin(), input->end(), 0);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input), ts_origin);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input), ts_origin, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         REQUIRE(sink_port->size() == 3);
@@ -405,20 +399,15 @@ struct FramerTestFixture {
     void run_metadata_propagation_test() {
         reset();
 
-        uut->m_frame_size = 4;
-        uut->m_overlap = 0;
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(4, 0, 4);
 
         // Send real i8 metadata
         auto meta = create_metadata(false, 8, composite::data_type::signed_integer, 10e6);
         meta.center_frequency = 915e6; // 915 MHz
 
-        source_port->send_metadata(meta);
-
         auto input = std::make_shared<std::vector<uint8_t>>(8);
         std::iota(input->begin(), input->end(), 0);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input), {0, 0});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input), {0, 0}, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         REQUIRE(sink_port->size() == 2);
@@ -427,7 +416,7 @@ struct FramerTestFixture {
         REQUIRE(out1.size() == 4);
 
         // Output should be complex cf32
-        REQUIRE(meta1.has_value());
+        REQUIRE(meta1 != nullptr);
         REQUIRE(meta1->format.is_complex == true);
         REQUIRE(meta1->format.bit_width == 32);
         REQUIRE(meta1->format.type == composite::data_type::floating_point);
@@ -451,24 +440,25 @@ struct FramerTestFixture {
             REQUIRE(out2.data()[i].real() == static_cast<float>(static_cast<int8_t>(i + 4)));
             REQUIRE(out2.data()[i].imag() == 0.0f);
         }
+
+        // Both frames must carry the SAME shared metadata instance (rebuilt only on an
+        // input-metadata change, refcount-bumped per frame — never copied per frame).
+        REQUIRE(meta2 != nullptr);
+        REQUIRE(meta1.get() == meta2.get());
     }
 
     void run_non_aligned_buffer_test() {
         reset();
 
-        uut->m_frame_size = 4;
-        uut->m_overlap = 0;
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(4, 0, 4);
 
         // Use complex i16 (4 bytes per sample)
         auto meta = create_metadata(true, 16, composite::data_type::signed_integer, 1e6);
-        source_port->send_metadata(meta);
 
         // Send 18 bytes (4.5 samples) - should process 4 complete samples, drop 2 bytes
         auto input = std::make_shared<std::vector<uint8_t>>(18);
         std::fill(input->begin(), input->end(), 0x42);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input), {0, 0});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input), {0, 0}, meta);
 
         // Should still process successfully (warning logged, partial sample dropped)
         REQUIRE(uut->process() == composite::retval::NORMAL);
@@ -483,19 +473,15 @@ struct FramerTestFixture {
         // Configure small ring to force wraparound quickly
         // frame_size=8, overlap=4, hop=4, frame_count=4
         // ring_size = 4 * 4 + 4 = 20 samples
-        uut->m_frame_size = 8;
-        uut->m_overlap = 4;
-        uut->m_frame_count = 4;
-        uut->property_change_handler();
+        configure(8, 4, 4);
 
         auto meta = create_metadata(false, 8, composite::data_type::signed_integer, 1e6);
-        source_port->send_metadata(meta);
 
         // Batch 1: Send samples 0-15 (16 samples)
         // write_head will be at 16 (no wrap yet, ring_size=20)
         auto input1 = std::make_shared<std::vector<uint8_t>>(16);
         std::iota(input1->begin(), input1->end(), 0);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {0, 0});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {0, 0}, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 3 frames: [0-7], [4-11], [8-15]
@@ -534,7 +520,7 @@ struct FramerTestFixture {
         // 32 % 20 = 12, so we've wrapped! Data now at ring positions 12-19, then 0-7
         auto input2 = std::make_shared<std::vector<uint8_t>>(16);
         std::iota(input2->begin(), input2->end(), 16);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {0, 16'000'000});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {0, 16'000'000}, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 4 more frames: [12-19], [16-23], [20-27], [24-31]
@@ -585,7 +571,7 @@ struct FramerTestFixture {
         // 48 % 20 = 8, so we've wrapped multiple times
         auto input3 = std::make_shared<std::vector<uint8_t>>(16);
         std::iota(input3->begin(), input3->end(), 32);
-        source_port->send_data(composite::immutable_buffer<uint8_t>(input3), {0, 32'000'000});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input3), {0, 32'000'000}, meta);
         REQUIRE(uut->process() == composite::retval::NORMAL);
 
         // Should emit 4 more frames: [28-35], [32-39], [36-43], [40-47]
@@ -635,6 +621,198 @@ struct FramerTestFixture {
             }
         }
     }
+
+    // At end-of-stream the framer must flush its partial residue as a zero-padded final frame,
+    // rather than silently dropping the tail. frame_size=8, overlap=0 (hop=8): a 12-sample input
+    // emits one full frame [0-7] and leaves a 4-sample residue [8-11] buffered; on_end_of_stream()
+    // zero-pads to [8,9,10,11,0,0,0,0] and emits it.
+    void run_eos_flush_test() {
+        reset();
+        configure(8, 0, 4);
+        auto meta = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
+        auto input_vec = std::make_shared<std::vector<uint8_t>>(24);  // 12 complex_i8 samples
+        for (size_t i = 0; i < 12; ++i) {
+            (*input_vec)[i * 2]     = static_cast<uint8_t>(i);  // I
+            (*input_vec)[i * 2 + 1] = static_cast<uint8_t>(i);  // Q
+        }
+        composite::immutable_buffer<uint8_t> input_buffer(input_vec);
+        source_port->send_data(input_buffer, composite::timestamp{2, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 1);   // one full frame emitted; the 4-sample residue stays buffered
+        (void)sink_port->get_data();       // drain frame [0-7]
+
+        // End of stream: the residue is flushed as a single zero-padded frame.
+        uut->on_end_of_stream();
+        REQUIRE(sink_port->size() == 1);
+        auto [tail, tts, tmeta] = sink_port->get_data();
+        REQUIRE(tail.size() == 8);
+        for (size_t i = 0; i < 4; ++i) {   // the real residue samples [8..11]
+            INFO("EOS residue sample " << i);
+            REQUIRE(tail.data()[i].real() == static_cast<float>(static_cast<int8_t>(i + 8)));
+            REQUIRE(tail.data()[i].imag() == static_cast<float>(static_cast<int8_t>(i + 8)));
+        }
+        for (size_t i = 4; i < 8; ++i) {   // zero padding
+            INFO("EOS pad sample " << i);
+            REQUIRE(tail.data()[i].real() == 0.0f);
+            REQUIRE(tail.data()[i].imag() == 0.0f);
+        }
+        // A second flush is a no-op — nothing left buffered.
+        uut->on_end_of_stream();
+        REQUIRE(sink_port->size() == 0);
+    }
+
+    // Real i16 input widens to complex with imag = 0 (same treatment real i8 gets).
+    void run_real_i16_test() {
+        reset();
+        configure(4, 0, 4);
+
+        auto meta = create_metadata(false, 16, composite::data_type::signed_integer, 1e6);
+        auto input_vec = std::make_shared<std::vector<uint8_t>>(16);  // 8 real i16 samples
+        auto* i16_data = reinterpret_cast<int16_t*>(input_vec->data());
+        for (size_t i = 0; i < 8; ++i) {
+            i16_data[i] = static_cast<int16_t>((i + 1) * 1000);
+        }
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input_vec), {0, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+
+        REQUIRE(sink_port->size() == 2);
+        auto [out1, ts1, meta1] = sink_port->get_data();
+        REQUIRE(out1.size() == 4);
+        for (size_t i = 0; i < 4; ++i) {
+            INFO("Real i16, Frame 1, Sample " << i);
+            REQUIRE(out1.data()[i].real() == static_cast<float>((i + 1) * 1000));
+            REQUIRE(out1.data()[i].imag() == 0.0f);
+        }
+        auto [out2, ts2, meta2] = sink_port->get_data();
+        REQUIRE(out2.size() == 4);
+        for (size_t i = 0; i < 4; ++i) {
+            INFO("Real i16, Frame 2, Sample " << i);
+            REQUIRE(out2.data()[i].real() == static_cast<float>((i + 5) * 1000));
+            REQUIRE(out2.data()[i].imag() == 0.0f);
+        }
+    }
+
+    // A ci16 framer fed cf32 input must refuse the stream (there is no float -> int16
+    // narrowing converter) rather than silently accepting the metadata and dropping every
+    // sample — and must recover when a supported format arrives.
+    void run_unsupported_combination_test() {
+        auto ci16 = std::make_shared<framer<std::complex<int16_t>>>(next_id());
+        auto src = std::make_shared<composite::output_port<composite::immutable_buffer<uint8_t>>>("source");
+        auto sink = std::make_shared<composite::input_port<composite::immutable_buffer<std::complex<int16_t>>>>("sink");
+        src->connect(&ci16->m_in_port);
+        ci16->m_out_port.connect(sink.get());
+        ci16->set_properties(composite::properties::json{
+                                 {"frame_size", 4}, {"overlap", 0}, {"frame_count", 4}},
+                             composite::properties::config_type::INITIALIZE);
+
+        // cf32 data into a ci16 framer: unsupported combination, nothing may be emitted.
+        auto cf32_meta = create_metadata(true, 32, composite::data_type::floating_point, 1e6);
+        auto cf32_vec = std::make_shared<std::vector<uint8_t>>(32);  // 4 cf32 samples
+        src->send_data(composite::immutable_buffer<uint8_t>(cf32_vec), {0, 0}, cf32_meta);
+        REQUIRE(ci16->process() == composite::retval::NORMAL);
+        REQUIRE(sink->size() == 0);
+
+        // A supported format afterwards flows normally.
+        auto ci16_meta = create_metadata(true, 16, composite::data_type::signed_integer, 1e6);
+        auto ci16_vec = std::make_shared<std::vector<uint8_t>>(16);  // 4 complex i16 samples
+        auto* i16_data = reinterpret_cast<int16_t*>(ci16_vec->data());
+        for (size_t i = 0; i < 4; ++i) {
+            i16_data[i * 2] = static_cast<int16_t>(i + 1);
+            i16_data[i * 2 + 1] = static_cast<int16_t>(i + 1);
+        }
+        src->send_data(composite::immutable_buffer<uint8_t>(ci16_vec), {1, 0}, ci16_meta);
+        REQUIRE(ci16->process() == composite::retval::NORMAL);
+        REQUIRE(sink->size() == 1);
+        auto [out, ts, meta] = sink->get_data();
+        REQUIRE(out.size() == 4);
+        for (size_t i = 0; i < 4; ++i) {
+            INFO("Recovery frame, Sample " << i);
+            REQUIRE(out.data()[i].real() == static_cast<int16_t>(i + 1));
+            REQUIRE(out.data()[i].imag() == static_cast<int16_t>(i + 1));
+        }
+    }
+
+    // A mid-stream sample-rate change must re-anchor timestamp extrapolation at the next
+    // buffer's timestamp, not extrapolate the new rate across the old origin.
+    void run_sample_rate_change_test() {
+        reset();
+        configure(4, 0, 4);
+
+        // 8 samples @ 1 MHz anchored at t=100s: frames at 100.0s and 100s + 4 us.
+        auto meta1 = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
+        auto input1 = std::make_shared<std::vector<uint8_t>>(16);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {100, 0}, meta1);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 2);
+        {
+            auto [f1, ts1, m1] = sink_port->get_data();
+            REQUIRE(ts1.seconds == 100);
+            REQUIRE(ts1.picoseconds == 0);
+            auto [f2, ts2, m2] = sink_port->get_data();
+            REQUIRE(ts2.seconds == 100);
+            REQUIRE(ts2.picoseconds == 4'000'000);
+        }
+
+        // 8 samples @ 2 MHz anchored at t=200s: frames at 200.0s and 200s + 2 us. Without
+        // re-anchoring these would be computed at the old origin with the new rate.
+        auto meta2 = create_metadata(true, 8, composite::data_type::signed_integer, 2e6);
+        auto input2 = std::make_shared<std::vector<uint8_t>>(16);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {200, 0}, meta2);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 2);
+        auto [f3, ts3, m3] = sink_port->get_data();
+        REQUIRE(ts3.seconds == 200);
+        REQUIRE(ts3.picoseconds == 0);
+        auto [f4, ts4, m4] = sink_port->get_data();
+        REQUIRE(ts4.seconds == 200);
+        REQUIRE(ts4.picoseconds == 2'000'000);
+    }
+
+    // When the ring drops a batch under backpressure, the sample counter stops advancing while
+    // wall time does not; the framer must re-anchor timestamps at the next accepted buffer and
+    // account for the loss in its drop metrics.
+    void run_drop_reanchor_and_metrics_test() {
+        reset();
+        // hop=4, frame_count=2 -> ring_size = 8 samples; two held frames block all writes.
+        configure(4, 0, 2);
+        const std::string component_id{uut->id()};
+
+        auto meta = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
+        auto input1 = std::make_shared<std::vector<uint8_t>>(16);  // 8 complex i8 samples
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {100, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 2);
+
+        // Hold both frames so every ring slot stays protected.
+        std::vector<composite::immutable_buffer<std::complex<float>>> held;
+        for (int i = 0; i < 2; ++i) {
+            auto [buf, ts, md] = sink_port->get_data();
+            held.push_back(std::move(buf));
+        }
+
+        // With the ring full, this batch times out under backpressure and is dropped.
+        auto input2 = std::make_shared<std::vector<uint8_t>>(8);  // 4 complex i8 samples
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {100, 8'000'000}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 0);
+
+        auto& registry = composite::metrics::registry::instance();
+        REQUIRE(registry.get_or_create_counter("framer.samples_dropped", "", "1",
+                                               {{"component_id", component_id}}).value() == 4);
+        REQUIRE(registry.get_or_create_counter("framer.drops_backpressure", "", "1",
+                                               {{"component_id", component_id}}).value() == 1);
+
+        // Release the held frames and send again much later: the emitted frame must carry the
+        // NEW buffer's timestamp (re-anchored), not one extrapolated across the dropped gap.
+        held.clear();
+        auto input3 = std::make_shared<std::vector<uint8_t>>(8);  // 4 complex i8 samples
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input3), {200, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 1);
+        auto [out, ts, md] = sink_port->get_data();
+        REQUIRE(ts.seconds == 200);
+        REQUIRE(ts.picoseconds == 0);
+    }
 };
 
 
@@ -670,6 +848,26 @@ TEST_CASE_METHOD(FramerTestFixture, "Framer handles non-sample-aligned buffers",
     run_non_aligned_buffer_test();
 }
 
+TEST_CASE_METHOD(FramerTestFixture, "Framer flushes a zero-padded residue at end-of-stream", "[framer][integration][eos]") {
+    run_eos_flush_test();
+}
+
 TEST_CASE_METHOD(FramerTestFixture, "Framer handles ring buffer wraparound correctly", "[framer][integration]") {
     run_wraparound_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer processes real_i16 input correctly", "[framer][integration]") {
+    run_real_i16_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer rejects unsupported input/output combinations and recovers", "[framer][integration]") {
+    run_unsupported_combination_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer re-anchors timestamps on sample-rate change", "[framer][integration]") {
+    run_sample_rate_change_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer re-anchors timestamps after drops and counts them", "[framer][integration]") {
+    run_drop_reanchor_and_metrics_test();
 }

@@ -20,56 +20,55 @@
 #pragma once
 
 #include "work.hpp"
-#include "task_queue.hpp"
 
-#include <composite/composite.hpp>
+#include <composite/core/pipeline_component.hpp>
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/aligned_mem.hpp>
+
+#include <atomic>
 #include <complex>
-#include <deque>
-#include <future>
 #include <memory>
+#include <string>
 
+// psd is a pipeline_component: the framework worker ingests in order and the slot ring re-
+// serialises output to submission order, while the parallel PSD runs on a worker pool. Its window
+// is DATA-DRIVEN (rebuilt from each packet's fft_size/fft_window metadata), so work() builds and
+// caches the window PER POOL WORKER (keyed by size+type, like fft's thread_local plan) and derives
+// the normalization constant locally from the window + the packet's sample_rate + the
+// power_based_normalization config snapshot — no shared mutable window/work state.
 template <typename T>
-class psd : public composite::component {
-    using input_port_t = composite::input_port<composite::mutable_buffer<std::complex<T>>>;
-    using output_port_t = composite::output_port<composite::mutable_buffer<T>>;
-    using output_tuple_t = std::tuple<composite::mutable_buffer<T>, composite::timestamp, std::optional<composite::metadata>>;
+class psd : public composite::pipeline_component<composite::mutable_buffer<std::complex<T>>, composite::mutable_buffer<T>> {
+    using base = composite::pipeline_component<composite::mutable_buffer<std::complex<T>>, composite::mutable_buffer<T>>;
     using window_t = composite::aligned_mem<T>;
-
-    static constexpr std::size_t ALIGNMENT = 64;
 
 public:
     explicit psd(std::string_view id);
     ~psd() override = default;
 
-    auto property_change_handler() -> void override;
-    auto initialize() -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
-    auto process() -> composite::retval override;
+    auto property_change_handler(const composite::properties::json& diff) -> void override;
+
+protected:
+    // ARRIVAL order, main thread: record the (snapshot) normalization mode onto the metadata.
+    auto prepare(composite::metadata& md) -> void override;
+
+    // The parallel stage (pool worker): build/lookup the window for this packet's fft params,
+    // compute its norm const, and run the PSD. Per-worker state lives in work() (thread_local).
+    auto work(composite::mutable_buffer<std::complex<T>> in, composite::timestamp ts,
+              const composite::metadata& md) -> composite::mutable_buffer<T> override;
 
 private:
-    auto calculate_norm_const() const -> T;
+    /// Normalization constant for a given window + sample rate + mode. Pure (no member state) so
+    /// it is safe to call from any pool worker. norm = 1 / (sample_rate * sum(window^2)[/size]).
+    static auto compute_norm_const(const window_t* window, T sample_rate, bool power_based) -> T;
 
-    // Ports
-    input_port_t m_in_port{"data_in"};
-    output_port_t m_out_port{"data_out"};
-
-    // Properties
-    uint32_t m_num_workers{1};
+    // Properties (num_workers is owned by pipeline_component). power_based_normalization is written
+    // by the engine under park; work() (pool threads, not parked) reads the m_pbn atomic snapshot.
     bool m_power_based_normalization{true};
+    std::atomic<bool> m_pbn{true};
 
-    // Members
-    composite::metadata m_metadata;
-    std::unique_ptr<window_t> m_window;
-    work<T> m_work;
-    T m_sample_rate{};
-    std::deque<std::future<output_tuple_t>> m_futures;
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::jthread m_input_thread;
-    task_queue m_task_queue;
+    // MUST be last: stops the pipeline (main worker + pool) before any member above destructs, so
+    // a pool worker in work() (reading m_pbn) can't touch freed state. See component.hpp auto_stop.
+    composite::component::auto_stop m_auto_stop{*this};
 
 }; // class psd
 

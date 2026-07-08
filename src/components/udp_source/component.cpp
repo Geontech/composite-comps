@@ -22,6 +22,8 @@
 #include "socket/recvmmsg.hpp"
 #include "socket/dpdk.hpp"
 
+#include <composite/core/register.hpp>
+
 #include <arpa/inet.h>
 #include <array>
 #include <complex>
@@ -31,7 +33,6 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <source_location>
-#include <spdlog/spdlog.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
@@ -39,10 +40,10 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_port(&m_out_port);
     using enum composite::properties::config_type;
     add_property("active", m_active, RUNTIME);
-    add_property("socket_type", m_socket_type).change_listener([this]() {
-        return m_socket_type == RECVMMSG
-            || m_socket_type == PACKET_MMAP
-            || m_socket_type == DPDK;
+    add_property("socket_type", m_socket_type).validate([](const std::string& v) {
+        return v == RECVMMSG
+            || v == PACKET_MMAP
+            || v == DPDK;
     });
     add_property("interface", m_interface, RUNTIME);
     add_property("ip_addr", m_ip_addr, RUNTIME);
@@ -54,35 +55,18 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_property("overrides", m_overrides, RUNTIME);
     add_property("dpdk", m_dpdk);
 
-    // Create metrics
-    auto& registry = composite::metrics::registry::instance();
-    auto sanitized_id = composite::metrics::sanitize_for_metric_name(this->id());
-
-    m_packets_received = &registry.get_or_create_counter(
-        "udp_source.packets_received",
-        "Total UDP packets received",
-        "1",
-        {{"component_id", sanitized_id}}
-    );
-    m_bytes_received = &registry.get_or_create_counter(
-        "udp_source.bytes_received",
-        "Total bytes received from network",
-        "bytes",
-        {{"component_id", sanitized_id}}
-    );
-    m_packets_dropped = &registry.get_or_create_counter(
-        "udp_source.packets_dropped",
-        "Packets dropped due to filtering or errors",
-        "1",
-        {{"component_id", sanitized_id}}
-    );
-    m_batch_sizes = &registry.get_or_create_histogram_pow2(
-        "udp_source.batch_sizes",
-        "Distribution of packets received per batch",
-        "1",
-        10,  // 10 buckets: 1, 2, 4, 8, ..., 512
-        {{"component_id", sanitized_id}}
-    );
+    // Create metrics via the base helpers, which label each series with this component's
+    // RAW id so ~component's remove_by_label("component_id", id) cleans them up on
+    // destruction (a sanitized label would never match and the series would leak).
+    m_packets_received = &create_counter(
+        "udp_source.packets_received", "Total UDP packets received");
+    m_bytes_received = &create_counter(
+        "udp_source.bytes_received", "Total bytes received from network", "bytes");
+    m_packets_dropped = &create_counter(
+        "udp_source.packets_dropped", "Packets dropped due to filtering or errors");
+    m_batch_sizes = &create_histogram_pow2(
+        "udp_source.batch_sizes", "Distribution of packets received per batch", "1",
+        10);  // 10 buckets: 1, 2, 4, 8, ..., 512
 }
 
 auto udp_source::create_metrics() -> udp::metrics {
@@ -94,7 +78,8 @@ auto udp_source::create_metrics() -> udp::metrics {
     };
 }
 
-auto udp_source::property_change_handler() -> void {
+auto udp_source::property_change_handler(const composite::properties::json& diff) -> void {
+    (void)diff;
     logger()->trace(std::source_location::current().function_name());
 
     // If we're transitioning to inactive, just stop the receiver
@@ -173,7 +158,7 @@ auto udp_source::start() -> void {
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
             if (!token.stop_requested()) {
-                if (logger()->should_log(spdlog::level::debug)) {
+                if (logger()->should_log(composite::log_level::debug)) {
                     std::map<std::string, std::string> stats;
                     {
                         std::scoped_lock lock(m_receiver_mtx);
@@ -216,9 +201,16 @@ auto udp_source::stop() -> void {
 }
 
 auto udp_source::process() -> composite::retval {
-    // Output provided by the receiver classes
-    // Returning FINISH to shut this thread down
-    return composite::retval::FINISH;
+    // Data output is produced by the receiver classes (packet_mmap / recvmmsg / dpdk) on their
+    // OWN threads, which write straight to m_out_port via start_recv(&m_out_port). This worker
+    // has nothing to do. Return NOOP — NOT FINISH: a clean FINISH now auto-fires send_eos() on
+    // completion (framework component completion path), which would close m_out_port at startup
+    // while the receiver thread keeps pushing packets into it — an at-startup end-of-stream plus
+    // two threads writing a single-producer port. NOOP parks this worker on the idle cadence (it
+    // has no input ring to wake it); stop()'s stop-token wakes it immediately. A live UDP stream
+    // has no natural EOF, so udp_source never sends EOS — an external stop() does not (only a
+    // self-FINISH would).
+    return composite::retval::NOOP;
 }
 
 auto udp_source::start_receiver_locked() -> void {
@@ -237,8 +229,4 @@ auto udp_source::stop_receiver_locked() -> void {
     m_receiver_running = false;
 }
 
-extern "C" {
-    auto create(std::string_view id) -> std::shared_ptr<composite::component> {
-        return std::make_shared<udp_source>(id);
-    }
-}
+COMPOSITE_REGISTER_SIMPLE(udp_source)

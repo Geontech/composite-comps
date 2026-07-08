@@ -81,7 +81,6 @@ target_include_directories(udp_source
 target_link_libraries(udp_source
     PRIVATE
     composite::composite
-    spdlog::spdlog_header_only
 )
 
 # Add DPDK includes and linkage if available

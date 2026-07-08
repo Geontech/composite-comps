@@ -19,13 +19,17 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <immintrin.h>
 #include <mutex>
 #include <type_traits>
 #include <variant>
+
+#include <composite/core/metadata.hpp>
 
 namespace avx {
 
@@ -88,6 +92,28 @@ inline auto init_avx512() {
 }
 
 } // namespace swap
+
+/// SIMD tier selected at runtime for the converters below.
+enum class simd_level { scalar, avx2, avx512 };
+
+/// One CPU-feature probe shared by every converter. The avx512 tier requires BW/VL/DQ in
+/// addition to F because the converters use 8/16-bit shuffles, epi8/epi16 widening
+/// conversions, and 256-bit EVEX loads — gating on avx512f alone would dispatch illegal
+/// instructions on an F-only CPU. Also runs the one-time shuffle-mask initialization for
+/// the selected tier.
+inline auto detect_simd_level() -> simd_level {
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq")) {
+        std::call_once(swap::avx512_once_flag, swap::init_avx512);
+        return simd_level::avx512;
+    }
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        std::call_once(swap::avx2_once_flag, swap::init_avx2);
+        return simd_level::avx2;
+    }
+    return simd_level::scalar;
+}
+
 } // namespace avx
 
 // ============================================================================
@@ -127,17 +153,19 @@ struct converter<int8_t, float> {
 
 private:
     auto init_cpu_features() -> void {
-        if (__builtin_cpu_supports("avx512f")) {
-            std::call_once(avx::swap::avx512_once_flag, avx::swap::init_avx512);
-            process_func = &converter::process_avx512;
-            samples_per_vector = 16;
-        } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            std::call_once(avx::swap::avx2_once_flag, avx::swap::init_avx2);
-            process_func = &converter::process_avx2;
-            samples_per_vector = 8;
-        } else {
-            process_func = &converter::process_single;
-            samples_per_vector = 1;
+        switch (avx::detect_simd_level()) {
+            case avx::simd_level::avx512:
+                process_func = &converter::process_avx512;
+                samples_per_vector = 16;
+                break;
+            case avx::simd_level::avx2:
+                process_func = &converter::process_avx2;
+                samples_per_vector = 8;
+                break;
+            case avx::simd_level::scalar:
+                process_func = &converter::process_single;
+                samples_per_vector = 1;
+                break;
         }
     }
 
@@ -198,17 +226,19 @@ struct converter<int16_t, float> {
 
 private:
     auto init_cpu_features() -> void {
-        if (__builtin_cpu_supports("avx512f")) {
-            std::call_once(avx::swap::avx512_once_flag, avx::swap::init_avx512);
-            process_func = &converter::process_avx512;
-            samples_per_vector = 16;
-        } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            std::call_once(avx::swap::avx2_once_flag, avx::swap::init_avx2);
-            process_func = &converter::process_avx2;
-            samples_per_vector = 8;
-        } else {
-            process_func = &converter::process_single;
-            samples_per_vector = 1;
+        switch (avx::detect_simd_level()) {
+            case avx::simd_level::avx512:
+                process_func = &converter::process_avx512;
+                samples_per_vector = 16;
+                break;
+            case avx::simd_level::avx2:
+                process_func = &converter::process_avx2;
+                samples_per_vector = 8;
+                break;
+            case avx::simd_level::scalar:
+                process_func = &converter::process_single;
+                samples_per_vector = 1;
+                break;
         }
     }
 
@@ -277,17 +307,19 @@ struct converter<uint32_t, float> {
 
 private:
     auto init_cpu_features() -> void {
-        if (__builtin_cpu_supports("avx512f")) {
-            std::call_once(avx::swap::avx512_once_flag, avx::swap::init_avx512);
-            process_func = &converter::process_avx512;
-            samples_per_vector = 16;
-        } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            std::call_once(avx::swap::avx2_once_flag, avx::swap::init_avx2);
-            process_func = &converter::process_avx2;
-            samples_per_vector = 8;
-        } else {
-            process_func = &converter::process_single;
-            samples_per_vector = 1;
+        switch (avx::detect_simd_level()) {
+            case avx::simd_level::avx512:
+                process_func = &converter::process_avx512;
+                samples_per_vector = 16;
+                break;
+            case avx::simd_level::avx2:
+                process_func = &converter::process_avx2;
+                samples_per_vector = 8;
+                break;
+            case avx::simd_level::scalar:
+                process_func = &converter::process_single;
+                samples_per_vector = 1;
+                break;
         }
     }
 
@@ -349,17 +381,19 @@ struct converter<int8_t, int16_t> {
 
 private:
     auto init_cpu_features() -> void {
-        if (__builtin_cpu_supports("avx512f")) {
-            std::call_once(avx::swap::avx512_once_flag, avx::swap::init_avx512);
-            process_func = &converter::process_avx512;
-            samples_per_vector = 32;
-        } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            std::call_once(avx::swap::avx2_once_flag, avx::swap::init_avx2);
-            process_func = &converter::process_avx2;
-            samples_per_vector = 16;
-        } else {
-            process_func = &converter::process_single;
-            samples_per_vector = 1;
+        switch (avx::detect_simd_level()) {
+            case avx::simd_level::avx512:
+                process_func = &converter::process_avx512;
+                samples_per_vector = 32;
+                break;
+            case avx::simd_level::avx2:
+                process_func = &converter::process_avx2;
+                samples_per_vector = 16;
+                break;
+            case avx::simd_level::scalar:
+                process_func = &converter::process_single;
+                samples_per_vector = 1;
+                break;
         }
     }
 
@@ -418,17 +452,19 @@ struct converter<int16_t, int16_t> {
 
 private:
     auto init_cpu_features() -> void {
-        if (__builtin_cpu_supports("avx512f")) {
-            std::call_once(avx::swap::avx512_once_flag, avx::swap::init_avx512);
-            process_func = &converter::process_avx512;
-            samples_per_vector = 32;
-        } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-            std::call_once(avx::swap::avx2_once_flag, avx::swap::init_avx2);
-            process_func = &converter::process_avx2;
-            samples_per_vector = 16;
-        } else {
-            process_func = &converter::process_single;
-            samples_per_vector = 1;
+        switch (avx::detect_simd_level()) {
+            case avx::simd_level::avx512:
+                process_func = &converter::process_avx512;
+                samples_per_vector = 32;
+                break;
+            case avx::simd_level::avx2:
+                process_func = &converter::process_avx2;
+                samples_per_vector = 16;
+                break;
+            case avx::simd_level::scalar:
+                process_func = &converter::process_single;
+                samples_per_vector = 1;
+                break;
         }
     }
 
@@ -510,4 +546,68 @@ template <typename OutputT>
 inline auto convert(converter_variant<OutputT>& converter_var,
                    const uint8_t* input, OutputT* output, std::size_t count) -> void {
     std::visit(convert_visitor<OutputT>{input, output, count}, converter_var);
+}
+
+// ============================================================================
+// Supported-input-format table - the single source of truth per output type
+// ============================================================================
+//
+// Whether a format is supported, its byte stride, and which converter handles it are all
+// answered by ONE table entry, so they cannot disagree (a format that "passes the support
+// check" but has no converter is impossible by construction). Keyed on the fields that
+// identify a wire format (complexity, sample type, bit width); endianness is handled
+// uniformly by the converters' optional byteswap, so it is not part of the key.
+
+template <typename OutputT>
+struct input_format_support {
+    bool is_complex;
+    composite::data_type type;
+    uint32_t bit_width;
+    std::size_t bytes_per_sample;                     // I+Q together for complex formats
+    converter_variant<OutputT> (*make)(bool swap);    // converter factory
+};
+
+template <typename OutputT>
+inline constexpr std::array<input_format_support<OutputT>, 0> supported_input_formats{};
+
+// Float output: integer inputs are widened numerically (NOT normalized), cf32 passes through.
+template <>
+inline constexpr auto supported_input_formats<float> = std::to_array<input_format_support<float>>({
+    {false, composite::data_type::signed_integer, 8, 1,
+     [](bool swap) -> converter_variant<float> { return converter<int8_t, float>(swap); }},
+    {false, composite::data_type::signed_integer, 16, 2,
+     [](bool swap) -> converter_variant<float> { return converter<int16_t, float>(swap); }},
+    {true, composite::data_type::signed_integer, 8, 2,
+     [](bool swap) -> converter_variant<float> { return converter<int8_t, float>(swap); }},
+    {true, composite::data_type::signed_integer, 16, 4,
+     [](bool swap) -> converter_variant<float> { return converter<int16_t, float>(swap); }},
+    {true, composite::data_type::floating_point, 32, 8,
+     [](bool swap) -> converter_variant<float> { return converter<uint32_t, float>(swap); }},
+});
+
+// int16_t output: integer inputs only (no float -> int16 narrowing path).
+template <>
+inline constexpr auto supported_input_formats<int16_t> = std::to_array<input_format_support<int16_t>>({
+    {false, composite::data_type::signed_integer, 8, 1,
+     [](bool swap) -> converter_variant<int16_t> { return converter<int8_t, int16_t>(swap); }},
+    {false, composite::data_type::signed_integer, 16, 2,
+     [](bool swap) -> converter_variant<int16_t> { return converter<int16_t, int16_t>(swap); }},
+    {true, composite::data_type::signed_integer, 8, 2,
+     [](bool swap) -> converter_variant<int16_t> { return converter<int8_t, int16_t>(swap); }},
+    {true, composite::data_type::signed_integer, 16, 4,
+     [](bool swap) -> converter_variant<int16_t> { return converter<int16_t, int16_t>(swap); }},
+});
+
+/// Look up the support entry for @p fmt, or nullptr if the (input format, OutputT)
+/// combination is not convertible.
+template <typename OutputT>
+inline auto find_input_format(const composite::data_format& fmt)
+    -> const input_format_support<OutputT>* {
+    for (const auto& entry : supported_input_formats<OutputT>) {
+        if (entry.is_complex == fmt.is_complex && entry.type == fmt.type &&
+            entry.bit_width == fmt.bit_width) {
+            return &entry;
+        }
+    }
+    return nullptr;
 }

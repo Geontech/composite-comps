@@ -147,7 +147,10 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
                 );
                 continue;
             }
-            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), 0, nullptr, nullptr); recvd > MIN_DATA_PACKET_SIZE) {
+            // MSG_DONTWAIT: poll() provides the wait; a poll-ready datagram discarded at receive
+            // time (deferred UDP checksum validation) must EAGAIN back to poll, not block stop()
+            // for the whole discovery window.
+            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), MSG_DONTWAIT, nullptr, nullptr); recvd > MIN_DATA_PACKET_SIZE) {
                 // Skip V49 context packets, wait for data packet
                 auto pkt_type = buffer[0] & 0xF0;
                 if (pkt_type == V49_CONTEXT_PACKET || pkt_type == V49_EXT_CONTEXT_PACKET) {
@@ -249,10 +252,21 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         }
 
         if (pfd.revents & POLLIN) [[likely]] {
-            struct timespec ts{.tv_sec=0, .tv_nsec=100'000};
-            auto recvd = ::recvmmsg(m_socket, msgs.data(), m_batch_size, 0, &ts);
+            // MSG_DONTWAIT: the poll() above provides the wait; the receive itself must never
+            // block, or the recv thread stops rechecking the stop token and stop_recv()'s join()
+            // hangs. Two kernel behaviors make any blocking variant hang: (1) plain recvmmsg
+            // tries to fill the whole batch and — per the documented recvmmsg(2) timeout bug (a
+            // `ts` timeout is only re-checked AFTER each received datagram) — blocks forever on
+            // slots 2..N once the stream goes quiet mid-batch; (2) poll-then-receive is itself
+            // racy: a poll-ready datagram can be discarded at receive time (deferred UDP checksum
+            // validation), leaving even MSG_WAITFORONE blocking for a FIRST datagram that never
+            // comes, with no timeout able to fire. Batching is preserved: under load the kernel
+            // backlog is still drained in one call; a lost race just returns EAGAIN and we go
+            // back to poll().
+            auto recvd = ::recvmmsg(m_socket, msgs.data(), m_batch_size, MSG_DONTWAIT, nullptr);
             if (recvd < 0) {
-                if (errno == EINTR) { continue; }
+                // EAGAIN/EWOULDBLOCK: the poll-vs-receive race above — expected, not an error.
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { continue; }
                 m_logger->error("recvmmsg failed: {} (errno={})", std::string{strerror(errno)}, errno);
                 if (errno == EBADF || errno == EINVAL) { return; }
                 continue;
@@ -268,7 +282,10 @@ auto recvmmsg::receive(std::stop_token token) -> void {
             m_metrics.packets_received.add(msgs_recvd);
             m_metrics.batch_sizes.record(static_cast<double>(msgs_recvd));
 
-            // Process received messages
+            // Process received messages. Sum the byte count in a local and record it with ONE
+            // atomic add after the batch, rather than one per packet (packets_received is already
+            // batched above). At hundreds of kpps this drops a locked RMW off the per-packet path.
+            uint64_t batch_bytes = 0;
             for (std::size_t i = 0; i < msgs_recvd; ++i) {
                 if (!buffers[i].has_value()) {
                     continue;
@@ -276,7 +293,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
 
                 // Create length-adjusted view (zero-allocation)
                 auto len = msgs[i].msg_len;
-                m_metrics.bytes_received.add(len);
+                batch_bytes += len;
                 auto sized_buffer = composite::immutable_buffer<uint8_t>(
                     std::move(buffers[i].value())
                 ).slice(0, len);
@@ -286,8 +303,12 @@ auto recvmmsg::receive(std::stop_token token) -> void {
 
                 // Acquire replacement buffer for next batch
                 buffers[i].reset();
-                if (!acquire_buffer(i)) { return; }
+                if (!acquire_buffer(i)) {
+                    m_metrics.bytes_received.add(batch_bytes);  // flush the partial batch before bailing
+                    return;
+                }
             }
+            m_metrics.bytes_received.add(batch_bytes);
         }
     }
 }

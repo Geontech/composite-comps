@@ -55,10 +55,20 @@ constexpr auto IDLE_BACKOFF = std::chrono::microseconds(50);
 struct frame_release {
     tpacket2_hdr* hdr{nullptr};
     udp::packet_mmap::ring_buffer_ptr ring{nullptr};
+    uint32_t slot{0};
 
-    void operator()() const {
-        if (hdr) {
-            std::atomic_ref<uint32_t>(hdr->tp_status).store(TP_STATUS_KERNEL, std::memory_order_release);
+    void operator()(uint8_t* /*payload*/) const {
+        if (!hdr) { return; }
+        // Return the slot to the kernel FIRST, then clear the held flag. Order matters: if we
+        // cleared held first, a recv loop wrapping onto this slot could observe (TP_STATUS_USER,
+        // !held) — the slot still carries the OLD bytes (not yet recycled) and would be re-read as
+        // a fresh packet (a duplicate). With KERNEL stored first, any interleaving the recv loop
+        // sees is safe: (KERNEL, *) short-circuits to not-ready, and (USER, held) backs off. The
+        // only cost is that if the kernel refills between these two stores, the loop backs off for
+        // a few iterations until held clears — a bounded delay, never corruption.
+        std::atomic_ref<uint32_t>(hdr->tp_status).store(TP_STATUS_KERNEL, std::memory_order_release);
+        if (ring && ring->slot_held) {
+            ring->slot_held[slot].store(false, std::memory_order_release);
         }
     }
 };
@@ -145,6 +155,12 @@ packet_mmap::packet_mmap(const config& config) :
     m_ring_buffer = std::make_shared<ring_buffer>();
     m_ring_buffer->ring = ring_ptr;
     m_ring_buffer->block_nr = block_nr;
+    // One held-flag per ring slot, all initially free. Sized to m_frame_count (the same slot count
+    // the recv loop wraps on).
+    m_ring_buffer->slot_held = std::make_unique<std::atomic<bool>[]>(m_frame_count);
+    for (uint32_t i = 0; i < m_frame_count; ++i) {
+        m_ring_buffer->slot_held[i].store(false, std::memory_order_relaxed);
+    }
 
     // Request Transparent Huge Pages
     ::madvise(m_ring_buffer->ring, ring_size, MADV_HUGEPAGE);
@@ -174,6 +190,16 @@ packet_mmap::packet_mmap(const config& config) :
             ::close(m_socket);
             throw std::runtime_error(std::format("failed to join multicast group: {}", std::string{strerror(errno)}));
         }
+    }
+
+    // Destination filter for receive(): only forward UDP datagrams addressed to the configured
+    // IP/port (mirrors the DPDK path). config.ip_addr is the multicast group or a specific unicast
+    // IP to accept; an empty / 0.0.0.0 address accepts any dst IP. port 0 accepts any port.
+    m_dst_port = config.port;
+    if (struct in_addr dst{}; !config.ip_addr.empty()
+        && ::inet_pton(AF_INET, config.ip_addr.c_str(), &dst) == 1
+        && dst.s_addr != INADDR_ANY) {
+        m_dst_ip_be = dst.s_addr;
     }
 }
 
@@ -221,43 +247,114 @@ auto packet_mmap::get_stats() -> std::map<std::string, std::string> {
 auto packet_mmap::receive(std::stop_token token) -> void {
     auto frame_idx = std::size_t{};
     std::size_t idle_spins = 0;
+    std::size_t stalled_slot = SIZE_MAX;  // slot we last warned about being held, or none
+
+    // Metric accumulators. This is a single-frame-at-a-time poll loop with no syscall batch, so
+    // instead sum counts locally while draining a run of ready frames and record them with one
+    // atomic add each when the drain ends (a stall, catching up to the kernel, or exit) — rather
+    // than a locked RMW per packet. flush() is a no-op once drained, so the idle spin only pays
+    // the atomics on its first iteration after a burst.
+    uint64_t acc_pkts = 0, acc_bytes = 0, acc_dropped = 0;
+    auto flush = [&] {
+        if (acc_pkts != 0) {
+            m_pkts_recvd.fetch_add(acc_pkts, std::memory_order_relaxed);
+            m_metrics.packets_received.add(acc_pkts);
+        }
+        if (acc_bytes != 0) { m_metrics.bytes_received.add(acc_bytes); }
+        if (acc_dropped != 0) { m_metrics.packets_dropped.add(acc_dropped); }
+        acc_pkts = acc_bytes = acc_dropped = 0;
+    };
 
     while (!token.stop_requested()) {
         // Get pointer to current frame
         auto* hdr = (struct tpacket2_hdr*)((uint8_t*)m_ring_buffer->ring + (frame_idx * m_frame_size));
 
+        // Check "held" BEFORE tp_status (both acquire) — the order is load-bearing for
+        // correctness, not just an early-out. TP_STATUS_USER alone can't tell a fresh kernel packet
+        // from a slot we already forwarded that a slow consumer still holds: its frame_release
+        // hasn't run, so the ORIGINAL fill's USER status lingers. Re-reading such a slot would
+        // deliver a duplicate and create a SECOND frame_release for it, double-returning it to the
+        // kernel -> UAF. Observing held==false here synchronizes-with frame_release's release-store
+        // of held, which is sequenced AFTER its TP_STATUS_KERNEL store, so the tp_status load below
+        // can no longer observe the stale original USER (it sees KERNEL, or the kernel's later
+        // refill). Loading tp_status first would leave a window where recv sees (USER-original,
+        // held-just-cleared) and re-reads stale bytes.
+        if (m_ring_buffer->slot_held[frame_idx].load(std::memory_order_acquire)) {
+            flush();  // downstream is stalled — publish whatever we accumulated before backing off
+            if (frame_idx != stalled_slot) {
+                stalled_slot = frame_idx;
+                m_logger->warn("packet_mmap: ring slot {} still held downstream a full rotation "
+                               "later; stalling (kernel is dropping). Increase frame_count if this "
+                               "persists.", frame_idx);
+            }
+            // Head-of-line by nature (the kernel can't refill a held slot either): back off and do
+            // NOT advance — the in-order ring needs THIS slot recycled before the next packet.
+            if (idle_spins < MAX_IDLE_SPINS) {
+                ++idle_spins;
+                std::this_thread::yield();
+            } else {
+                idle_spins = 0;
+                std::this_thread::sleep_for(IDLE_BACKOFF);
+            }
+            continue;  // re-check the SAME slot
+        }
+
         auto status = std::atomic_ref<uint32_t>(hdr->tp_status).load(std::memory_order_acquire);
 
         // Check for ready
         if (status & TP_STATUS_USER) [[likely]] {
+            stalled_slot = SIZE_MAX;  // slot is fresh — clear any stall latch
             idle_spins = 0;
-            m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
-            m_metrics.packets_received.inc();
+            ++acc_pkts;
 
-            // Validate protocol
-            // Note: With SOCK_DGRAM, tp_net points to IP header (no Ethernet header)
-            auto ip_hdr = (struct iphdr*)((uint8_t*)hdr + hdr->tp_net);
-            if (ip_hdr->protocol == IPPROTO_UDP) [[likely]] {
-                // Extract UDP payload
-                auto* udp_hdr = (struct udphdr*)((uint8_t*)(ip_hdr) + ip_hdr->ihl * 4);
-                auto* payload = (uint8_t*)(udp_hdr) + sizeof(struct udphdr);
-                size_t payload_len = ntohs(udp_hdr->len) - sizeof(struct udphdr);
+            // The captured frame is UNTRUSTED (raw network). Every header field is bounds-checked
+            // against the captured length BEFORE it is dereferenced, and the datagram is filtered
+            // to the configured destination — otherwise a short/malformed packet causes an OOB
+            // read, and ntohs(udp->len) - sizeof(udphdr) underflows to a huge length. With
+            // SOCK_DGRAM tp_net points at the IP header and tp_snaplen is the captured byte count.
+            const std::size_t avail = hdr->tp_snaplen;
+            auto* base = reinterpret_cast<uint8_t*>(hdr) + hdr->tp_net;
+            bool forwarded = false;
 
-                m_metrics.bytes_received.add(payload_len);
-
-                // Wrap payload in external_buffer with ring frame release callback (zero-allocation)
-                auto buffer = composite::external_buffer<uint8_t>(
-                    payload,
-                    payload_len,
-                    frame_release{hdr, m_ring_buffer}
-                );
-                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
-            } else {
-                // Non-UDP packet, release frame immediately
+            if (avail >= sizeof(struct iphdr)) {
+                auto* ip_hdr = reinterpret_cast<struct iphdr*>(base);
+                const std::size_t ihl_bytes = static_cast<std::size_t>(ip_hdr->ihl) * 4U;
+                if (ip_hdr->protocol == IPPROTO_UDP
+                    && ip_hdr->ihl >= 5                                   // min IPv4 header
+                    && avail >= ihl_bytes + sizeof(struct udphdr)         // UDP header fits
+                    && (!m_dst_ip_be || ip_hdr->daddr == *m_dst_ip_be)) { // dst-IP filter
+                    auto* udp_hdr = reinterpret_cast<struct udphdr*>(base + ihl_bytes);
+                    const std::uint16_t udp_total = ntohs(udp_hdr->len);
+                    const std::uint16_t dst_port = ntohs(udp_hdr->dest);
+                    if ((m_dst_port == 0 || dst_port == m_dst_port)       // dst-port filter
+                        && udp_total >= sizeof(struct udphdr)             // no length underflow
+                        && static_cast<std::size_t>(ihl_bytes) + udp_total <= avail) { // payload captured
+                        const std::size_t payload_len = udp_total - sizeof(struct udphdr);
+                        auto* payload = base + ihl_bytes + sizeof(struct udphdr);
+                        acc_bytes += payload_len;
+                        // Mark the slot held BEFORE publishing the buffer: frame_release (which
+                        // clears it) can only run once a consumer has received and dropped this
+                        // buffer, which is strictly after send_data below — so held is always set
+                        // before it can be cleared.
+                        m_ring_buffer->slot_held[frame_idx].store(true, std::memory_order_release);
+                        // Zero-copy: wrap the payload; the frame is released (and held cleared) when
+                        // the buffer dies.
+                        auto buffer = composite::external_buffer<uint8_t>(
+                            payload, payload_len,
+                            frame_release{hdr, m_ring_buffer, static_cast<uint32_t>(frame_idx)});
+                        m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
+                        forwarded = true;
+                    }
+                }
+            }
+            if (!forwarded) {
+                // Non-UDP, malformed, or filtered-out: count + release the frame immediately.
+                ++acc_dropped;
                 std::atomic_ref<uint32_t>(hdr->tp_status).store(TP_STATUS_KERNEL, std::memory_order_release);
             }
             frame_idx = (frame_idx + 1) % m_frame_count;
         } else {
+            flush();  // caught up to the kernel — publish accumulated counts, then idle
             if (idle_spins < MAX_IDLE_SPINS) {
                 ++idle_spins;
                 std::this_thread::yield();
@@ -267,6 +364,7 @@ auto packet_mmap::receive(std::stop_token token) -> void {
             }
         }
     }
+    flush();  // stop requested mid-drain: publish any counts accumulated since the last flush
 }
 
 } // namespace udp

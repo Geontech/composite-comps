@@ -36,12 +36,6 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(file_writer MODULE
     component.cpp
 )
-# Includes
-target_include_directories(file_writer
-    PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
-    ${vrtgen_SOURCE_DIR}/include
-)
 # Link
 target_link_libraries(file_writer
     PRIVATE

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <bit>
 #include <format>
+#include <stdexcept>
 
 namespace parsers {
 
@@ -69,7 +70,14 @@ auto sdds_parser::parse(
     const composite::metadata& current_metadata
 ) -> parse_result {
     parse_result result;
-    result.metadata = current_metadata;
+
+    // SDDS is a fixed 1080-byte protocol. Protocol lock-in does NOT trust later
+    // packets, so re-validate the size before the overlay reads fixed header
+    // offsets and slices [56, 56+1024) — a short/oversized packet would otherwise
+    // read out of bounds. The pkt_parser component catches this and drops + counts.
+    if (data.size() != SDDS_PACKET_SIZE) {
+        throw std::out_of_range("sdds_parser: packet size != SDDS_PACKET_SIZE (1080)");
+    }
 
     // Overlay SDDS packet (read-only)
     auto packet = overlay::sdds(std::span{data.data(), data.size()});
@@ -91,28 +99,45 @@ auto sdds_parser::parse(
     }
     m_pkt_count = seq_num;
 
-    // Extract metadata from packet
-    result.metadata.format.is_complex = packet.complex();
-    result.metadata.format.type = composite::data_type::signed_integer;
-    result.metadata.format.endianness = std::endian::big;
-    result.metadata.format.bit_width = packet.bps();
-    result.metadata.sample_rate = packet.sample_rate();
+    // Effective metadata this packet carries (extraction + the constant overrides). SDDS is
+    // always signed / big-endian; center_frequency and bandwidth come only from overrides
+    // (otherwise carried from the current metadata).
+    const bool eff_complex = m_overrides.data_format.is_complex.value_or(packet.complex());
+    const uint32_t eff_bps = packet.bps();
+    const double eff_sr = m_overrides.sample_rate.value_or(packet.sample_rate());
 
-    // Apply overrides
-    if (m_overrides.data_format.is_complex.has_value()) {
-        result.metadata.format.is_complex = m_overrides.data_format.is_complex.value();
-    }
+    // Rebuild metadata ONLY when it actually differs from the last published value
+    // (current_metadata), or on the first packet after (re)activation. Steady state does no
+    // copy, no map write, and no full compare — the component then reuses the shared instance.
+    bool changed = !m_emitted
+        || current_metadata.format.is_complex != eff_complex
+        || current_metadata.format.type != composite::data_type::signed_integer
+        || current_metadata.format.bit_width != eff_bps
+        || current_metadata.format.endianness != std::endian::big
+        || current_metadata.sample_rate != eff_sr;
     if (m_overrides.center_frequency.has_value()) {
-        result.metadata.center_frequency = m_overrides.center_frequency.value();
+        changed = changed || current_metadata.center_frequency != *m_overrides.center_frequency;
     }
     if (m_overrides.bandwidth.has_value()) {
-        result.metadata.bandwidth = m_overrides.bandwidth.value();
+        changed = changed || current_metadata.bandwidth != *m_overrides.bandwidth;
     }
-    if (m_overrides.sample_rate.has_value()) {
-        result.metadata.sample_rate = m_overrides.sample_rate.value();
+    if (changed) {
+        result.metadata = current_metadata;
+        result.metadata.format.is_complex = eff_complex;
+        result.metadata.format.type = composite::data_type::signed_integer;
+        result.metadata.format.endianness = std::endian::big;
+        result.metadata.format.bit_width = eff_bps;
+        result.metadata.sample_rate = eff_sr;
+        if (m_overrides.center_frequency.has_value()) {
+            result.metadata.center_frequency = *m_overrides.center_frequency;
+        }
+        if (m_overrides.bandwidth.has_value()) {
+            result.metadata.bandwidth = *m_overrides.bandwidth;
+        }
+        result.metadata.annotations["protocol"] = "sdds";
+        result.metadata_changed = true;
+        m_emitted = true;
     }
-
-    result.metadata.annotations["protocol"] = "sdds";
 
     // Extract timestamp
     result.timestamp = composite::timestamp{packet.secs(), packet.psecs()};
