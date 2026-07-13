@@ -23,6 +23,7 @@
 #include <composite/core/register.hpp>
 
 #include <bit>
+#include <cstdint>
 #include <fftw3.h>
 #include <format>
 #include <immintrin.h>
@@ -48,6 +49,12 @@ fft<T>::fft(std::string_view id)
     } else {
         fftw_init_threads();
     }
+
+    // Drop / plan-build counters in the shared registry so operators can see rejected frames and
+    // FFTW plan churn (labeled by component id; auto-removed by ~component).
+    m_frames_dropped = &this->create_counter("fft.frames_dropped",
+                                             "Input frames dropped for an fft_size mismatch");
+    m_plan_builds = &this->create_counter("fft.plan_builds", "FFTW plan (re)creations across the worker pool");
 
     // Publish an initial snapshot so a pool worker always loads a valid config even if no
     // properties are set before start() (property_change_handler republishes on every change).
@@ -113,39 +120,67 @@ auto fft<T>::work(composite::immutable_buffer<T> in, composite::timestamp ts,
     (void)md;
     // Load a consistent config snapshot for this work item (runs on a pool thread, not parked).
     auto cfg = m_task_cfg.load();
+    const auto n = cfg->fft_size;
 
-    // The working/output buffers below are sized to in.size(), but the FFTW plan reads AND writes
-    // exactly cfg->fft_size elements. If in.size() != fft_size the plan runs off the end of those
-    // buffers: a smaller frame is an out-of-bounds WRITE (heap corruption); a larger frame also
-    // walks the window buffer (sized fft_size) out of bounds. A framer/fft size mismatch must be a
-    // loud error, not silent corruption — throw so pipeline_component logs it and drops the packet
-    // (work() exceptions are captured per-slot) rather than executing the plan.
-    if (in.size() != cfg->fft_size) {
-        throw std::runtime_error(
-            "fft: input frame size (" + std::to_string(in.size()) +
-            ") does not match configured fft_size (" + std::to_string(cfg->fft_size) +
-            "); check the upstream framer's frame_size");
+    // The output buffer and the FFTW plan read AND write exactly cfg->fft_size elements. If
+    // in.size() != fft_size the plan runs off the end of those buffers: a smaller frame is an
+    // out-of-bounds WRITE (heap corruption); a larger frame also walks the window buffer (sized
+    // fft_size) out of bounds. A framer/fft size mismatch must be a loud error, not silent
+    // corruption — throw so pipeline_component logs it and drops the packet (work() exceptions are
+    // captured per-slot) rather than executing the plan.
+    if (in.size() != n) {
+        m_frames_dropped->inc();
+        throw std::runtime_error("fft: input frame size (" + std::to_string(in.size()) +
+                                 ") does not match configured fft_size (" + std::to_string(n) +
+                                 "); check the upstream framer's frame_size");
     }
 
-    // Per-pool-worker FFTW plan, rebuilt when the size changes (thread_local => one per worker).
+    // Per-pool-worker FFTW plan, rebuilt when the size OR the thread count changes (thread_local =>
+    // one per worker). Tracking planned_threads separately means a runtime fftw_threads change is
+    // actually honoured — previously the plan was keyed on size alone, so a threads change was
+    // silently ignored until the size also changed.
     thread_local std::unique_ptr<plan_t> fft_plan;
-    if (!fft_plan || fft_plan->size() != cfg->fft_size) {
-        fft_plan = std::make_unique<plan_t>(cfg->fft_size, cfg->fftw_threads);
+    thread_local std::uint32_t planned_threads{0};
+    if (!fft_plan || fft_plan->size() != n || planned_threads != cfg->fftw_threads) {
+        fft_plan = std::make_unique<plan_t>(n, cfg->fftw_threads);
+        planned_threads = cfg->fftw_threads;
+        m_plan_builds->inc();
     }
 
-    // Fused copy + window (or just copy if no window) into a working buffer.
-    auto working_buf = composite::make_aligned_buffer<T>(ALIGNMENT, in.size());
+    // Per-pool-worker scratch, 64-aligned to match the plan's array alignment and REUSED across
+    // packets (resized only when fft_size changes). This replaces a fresh make_aligned_buffer per
+    // packet, which allocated AND zero-initialised a whole frame that was then fully overwritten.
+    thread_local composite::mutable_buffer<T> scratch;
+    auto working = [&]() -> composite::mutable_buffer<T>& {
+        if (scratch.size() != n) {
+            // Uninitialized: every element is written (fused window or copy) before the FFT reads it.
+            scratch = composite::make_aligned_buffer_uninitialized<T>(ALIGNMENT, n);
+        }
+        return scratch;
+    };
+
+    // Out-of-place FFT into a fresh output buffer (sent downstream, so it cannot be pooled here).
+    // Uninitialized: the FFT (and the optional shift) write every element before it is read.
+    auto output_buf = composite::make_aligned_buffer_uninitialized<T>(ALIGNMENT, n);
     if (cfg->window) {
-        copy_and_window(in, working_buf, cfg->window.get());
+        // Fused copy + window into the reused scratch, then FFT scratch -> output.
+        auto& w = working();
+        copy_and_window(in, w, cfg->window.get());
+        fft_plan->execute(w.data(), output_buf.data());
+    } else if ((reinterpret_cast<std::uintptr_t>(in.data()) % ALIGNMENT) == 0) {
+        // No window and the input is already 64-aligned (the common case: an upstream aligned_mem
+        // frame) — fftw's new-array execute accepts it because its alignment matches the plan's, so
+        // FFT straight from the input and skip the frame copy entirely.
+        fft_plan->execute(in.data(), output_buf.data());
     } else {
-        std::copy(in.begin(), in.end(), working_buf.begin());
+        // No window but an under-aligned input — copy into the aligned scratch so fftw always sees
+        // an array with the alignment its plan was built for.
+        auto& w = working();
+        std::copy(in.begin(), in.end(), w.begin());
+        fft_plan->execute(w.data(), output_buf.data());
     }
-
-    // Out-of-place FFT: working -> output, with optional fftshift.
-    auto output_buf = composite::make_aligned_buffer<T>(ALIGNMENT, in.size());
-    fft_plan->execute(working_buf.data(), output_buf.data());
     if (cfg->shift) {
-        std::rotate(output_buf.begin(), output_buf.begin() + (output_buf.size() / 2), output_buf.end());
+        std::rotate(output_buf.begin(), output_buf.begin() + (n / 2), output_buf.end());
     }
     return std::move(output_buf).to_immutable();
 }
@@ -240,6 +275,10 @@ auto fft<T>::copy_and_window(
         out[i] = in[i] * w[i];
     }
 }
+
+// Explicit template instantiations
+template class fft<std::complex<float>>;
+template class fft<std::complex<double>>;
 
 COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
                                  -> std::shared_ptr<composite::component> {

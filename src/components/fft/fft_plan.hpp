@@ -51,10 +51,6 @@ public:
         fftwf_destroy_plan(m_plan);
     }
 
-    auto plan() -> fftwf_plan {
-        return m_plan;
-    }
-
     auto size() const noexcept -> std::size_t {
         return m_size;
     }
@@ -94,10 +90,6 @@ public:
 
     ~fft_plan() {
         fftw_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftw_plan {
-        return m_plan;
     }
 
     auto size() const noexcept -> std::size_t {

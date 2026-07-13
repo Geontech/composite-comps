@@ -30,12 +30,13 @@ exp_smooth<T>::exp_smooth(std::string_view id) : composite::component(id) {
     using enum composite::properties::config_type;
     add_port(&m_in_port);
     add_port(&m_out_port);
+    m_size_mismatch = &create_counter("exp_smooth.size_mismatch", "Frames whose size differed from the previous frame");
     add_property("num_averages", m_num_averages, RUNTIME).on_change([this](const composite::properties::json&) {
         m_alpha.reset();
         if (m_num_averages > 0) {
             m_alpha = T{1} - std::pow(T{10}, (std::log10(T{1} - T{0.98}) / m_num_averages));
         }
-        m_work = std::make_unique<work<T>>(m_alpha.value_or(T{1}));
+        m_work.emplace(m_alpha.value_or(T{1}));
         m_prev_psd = composite::mutable_buffer<T>{}; // Reset to empty buffer
     });
 }
@@ -68,7 +69,20 @@ auto exp_smooth<T>::process() -> composite::retval {
         m_prev_meta = meta;
         return NORMAL;
     }
-    // Run algorithm
+    // Frame size changed mid-stream (e.g. an upstream fft_size change): the EWMA history no longer
+    // applies to the new size. Re-baseline instead of running the kernel — flush the last buffered
+    // frame, then adopt this frame as the new starting point (like the first PSD). Throwing here
+    // would recur on every subsequent packet (m_prev_psd would keep the old size), so the stream
+    // could never recover from a size change; re-baselining lets it continue at the new size.
+    if (data.size() != m_prev_psd.size()) {
+        m_size_mismatch->inc();
+        m_out_port.send_data(std::move(m_prev_psd), m_prev_psd_ts, m_prev_meta);
+        m_prev_psd = std::move(data);
+        m_prev_psd_ts = ts;
+        m_prev_meta = meta;
+        return NORMAL;
+    }
+    // Run algorithm (sizes match).
     m_work->process(data, m_prev_psd);
     // Send previous PSD data + timestamp + the metadata that arrived with it.
     m_out_port.send_data(std::move(m_prev_psd), m_prev_psd_ts, m_prev_meta);

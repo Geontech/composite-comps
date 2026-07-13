@@ -24,9 +24,11 @@
 #include <composite/core/pipeline_component.hpp>
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/aligned_mem.hpp>
+#include <composite/metrics/metrics.hpp>
 
 #include <atomic>
 #include <complex>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -37,8 +39,8 @@
 // the normalization constant locally from the window + the packet's sample_rate + the
 // power_based_normalization config snapshot — no shared mutable window/work state.
 template <typename T>
-class psd : public composite::pipeline_component<composite::mutable_buffer<std::complex<T>>, composite::mutable_buffer<T>> {
-    using base = composite::pipeline_component<composite::mutable_buffer<std::complex<T>>, composite::mutable_buffer<T>>;
+class psd : public composite::pipeline_component<composite::immutable_buffer<std::complex<T>>, composite::mutable_buffer<T>> {
+    using base = composite::pipeline_component<composite::immutable_buffer<std::complex<T>>, composite::mutable_buffer<T>>;
     using window_t = composite::aligned_mem<T>;
 
 public:
@@ -53,7 +55,9 @@ protected:
 
     // The parallel stage (pool worker): build/lookup the window for this packet's fft params,
     // compute its norm const, and run the PSD. Per-worker state lives in work() (thread_local).
-    auto work(composite::mutable_buffer<std::complex<T>> in, composite::timestamp ts,
+    // Input is immutable (psd only reads it, producing a fresh real output) so it connects
+    // zero-copy to fft's immutable_buffer output.
+    auto work(composite::immutable_buffer<std::complex<T>> in, composite::timestamp ts,
               const composite::metadata& md) -> composite::mutable_buffer<T> override;
 
 private:
@@ -65,6 +69,11 @@ private:
     // by the engine under park; work() (pool threads, not parked) reads the m_pbn atomic snapshot.
     bool m_power_based_normalization{true};
     std::atomic<bool> m_pbn{true};
+
+    // Observability: packets whose fft_size annotation was present but unparseable (a malformed
+    // upstream metadata that would otherwise silently fall back to a no-window PSD). In the shared
+    // registry, labeled by component id; auto-removed by ~component.
+    composite::metrics::counter<uint64_t>* m_bad_metadata{nullptr};
 
     // MUST be last: stops the pipeline (main worker + pool) before any member above destructs, so
     // a pool worker in work() (reading m_pbn) can't touch freed state. See component.hpp auto_stop.

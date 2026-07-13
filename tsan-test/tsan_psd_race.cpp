@@ -36,7 +36,7 @@ int main() {
     comp->set_properties(json{{"num_workers", 2}, {"power_based_normalization", true}},
                          config_type::INITIALIZE);
 
-    using in_buf  = mutable_buffer<std::complex<float>>;
+    using in_buf  = immutable_buffer<std::complex<float>>;
     using out_buf = mutable_buffer<float>;
 
     auto* in  = comp->get_port<input_port<in_buf>>("data_in");
@@ -62,7 +62,7 @@ int main() {
             md.sample_rate = 1.0e6 + static_cast<double>(n % 7);
             md.annotations["fft_size"]   = static_cast<std::int64_t>(128 + 64 * (n % 4));
             md.annotations["fft_window"] = std::string(wins[n % 3]);
-            source.send_data(std::move(buf), timestamp{0, 0}, md);
+            source.send_data(std::move(buf).to_immutable(), timestamp{0, 0}, md);
             ++n;
             std::this_thread::yield();
         }

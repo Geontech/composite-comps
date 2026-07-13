@@ -52,7 +52,7 @@ int main() {
             for (std::size_t k = 0; k < FFT_SIZE; ++k) { buf[k] = cf(static_cast<float>(i), static_cast<float>(k)); }
             metadata md;
             md.sample_rate = 1.0e6;
-            src.send_data(std::move(buf).to_immutable(), timestamp{static_cast<uint64_t>(i), 0}, md);
+            src.send_data(std::move(buf).to_immutable(), timestamp{static_cast<uint32_t>(i), 0}, md);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         done.store(true, std::memory_order_release);
@@ -67,7 +67,7 @@ int main() {
         auto [data, ts, md] = sink.get_data();
         if (data.size() != 0) {
             if (data.size() != FFT_SIZE) { size_ok = false; }
-            if (!md.has_value() || md->annotations.find("fft_size") == md->annotations.end()) { annot_ok = false; }
+            if (!md || md->annotations.find("fft_size") == md->annotations.end()) { annot_ok = false; }
             order.push_back(ts.seconds);
         } else {
             std::this_thread::yield();

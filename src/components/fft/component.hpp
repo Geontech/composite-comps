@@ -24,9 +24,11 @@
 #include <composite/core/pipeline_component.hpp>
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/aligned_mem.hpp>
+#include <composite/metrics/metrics.hpp>
 
 #include <atomic>
 #include <complex>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -94,5 +96,12 @@ private:
     bool m_shift{true};
 
     std::atomic<std::shared_ptr<const task_config>> m_task_cfg{};
+
+    // Observability (shared metrics registry, labeled by component id; auto-removed by ~component).
+    // frames_dropped: packets rejected in work() for a frame-size/fft_size mismatch (else only
+    // logged per-slot). plan_builds: FFTW plan (re)creations — an FFTW_MEASURE build is expensive,
+    // so a climbing count flags fft_size/fftw_threads thrashing across the pool.
+    composite::metrics::counter<uint64_t>* m_frames_dropped{nullptr};
+    composite::metrics::counter<uint64_t>* m_plan_builds{nullptr};
 
 }; // class fft

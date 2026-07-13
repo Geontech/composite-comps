@@ -94,7 +94,7 @@ class work {};
 
 template <>
 class work<float> {
-    using cplx_data_type = composite::mutable_buffer<std::complex<float>>;
+    using cplx_data_type = composite::immutable_buffer<std::complex<float>>;
     using real_data_type = composite::mutable_buffer<float>;
     static constexpr std::size_t ALIGNMENT = 64;
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(float)};
@@ -114,17 +114,17 @@ public:
     explicit work(float normalization_const) : m_norm_const(normalization_const) {}
 
     auto norm_const() const noexcept -> float {
-        return m_norm_const.load(std::memory_order_relaxed);
+        return m_norm_const;
     }
 
     auto norm_const(float val) -> void {
-        m_norm_const.store(val, std::memory_order_relaxed);
+        m_norm_const = val;
     }
 
     [[gnu::target("default")]]
-    auto process(cplx_data_type& data) -> real_data_type {
+    auto process(const cplx_data_type& data) -> real_data_type {
         // Make output data
-        auto psd = composite::make_aligned_buffer<float>(ALIGNMENT, data.size());
+        auto psd = composite::make_aligned_buffer_uninitialized<float>(ALIGNMENT, data.size());
         // Process data
         for (auto i = 0u; i < data.size(); ++i) {
             const auto& val = data[i];
@@ -135,7 +135,7 @@ public:
     }
 
     [[gnu::target("avx512f")]]
-    auto process(cplx_data_type& data) -> real_data_type {
+    auto process(const cplx_data_type& data) -> real_data_type {
         // Constant registers
         static const auto unscramble_idx = _mm512_set_epi32(15,14,11,10,7,6,3,2,13,12,9,8,5,4,1,0);
         static const auto v_log_const = _mm512_set1_ps(log_const);
@@ -152,10 +152,10 @@ public:
         static const auto v_neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
         static const auto v_nan = _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN());
         const auto v_norm_const = _mm512_set1_ps(m_norm_const);
-        const auto norm_const_scalar = m_norm_const.load(std::memory_order_relaxed);
+        const auto norm_const_scalar = m_norm_const;
 
         // Make output data
-        auto psd = composite::make_aligned_buffer<float>(ALIGNMENT, data.size());
+        auto psd = composite::make_aligned_buffer_uninitialized<float>(ALIGNMENT, data.size());
 
         // Process data in SIMD chunks
         const auto simd_end = data.size() - (data.size() % STRIDE_512);
@@ -237,7 +237,7 @@ public:
     }
 
     [[gnu::target("avx2,fma")]]
-    auto process(cplx_data_type& data) -> real_data_type {
+    auto process(const cplx_data_type& data) -> real_data_type {
         // Constant registers
         static const auto unscramble_idx_256 = _mm256_set_epi32(7,6,3,2,5,4,1,0);
         static const auto v_log_const_256 = _mm256_set1_ps(log_const);
@@ -254,10 +254,10 @@ public:
         static const auto v_neg_inf_256 = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
         static const auto v_nan_256 = _mm256_set1_ps(std::numeric_limits<float>::quiet_NaN());
         const auto v_norm_const_256 = _mm256_set1_ps(m_norm_const);
-        const auto norm_const_scalar = m_norm_const.load(std::memory_order_relaxed);
+        const auto norm_const_scalar = m_norm_const;
 
         // Make output data
-        auto psd = composite::make_aligned_buffer<float>(ALIGNMENT, data.size());
+        auto psd = composite::make_aligned_buffer_uninitialized<float>(ALIGNMENT, data.size());
 
         // Process data in SIMD chunks
         const auto simd_end = data.size() - (data.size() % STRIDE_256);
@@ -323,13 +323,13 @@ public:
     }
 
 private:
-    std::atomic<float> m_norm_const{1};
+    float m_norm_const{1};
 
 }; // class work<float>
 
 template <>
 class work<double> {
-    using cplx_data_type = composite::mutable_buffer<std::complex<double>>;
+    using cplx_data_type = composite::immutable_buffer<std::complex<double>>;
     using real_data_type = composite::mutable_buffer<double>;
     static constexpr std::size_t ALIGNMENT = 64;
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(double)};
@@ -349,17 +349,17 @@ public:
     explicit work(double normalization_const) : m_norm_const(normalization_const) {}
 
     auto norm_const() const noexcept -> double {
-        return m_norm_const.load(std::memory_order_relaxed);
+        return m_norm_const;
     }
 
     auto norm_const(double val) -> void {
-        m_norm_const.store(val, std::memory_order_relaxed);
+        m_norm_const = val;
     }
 
     [[gnu::target("default")]]
-    auto process(cplx_data_type& data) -> real_data_type {
+    auto process(const cplx_data_type& data) -> real_data_type {
         // Make output data
-        auto psd = composite::make_aligned_buffer<double>(ALIGNMENT, data.size());
+        auto psd = composite::make_aligned_buffer_uninitialized<double>(ALIGNMENT, data.size());
         // Process data
         for (auto i = 0u; i < data.size(); ++i) {
             const auto& val = data[i];
@@ -370,7 +370,7 @@ public:
     }
 
     [[gnu::target("avx512f,avx512dq")]]
-    auto process(cplx_data_type& data) -> real_data_type {
+    auto process(const cplx_data_type& data) -> real_data_type {
         // Constant registers
         static const auto unscramble_idx = _mm512_set_epi64(7,5,3,1,6,4,2,0);
         static const auto v_log_const = _mm512_set1_pd(log_const);
@@ -387,10 +387,10 @@ public:
         static const auto v_neg_inf = _mm512_set1_pd(-std::numeric_limits<double>::infinity());
         static const auto v_nan = _mm512_set1_pd(std::numeric_limits<double>::quiet_NaN());
         const auto v_norm_const = _mm512_set1_pd(m_norm_const);
-        const auto norm_const_scalar = m_norm_const.load(std::memory_order_relaxed);
+        const auto norm_const_scalar = m_norm_const;
 
         // Make output data
-        auto psd = composite::make_aligned_buffer<double>(ALIGNMENT, data.size());
+        auto psd = composite::make_aligned_buffer_uninitialized<double>(ALIGNMENT, data.size());
 
         // Process data in SIMD chunks
         const auto simd_end = data.size() - (data.size() % STRIDE_512);
@@ -455,6 +455,6 @@ public:
     }
 
 private:
-    std::atomic<double> m_norm_const{1};
+    double m_norm_const{1};
 
 }; // class work<double>

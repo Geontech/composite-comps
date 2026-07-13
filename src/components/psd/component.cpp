@@ -37,6 +37,7 @@ psd<T>::psd(std::string_view id)
     // num_workers is provided by pipeline_component.
     this->add_property("power_based_normalization", m_power_based_normalization, RUNTIME);
     m_pbn.store(m_power_based_normalization, std::memory_order_relaxed);
+    m_bad_metadata = &this->create_counter("psd.bad_metadata", "Packets with an unparseable fft_size annotation");
 }
 
 template <typename T>
@@ -76,7 +77,7 @@ auto psd<T>::compute_norm_const(const window_t* window, T sample_rate, bool powe
 }
 
 template <typename T>
-auto psd<T>::work(composite::mutable_buffer<std::complex<T>> in, composite::timestamp ts,
+auto psd<T>::work(composite::immutable_buffer<std::complex<T>> in, composite::timestamp ts,
                   const composite::metadata& md) -> composite::mutable_buffer<T> {
     (void)ts;
     // Per-pool-worker state: the window + PSD kernel for this worker, rebuilt only when the FFT
@@ -93,7 +94,10 @@ auto psd<T>::work(composite::mutable_buffer<std::complex<T>> in, composite::time
     std::size_t fft_size{0};
     std::string wtype;
     if (md.annotations.contains("fft_size")) {
-        try { fft_size = std::stoul(md.annotations.at("fft_size").to_string()); } catch (...) {}
+        // Present-but-unparseable is malformed upstream metadata (an absent annotation is a valid
+        // no-window request, so it is NOT counted); surface it rather than silently falling back.
+        try { fft_size = std::stoul(md.annotations.at("fft_size").to_string()); }
+        catch (...) { m_bad_metadata->inc(); }
     }
     if (md.annotations.contains("fft_window")) {
         wtype = md.annotations.at("fft_window").to_string();

@@ -20,6 +20,9 @@
 #include "work.hpp"
 
 #include <composite/core/component.hpp>
+#include <composite/metrics/metrics.hpp>
+
+#include <cstdint>
 
 template <typename T>
 class exp_smooth : public composite::component {
@@ -43,10 +46,15 @@ private:
 
     // Members
     std::optional<T> m_alpha;
-    std::unique_ptr<work<T>> m_work;
+    std::optional<work<T>> m_work;  // in-place: work<T> holds only a scalar, no heap indirection
     typename input_port_t::buffer_type m_prev_psd;
     composite::timestamp m_prev_psd_ts;
     composite::metadata_ptr m_prev_meta;  // metadata of m_prev_psd's source frame (rides its send)
+
+    // Observability: frame-size changes mid-stream (e.g. an upstream fft_size change) that force the
+    // EWMA to re-baseline rather than smooth. Shared registry, labeled by component id; auto-removed
+    // by ~component.
+    composite::metrics::counter<uint64_t>* m_size_mismatch{nullptr};
 
     // MUST be last: stops the framework worker before any member above destructs (the base
     // ~component stops too late). See component.hpp auto_stop.

@@ -30,11 +30,11 @@ int main() {
     comp->set_properties(json{{"power_based_normalization", true}, {"num_workers", 4}},
                          config_type::INITIALIZE);
 
-    auto* in  = comp->get_port<input_port<mutable_buffer<cf>>>("data_in");
+    auto* in  = comp->get_port<input_port<immutable_buffer<cf>>>("data_in");
     auto* out = comp->get_port<output_port<mutable_buffer<float>>>("data_out");
     if (in == nullptr || out == nullptr) { std::printf("FAIL: ports not found\n"); return 1; }
 
-    output_port<mutable_buffer<cf>> src("src");
+    output_port<immutable_buffer<cf>> src("src");
     input_port<mutable_buffer<float>> sink("snk");
     src.connect(in);
     out->connect(&sink);
@@ -51,7 +51,7 @@ int main() {
             md.sample_rate = 1.0e6;
             md.annotations["fft_size"]   = static_cast<std::int64_t>(N_SAMP);
             md.annotations["fft_window"] = std::string(wins[(i / 16) % 3]);  // vary -> per-worker window rebuild
-            src.send_data(std::move(buf), timestamp{static_cast<uint64_t>(i), 0}, md);
+            src.send_data(std::move(buf).to_immutable(), timestamp{static_cast<uint32_t>(i), 0}, md);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         done.store(true, std::memory_order_release);
@@ -65,7 +65,7 @@ int main() {
         auto [data, ts, md] = sink.get_data();
         if (data.size() != 0) {
             if (data.size() != N_SAMP) { size_ok = false; }
-            if (!md.has_value() || md->annotations.find("psd_power_based_normalization") == md->annotations.end()) { annot_ok = false; }
+            if (!md || md->annotations.find("psd_power_based_normalization") == md->annotations.end()) { annot_ok = false; }
             order.push_back(ts.seconds);
         } else {
             std::this_thread::yield();
