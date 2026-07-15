@@ -25,8 +25,8 @@
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/aligned_mem.hpp>
 #include <composite/metrics/metrics.hpp>
+#include <composite/properties/snapshot.hpp>
 
-#include <atomic>
 #include <complex>
 #include <cstdint>
 #include <memory>
@@ -74,11 +74,12 @@ private:
     auto copy_and_window(const composite::immutable_buffer<T>& input,
                          composite::mutable_buffer<T>& output, const window_t* window) -> void;
 
-    // #39: immutable per-task config snapshot. property_change_handler runs under park (the main
+    // Immutable per-task config snapshot. property_change_handler runs under park (the main
     // ingest/retire worker quiesced), but the POOL workers running work() do NOT park — so they
     // must not read the live config members (m_window free-while-used is a UAF; the scalar reads
-    // are torn). PCH builds a fresh snapshot and publishes it atomically; work() loads it, getting
-    // a consistent {fft_size, window, shift} and a window buffer kept alive by the shared_ptr.
+    // are torn). PCH builds a fresh value and publishes it through composite::snapshot; work()
+    // loads it, getting a consistent {fft_size, window, shift} and a window buffer kept alive by
+    // the returned shared_ptr.
     struct task_config {
         std::size_t fft_size{1024};
         bool shift{true};
@@ -95,7 +96,7 @@ private:
     uint32_t m_fftw_threads{1};
     bool m_shift{true};
 
-    std::atomic<std::shared_ptr<const task_config>> m_task_cfg{};
+    composite::snapshot<task_config> m_task_cfg;
 
     // Observability (shared metrics registry, labeled by component id; auto-removed by ~component).
     // frames_dropped: packets rejected in work() for a frame-size/fft_size mismatch (else only

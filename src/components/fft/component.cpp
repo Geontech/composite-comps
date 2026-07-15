@@ -58,7 +58,7 @@ fft<T>::fft(std::string_view id)
 
     // Publish an initial snapshot so a pool worker always loads a valid config even if no
     // properties are set before start() (property_change_handler republishes on every change).
-    m_task_cfg.store(make_task_config());
+    m_task_cfg.publish(make_task_config());
 }
 
 template <typename T>
@@ -81,7 +81,7 @@ auto fft<T>::property_change_handler(const composite::properties::json& diff) ->
     // flight keep their previously-loaded snapshot alive, so the old window is freed only once the
     // last worker using it finishes — no use-after-free even though the pool is not parked. (A
     // num_workers change is applied separately by pipeline_component.)
-    m_task_cfg.store(make_task_config());
+    m_task_cfg.publish(make_task_config());
     // prepare() stamps fft_size/fft_window from this snapshot onto the shared metadata; tell
     // the pipeline to rebuild it even though the incoming metadata instance is unchanged.
     this->invalidate_prepared_metadata();
@@ -284,9 +284,9 @@ COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_arg
                                  -> std::shared_ptr<composite::component> {
     const auto type = args.type();
     if (type == "cf32") {
-        return std::make_shared<fft<std::complex<float>>>(id);
+        return composite::make_component<fft<std::complex<float>>>(id);
     } else if (type == "cf64") {
-        return std::make_shared<fft<std::complex<double>>>(id);
+        return composite::make_component<fft<std::complex<double>>>(id);
     }
     throw std::runtime_error(std::format("unknown type '{}' for fft component", type));
 })

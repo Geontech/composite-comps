@@ -25,8 +25,8 @@
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/aligned_mem.hpp>
 #include <composite/metrics/metrics.hpp>
+#include <composite/properties/snapshot.hpp>
 
-#include <atomic>
 #include <complex>
 #include <cstdint>
 #include <memory>
@@ -66,9 +66,9 @@ private:
     static auto compute_norm_const(const window_t* window, T sample_rate, bool power_based) -> T;
 
     // Properties (num_workers is owned by pipeline_component). power_based_normalization is written
-    // by the engine under park; work() (pool threads, not parked) reads the m_pbn atomic snapshot.
+    // by the engine under park; work() (pool threads, not parked) reads the published snapshot.
     bool m_power_based_normalization{true};
-    std::atomic<bool> m_pbn{true};
+    composite::snapshot<bool> m_pbn{true};
 
     // Observability: packets whose fft_size annotation was present but unparseable (a malformed
     // upstream metadata that would otherwise silently fall back to a no-window PSD). In the shared

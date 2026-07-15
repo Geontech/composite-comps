@@ -394,9 +394,9 @@ COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_arg
                                  -> std::shared_ptr<composite::component> {
     const auto type = args.type();
     if (type == "cf32") {
-        return std::make_shared<framer<std::complex<float>>>(id);
+        return composite::make_component<framer<std::complex<float>>>(id);
     } else if (type == "ci16") {
-        return std::make_shared<framer<std::complex<int16_t>>>(id);
+        return composite::make_component<framer<std::complex<int16_t>>>(id);
     }
     throw std::runtime_error(std::format("unknown type '{}' for framer component", type));
 })

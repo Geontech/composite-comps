@@ -36,7 +36,7 @@ psd<T>::psd(std::string_view id)
     using enum composite::properties::config_type;
     // num_workers is provided by pipeline_component.
     this->add_property("power_based_normalization", m_power_based_normalization, RUNTIME);
-    m_pbn.store(m_power_based_normalization, std::memory_order_relaxed);
+    m_pbn.publish(m_power_based_normalization);
     m_bad_metadata = &this->create_counter("psd.bad_metadata", "Packets with an unparseable fft_size annotation");
 }
 
@@ -45,7 +45,7 @@ auto psd<T>::property_change_handler(const composite::properties::json& diff) ->
     (void)diff;
     // Publish the config snapshot read by the pool's work() (pool threads are not parked). A
     // num_workers change is handled separately by pipeline_component.
-    m_pbn.store(m_power_based_normalization, std::memory_order_relaxed);
+    m_pbn.publish(m_power_based_normalization);
     // prepare() stamps the normalization mode onto the shared metadata; tell the pipeline to
     // rebuild it even though the incoming metadata instance is unchanged.
     this->invalidate_prepared_metadata();
@@ -54,8 +54,7 @@ auto psd<T>::property_change_handler(const composite::properties::json& diff) ->
 template <typename T>
 auto psd<T>::prepare(composite::metadata& md) -> void {
     // ARRIVAL order, main thread: record the normalization mode (from the snapshot) on the metadata.
-    md.annotations["psd_power_based_normalization"] =
-        std::to_string(m_pbn.load(std::memory_order_relaxed));
+    md.annotations["psd_power_based_normalization"] = std::to_string(*m_pbn.load());
 }
 
 template <typename T>
@@ -103,7 +102,7 @@ auto psd<T>::work(composite::immutable_buffer<std::complex<T>> in, composite::ti
         wtype = md.annotations.at("fft_window").to_string();
     }
     const T sample_rate = static_cast<T>(md.sample_rate);
-    const bool pbn = m_pbn.load(std::memory_order_relaxed);
+    const bool pbn = *m_pbn.load();
 
     // Rebuild the window only when (size, type) changes.
     if (!tl_have_key || fft_size != tl_size || wtype != tl_wtype) {
@@ -136,9 +135,9 @@ COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_arg
                                  -> std::shared_ptr<composite::component> {
     const auto type = args.type();
     if (type == "f32") {
-        return std::make_shared<psd<float>>(id);
+        return composite::make_component<psd<float>>(id);
     } else if (type == "f64") {
-        return std::make_shared<psd<double>>(id);
+        return composite::make_component<psd<double>>(id);
     }
     throw std::runtime_error(std::format("unknown type '{}' for psd component", type));
 })

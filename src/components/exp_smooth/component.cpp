@@ -109,9 +109,9 @@ COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_arg
                                  -> std::shared_ptr<composite::component> {
     const auto type = args.type();
     if (type == "f32") {
-        return std::make_shared<exp_smooth<float>>(id);
+        return composite::make_component<exp_smooth<float>>(id);
     } else if (type == "f64") {
-        return std::make_shared<exp_smooth<double>>(id);
+        return composite::make_component<exp_smooth<double>>(id);
     }
     throw std::runtime_error(std::format("unknown type '{}' for exp_smooth component", type));
 })

@@ -623,13 +623,13 @@ COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_arg
                                  -> std::shared_ptr<composite::component> {
     const auto type = args.type();
     if (type == "f32") {
-        return std::make_shared<ws_sink<float>>(id);
+        return composite::make_component<ws_sink<float>>(id);
     } else if (type == "cf32") {
-        return std::make_shared<ws_sink<std::complex<float>>>(id);
+        return composite::make_component<ws_sink<std::complex<float>>>(id);
     } else if (type == "f64") {
-        return std::make_shared<ws_sink<double>>(id);
+        return composite::make_component<ws_sink<double>>(id);
     } else if (type == "cf64") {
-        return std::make_shared<ws_sink<std::complex<double>>>(id);
+        return composite::make_component<ws_sink<std::complex<double>>>(id);
     }
     throw std::runtime_error(
         std::format("unknown type '{}' for ws_sink component (supported: f32, cf32, f64, cf64)", type));
