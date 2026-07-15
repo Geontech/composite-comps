@@ -61,9 +61,15 @@ public:
     explicit udp_source(std::string_view id);
     ~udp_source() override = default;
     auto property_change_handler(const composite::properties::json& diff) -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
     auto process() -> composite::retval override;
+
+protected:
+    // The receiver and the stats thread are worker-scoped resources, so they hang off the
+    // framework's worker lifecycle hooks (start()/stop() are final). The hooks run on EVERY
+    // start/stop path — including the application/REST enabled-reconcile, which the old
+    // start()/stop() overrides were bypassed by (a REST disable left the receiver running).
+    auto on_worker_start() -> void override;
+    auto on_worker_stop() -> void override;
 
 private:
     // Ports

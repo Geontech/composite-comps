@@ -147,8 +147,7 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
     }
 }
 
-auto udp_source::start() -> void {
-    component::start();
+auto udp_source::on_worker_start() -> void {
     {
         std::scoped_lock lock(m_receiver_mtx);
         m_component_running = true;
@@ -187,7 +186,7 @@ auto udp_source::start() -> void {
     }
 }
 
-auto udp_source::stop() -> void {
+auto udp_source::on_worker_stop() -> void {
     {
         std::scoped_lock lock(m_receiver_mtx);
         stop_receiver_locked();
@@ -197,7 +196,6 @@ auto udp_source::stop() -> void {
     if (m_stat_thread.joinable()) {
         m_stat_thread.join();
     }
-    component::stop();
 }
 
 auto udp_source::process() -> composite::retval {
