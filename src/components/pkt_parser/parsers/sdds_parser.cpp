@@ -42,7 +42,15 @@ namespace {
 } // anonymous namespace
 
 sdds_parser::sdds_parser(const struct_props::signal_overrides& overrides)
-    : m_overrides(overrides) {}
+    : m_overrides(overrides) {
+    // SDDS is big-endian per spec, but honor an explicit endianness override for receivers
+    // that emit little-endian samples (resolved once, not re-parsed per packet).
+    if (m_overrides.data_format.endianness == "little") {
+        m_ov_endianness = std::endian::little;
+    } else if (m_overrides.data_format.endianness == "big") {
+        m_ov_endianness = std::endian::big;
+    }
+}
 
 auto sdds_parser::can_parse(const composite::immutable_buffer<uint8_t>& data) const -> bool {
     // SDDS packets are exactly 1080 bytes (56 header + 1024 payload)
@@ -100,11 +108,13 @@ auto sdds_parser::parse(
     m_pkt_count = seq_num;
 
     // Effective metadata this packet carries (extraction + the constant overrides). SDDS is
-    // always signed / big-endian; center_frequency and bandwidth come only from overrides
-    // (otherwise carried from the current metadata).
+    // signed and big-endian per spec (endianness overridable for non-conforming receivers);
+    // center_frequency and bandwidth come only from overrides (otherwise carried from the
+    // current metadata).
     const bool eff_complex = m_overrides.data_format.is_complex.value_or(packet.complex());
     const uint32_t eff_bps = packet.bps();
     const double eff_sr = m_overrides.sample_rate.value_or(packet.sample_rate());
+    const std::endian eff_endianness = m_ov_endianness.value_or(std::endian::big);
 
     // Rebuild metadata ONLY when it actually differs from the last published value
     // (current_metadata), or on the first packet after (re)activation. Steady state does no
@@ -113,7 +123,7 @@ auto sdds_parser::parse(
         || current_metadata.format.is_complex != eff_complex
         || current_metadata.format.type != composite::data_type::signed_integer
         || current_metadata.format.bit_width != eff_bps
-        || current_metadata.format.endianness != std::endian::big
+        || current_metadata.format.endianness != eff_endianness
         || current_metadata.sample_rate != eff_sr;
     if (m_overrides.center_frequency.has_value()) {
         changed = changed || current_metadata.center_frequency != *m_overrides.center_frequency;
@@ -125,7 +135,7 @@ auto sdds_parser::parse(
         result.metadata = current_metadata;
         result.metadata.format.is_complex = eff_complex;
         result.metadata.format.type = composite::data_type::signed_integer;
-        result.metadata.format.endianness = std::endian::big;
+        result.metadata.format.endianness = eff_endianness;
         result.metadata.format.bit_width = eff_bps;
         result.metadata.sample_rate = eff_sr;
         if (m_overrides.center_frequency.has_value()) {

@@ -22,7 +22,9 @@
 #include "protocol_parser.hpp"
 #include "config.hpp"
 
+#include <bit>
 #include <cstdint>
+#include <optional>
 
 namespace parsers {
 
@@ -50,6 +52,7 @@ public:
 
 private:
     struct_props::signal_overrides m_overrides;
+    std::optional<std::endian> m_ov_endianness;
     uint16_t m_pkt_count{0};
     bool m_emitted{false};  ///< false until this parser has published metadata since (re)activation
 
