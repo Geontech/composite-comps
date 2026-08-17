@@ -101,14 +101,14 @@ struct config {
     std::size_t autodiscovery_timeout{10};
 
     /**
-     * Adaptive recvmmsg coalescing controls. A target of zero selects 75% of batch_size.
-     * The receive thread estimates the stream packet rate and waits long enough after an
-     * empty-to-readable transition to build approximately this many queued datagrams.
+     * recvmmsg batching controls. Once the socket is readable, receive_batch_wait_us gives
+     * additional datagrams a fixed window to accumulate in the kernel. Received packets are
+     * then retained across calls until output_batch_size is reached or the oldest packet has
+     * waited max_batch_delay_us. A batch size of zero selects batch_size (num_msgs).
      */
-    std::size_t coalesce_target_batch{};
-    std::size_t min_coalesce_us{};
-    std::size_t max_coalesce_us{};
-    std::size_t adaptation_interval_ms{250};
+    std::size_t receive_batch_wait_us{100};
+    std::size_t output_batch_size{};
+    std::size_t max_batch_delay_us{1000};
 
     /**
      * @brief Optional metrics for the receiver.

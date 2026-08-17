@@ -113,10 +113,9 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
         .batch_size = m_num_msgs,
         .frame_count = m_frame_count,
         .autodiscovery_timeout = m_autodiscovery_timeout,
-        .coalesce_target_batch = m_recvmmsg.target_batch,
-        .min_coalesce_us = m_recvmmsg.min_coalesce_us,
-        .max_coalesce_us = m_recvmmsg.max_coalesce_us,
-        .adaptation_interval_ms = m_recvmmsg.adaptation_interval_ms,
+        .receive_batch_wait_us = m_recvmmsg.receive_batch_wait_us,
+        .output_batch_size = m_recvmmsg.output_batch_size,
+        .max_batch_delay_us = m_recvmmsg.max_batch_delay_us,
         .metrics = create_metrics()
     };
     if (m_overrides.msg_size.has_value()) {

@@ -46,12 +46,11 @@ struct dpdk_config {
 }; // struct dpdk_config
 
 struct recvmmsg_config {
-    // Zero selects 75% of num_msgs. Leaving headroom lets a delayed wakeup absorb jitter
-    // without immediately filling the receive vector and requiring another syscall.
-    uint32_t target_batch{};
-    uint32_t min_coalesce_us{};
-    uint32_t max_coalesce_us{};
-    uint32_t adaptation_interval_ms{250};
+    // Zero selects num_msgs. Partial batches are retained across receive calls and
+    // published when either this size or max_batch_delay_us is reached.
+    uint32_t receive_batch_wait_us{100};
+    uint32_t output_batch_size{};
+    uint32_t max_batch_delay_us{1000};
 }; // struct recvmmsg_config
 
 } // namespace struct_props
@@ -60,7 +59,7 @@ COMPOSITE_STRUCT(struct_props::overrides, msg_size);
 COMPOSITE_STRUCT(struct_props::dpdk_config,
     port_id, queue_id, mempool_name, burst_size, igmp_respond_to_queries, src_ip);
 COMPOSITE_STRUCT(struct_props::recvmmsg_config,
-    target_batch, min_coalesce_us, max_coalesce_us, adaptation_interval_ms);
+    receive_batch_wait_us, output_batch_size, max_batch_delay_us);
 
 class udp_source : public composite::component {
     static constexpr std::string_view RECVMMSG = "recvmmsg";

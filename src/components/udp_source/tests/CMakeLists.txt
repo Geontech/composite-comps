@@ -17,9 +17,7 @@
 # along with this program.  If not, see http://www.gnu.org/licenses/.
 #
 
-# Deterministic unit tests for the adaptive recvmmsg coalescing policy. The controller is a
-# pure, clock-injected header, so these simulate steady, bursty, drop, occupancy, full-vector,
-# and downstream-stall scenarios without sockets or threads.
+# Deterministic unit tests for the fixed-window recvmmsg batching policy.
 
 include(FetchContent)
 FetchContent_Declare(
@@ -29,26 +27,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(Catch2)
 
-add_executable(coalesce_controller_tests
-    coalesce_controller_tests.cpp
+add_executable(receive_batch_policy_tests
+    receive_batch_policy_tests.cpp
 )
-target_link_libraries(coalesce_controller_tests
+target_link_libraries(receive_batch_policy_tests
     PRIVATE
         Catch2::Catch2WithMain
 )
-target_include_directories(coalesce_controller_tests
+target_include_directories(receive_batch_policy_tests
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
-target_compile_features(coalesce_controller_tests PRIVATE cxx_std_23)
+target_compile_features(receive_batch_policy_tests PRIVATE cxx_std_23)
 
 include(CTest)
 list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
 include(Catch)
-catch_discover_tests(coalesce_controller_tests)
+catch_discover_tests(receive_batch_policy_tests TEST_PREFIX "receive_batch_policy: ")
 
 install(TARGETS
-    coalesce_controller_tests
+    receive_batch_policy_tests
     RUNTIME DESTINATION bin/tests
     OPTIONAL
 )

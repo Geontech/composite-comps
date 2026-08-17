@@ -20,7 +20,7 @@
 #include <composite/buffers/external_buffer.hpp>
 
 #include "net/utils.hpp"
-#include "coalesce_controller.hpp"
+#include "receive_batch_policy.hpp"
 #include "recvmmsg.hpp"
 
 #include <arpa/inet.h>
@@ -49,10 +49,9 @@ recvmmsg::recvmmsg(const config& config) :
   interface(config.logger, config.metrics),
   m_frame_count(config.frame_count),
   m_autodiscovery_timeout(config.autodiscovery_timeout),
-  m_coalesce_target_batch(config.coalesce_target_batch),
-  m_min_coalesce(std::chrono::microseconds(config.min_coalesce_us)),
-  m_max_coalesce(std::chrono::microseconds(config.max_coalesce_us)),
-  m_adaptation_interval(std::chrono::milliseconds(config.adaptation_interval_ms)),
+  m_receive_batch_wait(std::chrono::microseconds(config.receive_batch_wait_us)),
+  m_output_batch_size(config.output_batch_size),
+  m_max_batch_delay(std::chrono::microseconds(config.max_batch_delay_us)),
   m_recv_buf_explicit(config.recv_buf_size > 0) {
     // Create socket
     m_logger->trace("opening udp socket");
@@ -83,8 +82,7 @@ recvmmsg::recvmmsg(const config& config) :
                             config.recv_buf_size, m_effective_recv_buf);
         }
     } else {
-        m_logger->debug("using system-default SO_RCVBUF (effective={} bytes); adaptive recvmmsg "
-                        "coalescing is disabled unless recv_buf_size is explicitly configured",
+        m_logger->debug("using system-default SO_RCVBUF (effective={} bytes)",
                         m_effective_recv_buf);
     }
 
@@ -223,51 +221,23 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
     if (m_batch_size == 0) {
         throw std::runtime_error("recvmmsg frame_count and batch_size must be greater than zero");
     }
-    if (m_max_coalesce < m_min_coalesce) {
-        m_logger->warn("recvmmsg min_coalesce_us exceeds max_coalesce_us; clamping the minimum");
-        m_min_coalesce = m_max_coalesce;
-    }
-    if (m_adaptation_interval <= std::chrono::milliseconds::zero()) {
-        m_adaptation_interval = std::chrono::milliseconds(250);
-    }
-
-    // Linux charges receive-buffer space by skb allocation, not UDP payload bytes. Use a
-    // deliberately conservative power-of-two charge estimate and reserve 75% of SO_RCVBUF for
-    // scheduler jitter, drain work, and bursts outside the intentional coalescing window.
+    // Linux charges receive-buffer space by skb allocation, not UDP payload bytes. Keep the
+    // conservative estimate as useful operational telemetry even though this implementation no
+    // longer deliberately accumulates packets in the kernel socket queue.
     m_conservative_packet_charge = std::max<std::size_t>(
         4096, std::bit_ceil(m_frame_size + std::size_t{1024}));
-    const auto safe_packet_budget = m_effective_recv_buf / 4 / m_conservative_packet_charge;
-    auto requested_target = m_coalesce_target_batch == 0
-        ? (m_batch_size * 3) / 4 : m_coalesce_target_batch;
-    requested_target = std::clamp(requested_target, std::size_t{1}, m_batch_size);
-
-    if (m_max_coalesce > std::chrono::microseconds::zero() && !m_recv_buf_explicit) {
-        m_logger->warn("adaptive recvmmsg coalescing requested without an explicit recv_buf_size; "
-                       "disabling coalescing to protect the system-default socket buffer");
-        m_max_coalesce = std::chrono::microseconds::zero();
-        m_min_coalesce = std::chrono::microseconds::zero();
+    if (m_output_batch_size == 0) { m_output_batch_size = m_batch_size; }
+    m_output_batch_size = std::clamp(
+        m_output_batch_size, std::size_t{1}, std::max<std::size_t>(1, m_frame_count));
+    constexpr auto MAX_RECEIVE_BATCH_WAIT = std::chrono::microseconds(5000);
+    if (m_receive_batch_wait > MAX_RECEIVE_BATCH_WAIT) {
+        m_logger->warn("recvmmsg receive_batch_wait_us {} exceeds the 5000 us safety limit; "
+                       "clamping it", m_receive_batch_wait.count());
+        m_receive_batch_wait = MAX_RECEIVE_BATCH_WAIT;
     }
-    if (m_max_coalesce > std::chrono::microseconds::zero() && safe_packet_budget < 2) {
-        m_logger->warn("effective SO_RCVBUF ({}) is too small for safe adaptive coalescing; disabling it",
-                       m_effective_recv_buf);
-        m_max_coalesce = std::chrono::microseconds::zero();
-        m_min_coalesce = std::chrono::microseconds::zero();
-    }
-    m_coalesce_target_batch = m_max_coalesce > std::chrono::microseconds::zero()
-        ? std::min(requested_target, safe_packet_budget)
-        : std::size_t{1};
-    if (m_max_coalesce > std::chrono::microseconds::zero()
-        && m_coalesce_target_batch < requested_target) {
-        m_logger->warn("recvmmsg target_batch {} exceeds the 25% SO_RCVBUF safety budget; "
-                       "clamping target to {}", requested_target, m_coalesce_target_batch);
-    }
-    if (m_max_coalesce > std::chrono::microseconds::zero()
-        && m_coalesce_target_batch > m_batch_size / 2) {
-        m_logger->warn("recvmmsg target_batch {} exceeds half the receive vector ({}); the "
-                       "adaptive delay is capped at the half-vector fill time so scheduling "
-                       "jitter cannot routinely fill the vector. Raise num_msgs for more "
-                       "coalescing headroom", m_coalesce_target_batch, m_batch_size);
-    }
+    m_logger->debug("recvmmsg fixed batching: receive_wait_us={}, output_batch_size={}, "
+                    "max_delay_us={}", m_receive_batch_wait.count(), m_output_batch_size,
+                    m_max_batch_delay.count());
     m_out_port = port;
     clear_stop_signal();
     m_recv_thread = std::jthread(&recvmmsg::receive, this);
@@ -300,8 +270,8 @@ auto recvmmsg::clear_stop_signal() noexcept -> void {
 }
 
 auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
-    // Pull socket-memory diagnostics on the low-rate stats path as well as the adaptive receive
-    // path. This keeps the default (coalescing-disabled) hot path free of extra getsockopt calls.
+    // Pull socket-memory diagnostics on the low-rate stats path as well as the periodic receive
+    // path, so reports retain visibility even while the source is idle.
     std::array<uint32_t, SK_MEMINFO_VARS> memory{};
     socklen_t memory_len = sizeof(memory);
     if (::getsockopt(m_socket, SOL_SOCKET, SO_MEMINFO, memory.data(), &memory_len) == 0) {
@@ -318,10 +288,16 @@ auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
     auto stats = std::map<std::string, std::string>{};
     stats["pkts_recvd"] = std::to_string(m_pkts_recvd.load());
     stats["recv_syscalls"] = std::to_string(m_recv_syscalls.load());
-    stats["estimated_pps"] = std::to_string(m_estimated_pps.load());
-    stats["coalesce_us"] = std::to_string(m_coalesce_us.load());
-    stats["nominal_coalesce_us"] = std::to_string(m_nominal_coalesce_us.load());
-    stats["coalesce_target_batch"] = std::to_string(m_coalesce_target_batch);
+    stats["wait_syscalls"] = std::to_string(m_wait_syscalls.load());
+    stats["total_receive_syscalls"] = std::to_string(
+        m_recv_syscalls.load() + m_wait_syscalls.load());
+    stats["full_receive_vectors"] = std::to_string(m_full_receive_vectors.load());
+    stats["receive_batch_wait_us"] = std::to_string(m_receive_batch_wait.count());
+    stats["output_batch_size"] = std::to_string(m_output_batch_size);
+    stats["max_batch_delay_us"] = std::to_string(m_max_batch_delay.count());
+    stats["output_batches"] = std::to_string(m_output_batches.load());
+    stats["partial_batch_flushes"] = std::to_string(m_partial_batch_flushes.load());
+    stats["pending_output_packets"] = std::to_string(m_pending_output_packets.load());
     stats["effective_recv_buf"] = std::to_string(m_effective_recv_buf);
     stats["estimated_packet_charge"] = std::to_string(m_conservative_packet_charge);
     stats["socket_rmem_bytes"] = std::to_string(m_socket_rmem_bytes.load());
@@ -330,27 +306,8 @@ auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
     stats["socket_rmem_peak_bytes"] = std::to_string(
         m_socket_rmem_peak_bytes.exchange(0, std::memory_order_relaxed));
     stats["kernel_drops"] = std::to_string(m_kernel_drops.load());
-    stats["congest_full_vector"] = std::to_string(m_congest_full_vector.load());
     stats["congest_pool_stall"] = std::to_string(m_congest_pool_stall.load());
-    stats["congest_kernel_drop"] = std::to_string(m_congest_kernel_drop.load());
-    stats["congest_rmem_pressure"] = std::to_string(m_congest_rmem_pressure.load());
-    stats["latch_entries"] = std::to_string(m_latch_entries.load());
-    stats["latch_active"] = std::to_string(m_latch_active.load());
-    stats["latch_reason"] = std::string{coalesce_controller::to_string(
-        static_cast<coalesce_controller::congestion_reason>(m_latch_reason.load()))};
-    stats["latch_remaining_us"] = std::to_string(m_latch_remaining_us.load());
-    stats["idle_model_resets"] = std::to_string(m_idle_model_resets.load());
-    stats["zero_sleep_reason"] = std::string{coalesce_controller::to_string(
-        static_cast<coalesce_controller::zero_sleep_reason>(m_zero_sleep_reason.load()))};
     stats["pool_stall_backoff_us"] = std::to_string(m_pool_stall_backoff_us.load());
-    const auto interval_cycles = m_interval_cycles.load();
-    const auto interval_coalesced = m_interval_coalesced_cycles.load();
-    stats["interval_cycles"] = std::to_string(interval_cycles);
-    stats["interval_coalesced_pct"] = std::to_string(
-        interval_cycles > 0 ? interval_coalesced * 100 / interval_cycles : 0);
-    stats["interval_sleep_min_us"] = std::to_string(m_interval_sleep_min_us.load());
-    stats["interval_sleep_mean_us"] = std::to_string(m_interval_sleep_mean_us.load());
-    stats["interval_sleep_max_us"] = std::to_string(m_interval_sleep_max_us.load());
     if (m_pool) {
         stats["pool_capacity"] = std::to_string(m_pool->capacity());
         stats["pool_outstanding"] = std::to_string(m_pool->outstanding());
@@ -387,115 +344,127 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         return;
     }
 
-    // Pre-allocate structures for batch operations
+    using clock = receive_batch_policy::clock;
+    auto policy = receive_batch_policy(receive_batch_policy::settings{
+        .output_batch_size = m_output_batch_size,
+        .receive_vector_size = m_batch_size,
+        .receive_batch_wait = m_receive_batch_wait,
+        .max_batch_delay = m_max_batch_delay,
+    });
+
+    // The receive vector and the output accumulator are deliberately independent:
+    // num_msgs controls one recvmmsg call, while output_batch_size controls one ring publish.
     auto iovecs = std::vector<struct iovec>(m_batch_size);
     auto msgs = std::vector<struct mmsghdr>(m_batch_size);
     using buffer_opt_t = std::optional<composite::external_buffer<uint8_t>>;
     auto buffers = std::vector<buffer_opt_t>(m_batch_size);
+    auto acquired_buffers = std::vector<composite::external_buffer<uint8_t>>{};
+    acquired_buffers.reserve(m_batch_size);
     auto output_buffers = std::vector<composite::immutable_buffer<uint8_t>>{};
-    output_buffers.reserve(m_batch_size);
-    bool pool_stalled = false;
+    output_buffers.reserve(m_output_batch_size);
 
-    // Acquire buffers from pool and set up iovecs
-    auto acquire_buffer = [&](std::size_t idx) -> bool {
+    auto flush_output = [&](bool partial) {
+        if (output_buffers.empty()) { return; }
+        if (partial && m_max_batch_delay > std::chrono::microseconds::zero()
+            && output_buffers.size() < m_output_batch_size) {
+            m_partial_batch_flushes.fetch_add(1, std::memory_order_relaxed);
+        }
+        m_out_port->send_batch(output_buffers, {});
+        output_buffers.clear();
+        policy.note_batch_flushed();
+        m_pending_output_packets.store(0, std::memory_order_relaxed);
+        m_output_batches.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    auto prepare_slot = [&](std::size_t idx) {
+        msgs[idx] = {};
+        iovecs[idx].iov_base = buffers[idx]->data();
+        iovecs[idx].iov_len = buffers[idx]->size();
+        msgs[idx].msg_hdr.msg_iov = &iovecs[idx];
+        msgs[idx].msg_hdr.msg_iovlen = 1;
+    };
+
+    auto acquire_buffers = [&](std::size_t first, std::size_t count) -> bool {
         constexpr auto ACQUIRE_BACKOFF = std::chrono::microseconds(50);
-        std::optional<std::chrono::steady_clock::time_point> stall_start;
-        while (!token.stop_requested()) {
-            if (auto buf = m_pool->acquire()) {
-                buffers[idx] = std::move(buf);
-                iovecs[idx].iov_base = buffers[idx]->data();
-                iovecs[idx].iov_len = buffers[idx]->size();
-                msgs[idx].msg_hdr.msg_iov = &iovecs[idx];
-                msgs[idx].msg_hdr.msg_iovlen = 1;
-                msgs[idx].msg_hdr.msg_control = nullptr;
-                msgs[idx].msg_hdr.msg_controllen = 0;
-                msgs[idx].msg_hdr.msg_name = nullptr;
-                msgs[idx].msg_hdr.msg_namelen = 0;
-                msgs[idx].msg_len = 0;
-                if (stall_start) {
-                    m_pool_stall_backoff_us.fetch_add(static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - *stall_start).count()),
-                        std::memory_order_relaxed);
-                }
-                return true;
+        std::optional<clock::time_point> stall_start;
+        std::size_t filled = 0;
+        while (filled < count && !token.stop_requested()) {
+            acquired_buffers.clear();
+            const auto acquired = m_pool->acquire_batch(count - filled, acquired_buffers);
+            for (std::size_t i = 0; i < acquired; ++i) {
+                const auto idx = first + filled + i;
+                buffers[idx].emplace(std::move(acquired_buffers[i]));
+                prepare_slot(idx);
             }
+            filled += acquired;
+            if (filled == count) { break; }
             if (!stall_start) {
-                pool_stalled = true;
-                stall_start = std::chrono::steady_clock::now();
+                m_congest_pool_stall.fetch_add(1, std::memory_order_relaxed);
+                stall_start = clock::now();
+                // A partial userspace batch may itself hold the only buffers that can refill
+                // the receive vector (notably when frame_count == num_msgs). Publish it before
+                // waiting so output aggregation can never deadlock its own pool refill.
+                if (policy.flush_for(output_buffers.size(), clock::now(),
+                                     receive_batch_policy::event::pool_stall)
+                    == receive_batch_policy::flush_reason::pool_stall) {
+                    flush_output(true);
+                }
             }
             std::this_thread::sleep_for(ACQUIRE_BACKOFF);
         }
-        return false;
+        if (stall_start) {
+            m_pool_stall_backoff_us.fetch_add(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    clock::now() - *stall_start).count()),
+                std::memory_order_relaxed);
+        }
+        return filled == count;
     };
 
-    // Initial batch acquisition
-    for (std::size_t i = 0; i < m_batch_size; ++i) {
-        if (!acquire_buffer(i)) { return; }
-    }
-    pool_stalled = false; // initial pool population is not downstream congestion
-
-    using clock = std::chrono::steady_clock;
-    constexpr auto IDLE_RATE_RESET = std::chrono::seconds(1);
-
-    // The safety latch holds the actual sleep at zero for one adaptation window after the last
-    // safety signal: long enough to drain and re-observe a healthy socket, short enough that a
-    // transient event costs milliseconds of coalescing rather than an EWMA relearn. The learned
-    // nominal delay is retained across the latch (see coalesce_controller).
-    auto controller = coalesce_controller(
-        coalesce_controller::settings{
-            .target_batch = m_coalesce_target_batch,
-            .batch_size = m_batch_size,
-            .min_coalesce = m_min_coalesce,
-            .max_coalesce = m_max_coalesce,
-            .adaptation_interval = m_adaptation_interval,
-            .latch_hold = m_adaptation_interval,
-        },
-        clock::now());
+    if (!acquire_buffers(0, m_batch_size)) { return; }
     uint64_t recv_syscalls = 0;
-    const bool adaptive_enabled = m_max_coalesce > std::chrono::microseconds::zero();
+    uint64_t wait_syscalls = 0;
     std::optional<clock::time_point> last_receive_error_log;
     uint64_t suppressed_receive_errors = 0;
-    m_coalesce_us.store(0, std::memory_order_relaxed);
 
-    auto publish_controller = [&](clock::time_point now) {
-        const auto& counters = controller.counters();
-        m_estimated_pps.store(static_cast<uint64_t>(controller.estimated_pps()),
-                              std::memory_order_relaxed);
-        m_nominal_coalesce_us.store(static_cast<uint64_t>(controller.nominal_us()),
-                                    std::memory_order_relaxed);
-        m_congest_full_vector.store(counters.full_vector, std::memory_order_relaxed);
-        m_congest_pool_stall.store(counters.pool_stall, std::memory_order_relaxed);
-        m_congest_kernel_drop.store(counters.kernel_drop, std::memory_order_relaxed);
-        m_congest_rmem_pressure.store(counters.rmem_pressure, std::memory_order_relaxed);
-        m_latch_entries.store(counters.latch_entries, std::memory_order_relaxed);
-        m_idle_model_resets.store(counters.idle_resets, std::memory_order_relaxed);
-        m_latch_active.store(controller.latch_active(now) ? 1 : 0, std::memory_order_relaxed);
-        m_latch_reason.store(static_cast<uint8_t>(controller.latch_reason()),
-                             std::memory_order_relaxed);
-        m_latch_remaining_us.store(controller.latch_remaining_us(now),
-                                   std::memory_order_relaxed);
-        m_zero_sleep_reason.store(static_cast<uint8_t>(controller.zero_reason()),
-                                  std::memory_order_relaxed);
-        const auto& interval = controller.interval();
-        m_interval_cycles.store(interval.cycles, std::memory_order_relaxed);
-        m_interval_coalesced_cycles.store(interval.coalesced_cycles, std::memory_order_relaxed);
-        m_interval_sleep_min_us.store(interval.min_sleep_us, std::memory_order_relaxed);
-        m_interval_sleep_mean_us.store(interval.mean_sleep_us, std::memory_order_relaxed);
-        m_interval_sleep_max_us.store(interval.max_sleep_us, std::memory_order_relaxed);
+    enum class delay_result { expired, stopped, failed };
+    auto interruptible_delay = [&](std::chrono::microseconds delay) -> delay_result {
+        const auto deadline = clock::now() + delay;
+        while (!token.stop_requested()) {
+            const auto now = clock::now();
+            if (now >= deadline) { return delay_result::expired; }
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+            struct timespec timeout{
+                .tv_sec = static_cast<time_t>(ns.count() / 1'000'000'000),
+                .tv_nsec = static_cast<long>(ns.count() % 1'000'000'000)
+            };
+            struct pollfd stop_fd{.fd = m_stop_fd, .events = POLLIN, .revents = 0};
+            ++wait_syscalls;
+            m_wait_syscalls.store(wait_syscalls, std::memory_order_relaxed);
+            const auto result = ::ppoll(&stop_fd, 1, &timeout, nullptr);
+            if (result == 0) { return delay_result::expired; }
+            if (result > 0 && (stop_fd.revents & POLLIN)) { return delay_result::stopped; }
+            if (result < 0 && errno == EINTR) { continue; }
+            if (result < 0) {
+                m_logger->error("recvmmsg batch wait failed: {} (errno={})",
+                                std::string{strerror(errno)}, errno);
+                return delay_result::failed;
+            }
+        }
+        return delay_result::stopped;
     };
 
     struct socket_memory_snapshot {
         uint64_t allocated{};
-        uint64_t limit{};
         uint64_t drops{};
     };
     bool meminfo_supported = true;
     bool have_drop_baseline = false;
     uint64_t last_kernel_drops = 0;
+    auto last_safety_observe = clock::now();
 
     auto read_socket_memory = [&]() -> std::optional<socket_memory_snapshot> {
-        if (!adaptive_enabled || !meminfo_supported) { return std::nullopt; }
+        if (!meminfo_supported) { return std::nullopt; }
         std::array<uint32_t, SK_MEMINFO_VARS> values{};
         socklen_t len = sizeof(values);
         if (::getsockopt(m_socket, SOL_SOCKET, SO_MEMINFO, values.data(), &len) < 0) {
@@ -512,13 +481,10 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         }
         return socket_memory_snapshot{
             .allocated = values[SK_MEMINFO_RMEM_ALLOC],
-            .limit = count > SK_MEMINFO_RCVBUF
-                ? values[SK_MEMINFO_RCVBUF] : m_effective_recv_buf,
             .drops = count > SK_MEMINFO_DROPS ? values[SK_MEMINFO_DROPS] : last_kernel_drops
         };
     };
 
-    auto last_safety_observe = clock::now();
     auto observe_socket_memory = [&]() -> std::optional<socket_memory_snapshot> {
         last_safety_observe = clock::now();
         auto snapshot = read_socket_memory();
@@ -528,205 +494,179 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         m_kernel_drops.store(snapshot->drops, std::memory_order_relaxed);
         record_kernel_drop_snapshot(static_cast<uint32_t>(snapshot->drops));
 
-        const auto now = clock::now();
         if (have_drop_baseline && snapshot->drops != last_kernel_drops) {
             // SK_MEMINFO_DROPS is u32. Unsigned subtraction preserves the delta across its wrap
             // (assuming fewer than 2^32 drops between observations, which is unavoidable here).
             const auto delta = static_cast<uint32_t>(snapshot->drops)
                 - static_cast<uint32_t>(last_kernel_drops);
-            if (controller.enter_congestion(
-                    coalesce_controller::congestion_reason::kernel_drop, now)) {
-                m_logger->warn("UDP socket dropped {} packet(s); suspending coalescing "
-                               "(learned delay retained)", delta);
-            }
+            m_logger->warn("UDP socket dropped {} packet(s)", delta);
         }
         last_kernel_drops = snapshot->drops;
         have_drop_baseline = true;
-
-        if (snapshot->limit > 0) {
-            // Hysteresis: latch at 25% occupancy; while latched for occupancy, keep re-arming
-            // until it falls below 12.5% so boundary chatter cannot flap the latch.
-            const auto rmem_latched = controller.latch_active(now)
-                && controller.latch_reason()
-                    == coalesce_controller::congestion_reason::rmem_pressure;
-            const auto divisor = rmem_latched
-                ? coalesce_controller::RMEM_DIVISOR * 2
-                : coalesce_controller::RMEM_DIVISOR;
-            if (snapshot->allocated >= snapshot->limit / divisor) {
-                controller.enter_congestion(
-                    coalesce_controller::congestion_reason::rmem_pressure, now);
-            }
-        }
         return snapshot;
     };
 
     while (!token.stop_requested()) {
-        // WAIT: sleep without periodic wakeups until either data or an explicit stop arrives.
-        struct pollfd wait_fds[2]{
-            {.fd = m_socket, .events = POLLIN, .revents = 0},
-            {.fd = m_stop_fd, .events = POLLIN, .revents = 0}
-        };
-        const auto wait_started = clock::now();
-        int poll_result{};
-        do {
-            poll_result = ::poll(wait_fds, 2, -1);
-        } while (poll_result < 0 && errno == EINTR && !token.stop_requested());
-
-        if (token.stop_requested() || (wait_fds[1].revents & POLLIN)) { return; }
-        if (poll_result < 0) {
-            m_logger->error("recvmmsg wait failed: {} (errno={})", std::string{strerror(errno)}, errno);
-            return;
-        }
-        if (wait_fds[0].revents & POLLNVAL) {
-            m_logger->error("recvmmsg socket became invalid while waiting");
-            return;
-        }
-        if (!(wait_fds[0].revents & (POLLIN | POLLERR))) { continue; }
-
-        if (clock::now() - wait_started >= IDLE_RATE_RESET) {
-            // A stopped/restarted or intermittent source should not inherit a stale rate from the
-            // previous run. Start conservatively and relearn from the new stream.
-            controller.on_idle_reset(clock::now());
-            m_estimated_pps.store(0, std::memory_order_relaxed);
-            m_coalesce_us.store(0, std::memory_order_relaxed);
+        const auto now = clock::now();
+        if (policy.flush_for(output_buffers.size(), now)
+            == receive_batch_policy::flush_reason::deadline) {
+            flush_output(true);
+            continue;
         }
 
-        pool_stalled = false;
-        auto memory_before = observe_socket_memory();
-
-        // COALESCE: the controller supplies the sleep from its learned nominal delay; socket
-        // capacity and the safety latch have absolute priority inside compute_sleep. With no
-        // SO_MEMINFO support, retain the same conservative static budget using the verified
-        // SO_RCVBUF value and one packet already queued.
-        const uint64_t allocated = memory_before
-            ? memory_before->allocated : m_conservative_packet_charge;
-        const uint64_t limit = memory_before && memory_before->limit > 0
-            ? memory_before->limit : m_effective_recv_buf;
-        const auto current_coalesce = controller.compute_sleep(
-            clock::now(), allocated, limit, m_conservative_packet_charge);
-        m_coalesce_us.store(current_coalesce.count(), std::memory_order_relaxed);
-
-        if (current_coalesce > std::chrono::microseconds::zero()) {
-            struct pollfd stop_pfd{.fd = m_stop_fd, .events = POLLIN, .revents = 0};
-            auto timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(current_coalesce);
-            struct timespec ts{
-                .tv_sec = static_cast<time_t>(timeout.count() / 1'000'000'000),
-                .tv_nsec = static_cast<long>(timeout.count() % 1'000'000'000)
+        auto socket_readable_at = now;
+        if (!policy.backlog_likely()) {
+            // Idle/normal path: wait for data, the oldest output packet's deadline, or stop.
+            struct pollfd wait_fds[2]{
+                {.fd = m_socket, .events = POLLIN, .revents = 0},
+                {.fd = m_stop_fd, .events = POLLIN, .revents = 0}
             };
-            int coalesce_result{};
+            int poll_result{};
             do {
-                coalesce_result = ::ppoll(&stop_pfd, 1, &ts, nullptr);
-            } while (coalesce_result < 0 && errno == EINTR && !token.stop_requested());
-            if (token.stop_requested() || (stop_pfd.revents & POLLIN)) { return; }
-            if (coalesce_result < 0) {
-                m_logger->error("recvmmsg coalesce wait failed: {} (errno={})",
-                                std::string{strerror(errno)}, errno);
+                struct timespec timeout{};
+                struct timespec* timeout_ptr = nullptr;
+                if (const auto remaining = policy.deadline_remaining(clock::now())) {
+                    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(*remaining);
+                    timeout.tv_sec = static_cast<time_t>(ns.count() / 1'000'000'000);
+                    timeout.tv_nsec = static_cast<long>(ns.count() % 1'000'000'000);
+                    timeout_ptr = &timeout;
+                }
+                ++wait_syscalls;
+                m_wait_syscalls.store(wait_syscalls, std::memory_order_relaxed);
+                poll_result = ::ppoll(wait_fds, 2, timeout_ptr, nullptr);
+            } while (poll_result < 0 && errno == EINTR && !token.stop_requested());
+
+            if (token.stop_requested() || (wait_fds[1].revents & POLLIN)) {
+                flush_output(true);
                 return;
             }
-        }
+            if (poll_result < 0) {
+                m_logger->error("recvmmsg wait failed: {} (errno={})",
+                                std::string{strerror(errno)}, errno);
+                flush_output(true);
+                return;
+            }
+            if (poll_result == 0) {
+                flush_output(true);
+                continue;
+            }
+            if (wait_fds[0].revents & POLLNVAL) {
+                m_logger->error("recvmmsg socket became invalid while waiting");
+                flush_output(true);
+                return;
+            }
+            if (!(wait_fds[0].revents & (POLLIN | POLLERR))) { continue; }
 
-        // DRAIN: recvmmsg is always nonblocking. This makes a stale poll readiness indication
-        // harmless and keeps draining full-rate streams without returning through WAIT/COALESCE.
-        while (!token.stop_requested()) {
-            ++recv_syscalls;
-            auto recvd = ::recvmmsg(m_socket, msgs.data(), m_batch_size, MSG_DONTWAIT, nullptr);
-            if (recvd < 0) {
-                if (errno == EINTR) { continue; }
-                if (errno == EAGAIN || errno == EWOULDBLOCK) { break; }
-                const auto recv_errno = errno;
-                if (recv_errno == EBADF || recv_errno == EINVAL) {
-                    m_logger->error("recvmmsg failed fatally: {} (errno={})",
-                                    std::string{strerror(recv_errno)}, recv_errno);
+            socket_readable_at = clock::now();
+            const auto batch_wait = policy.receive_wait(socket_readable_at);
+            if (batch_wait > std::chrono::microseconds::zero()) {
+                const auto delay = interruptible_delay(batch_wait);
+                if (delay != delay_result::expired) {
+                    flush_output(true);
                     return;
                 }
-                const auto now = clock::now();
-                if (!last_receive_error_log
-                    || now - *last_receive_error_log >= std::chrono::seconds(1)) {
-                    if (suppressed_receive_errors == 0) {
-                        m_logger->error("recvmmsg failed: {} (errno={})",
-                                        std::string{strerror(recv_errno)}, recv_errno);
-                    } else {
-                        m_logger->error("recvmmsg failed: {} (errno={}); suppressed {} repeated error(s)",
-                                        std::string{strerror(recv_errno)}, recv_errno,
-                                        suppressed_receive_errors);
-                    }
-                    last_receive_error_log = now;
-                    suppressed_receive_errors = 0;
-                } else {
-                    ++suppressed_receive_errors;
-                }
-                break;
             }
-            if (recvd == 0) { break; }
-
-            const auto msgs_recvd = static_cast<std::size_t>(recvd);
-            const auto batch_now = clock::now();
-
-            // A continuously busy drain may never reach EAGAIN, so the pre-coalesce safety
-            // sample alone cannot bound how stale drop/occupancy feedback gets. Re-observe on
-            // the adaptation cadence — and BEFORE on_packets(), so a drop or unsafe occupancy
-            // discovered by this sample taints the current window before it can roll and train
-            // the model. Also keeps telemetry fresh for the stats thread.
-            if (batch_now - last_safety_observe >= m_adaptation_interval) {
-                observe_socket_memory();
-                m_recv_syscalls.store(recv_syscalls, std::memory_order_relaxed);
-                publish_controller(batch_now);
-            }
-
-            if (msgs_recvd == m_batch_size) {
-                // Load information only, never a latch: this drain loop already continues
-                // nonblocking to EAGAIN, and sustained overload surfaces through the
-                // kernel-drop and receive-memory safety signals.
-                controller.note_full_vector();
-            }
-            controller.on_packets(msgs_recvd, batch_now);
-
-            m_pkts_recvd.fetch_add(msgs_recvd, std::memory_order_relaxed);
-            m_metrics.packets_received.add(msgs_recvd);
-            m_metrics.batch_sizes.record(static_cast<double>(msgs_recvd));
-
-            uint64_t batch_bytes = 0;
-            output_buffers.clear();
-            for (std::size_t i = 0; i < msgs_recvd; ++i) {
-                if (!buffers[i].has_value()) {
-                    m_metrics.packets_dropped.inc();
-                    m_logger->critical("recvmmsg buffer invariant violated for received slot {}", i);
-                    return;
-                }
-                const auto len = msgs[i].msg_len;
-                batch_bytes += len;
-                // Narrow the external view before adopting it. This transfers the
-                // pool handle straight through immutable_buffer and send_batch
-                // without the refcount bump/decrement pairs from convert+slice.
-                output_buffers.emplace_back(composite::immutable_buffer<uint8_t>(
-                    std::move(buffers[i].value()).take(len)));
-            }
-
-            // One immutable consumer gets one downstream ring publication for the entire receive
-            // batch. Fan-out/mutable connections retain output_port's safe per-buffer fallback.
-            m_out_port->send_batch(output_buffers, {});
-            output_buffers.clear(); // send_batch consumed every accepted/dropped buffer
-            m_metrics.bytes_received.add(batch_bytes);
-
-            for (std::size_t i = 0; i < msgs_recvd; ++i) {
-                buffers[i].reset();
-                if (!acquire_buffer(i)) { return; }
-            }
-            if (pool_stalled) {
-                controller.enter_congestion(
-                    coalesce_controller::congestion_reason::pool_stall, clock::now());
-                pool_stalled = false; // count distinct stall episodes, not one per drain pass
+            // The fixed receive window consumes the same total latency budget as userspace
+            // accumulation. Flush an older partial output batch before receiving more.
+            if (policy.flush_for(output_buffers.size(), clock::now())
+                == receive_batch_policy::flush_reason::deadline) {
+                flush_output(true);
             }
         }
 
-        // The next cycle's pre-coalesce observation catches drops that occurred during this drain.
-        // Keeping that sample (rather than reusing a stale post-drain value across WAIT) preserves
-        // the occupancy guard while avoiding a second SO_MEMINFO syscall per cycle.
-        // These are single-writer statistics. Publish once per complete drain rather than paying
-        // for atomic RMWs on every syscall in the hot path.
+        ++recv_syscalls;
         m_recv_syscalls.store(recv_syscalls, std::memory_order_relaxed);
-        publish_controller(clock::now());
+        auto recvd = ::recvmmsg(m_socket, msgs.data(), m_batch_size, MSG_DONTWAIT, nullptr);
+        if (recvd < 0) {
+            if (errno == EINTR) { continue; }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                policy.note_receive_result(0);
+                continue;
+            }
+            policy.note_receive_result(0);
+            const auto recv_errno = errno;
+            if (recv_errno == EBADF || recv_errno == EINVAL) {
+                m_logger->error("recvmmsg failed fatally: {} (errno={})",
+                                std::string{strerror(recv_errno)}, recv_errno);
+                flush_output(true);
+                return;
+            }
+            const auto error_now = clock::now();
+            if (!last_receive_error_log
+                || error_now - *last_receive_error_log >= std::chrono::seconds(1)) {
+                if (suppressed_receive_errors == 0) {
+                    m_logger->error("recvmmsg failed: {} (errno={})",
+                                    std::string{strerror(recv_errno)}, recv_errno);
+                } else {
+                    m_logger->error("recvmmsg failed: {} (errno={}); suppressed {} repeated error(s)",
+                                    std::string{strerror(recv_errno)}, recv_errno,
+                                    suppressed_receive_errors);
+                }
+                last_receive_error_log = error_now;
+                suppressed_receive_errors = 0;
+            } else {
+                ++suppressed_receive_errors;
+            }
+            continue;
+        }
+        if (recvd == 0) {
+            policy.note_receive_result(0);
+            continue;
+        }
+
+        const auto msgs_recvd = static_cast<std::size_t>(recvd);
+        policy.note_receive_result(msgs_recvd);
+        if (msgs_recvd == m_batch_size) {
+            m_full_receive_vectors.fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto receive_now = clock::now();
+        m_pkts_recvd.fetch_add(msgs_recvd, std::memory_order_relaxed);
+        m_metrics.packets_received.add(msgs_recvd);
+        m_metrics.batch_sizes.record(static_cast<double>(msgs_recvd));
+
+        uint64_t batch_bytes = 0;
+        for (std::size_t i = 0; i < msgs_recvd; ++i) {
+            if (!buffers[i].has_value()) {
+                m_metrics.packets_dropped.inc();
+                m_logger->critical("recvmmsg buffer invariant violated for received slot {}", i);
+                flush_output(true);
+                return;
+            }
+            const auto len = msgs[i].msg_len;
+            batch_bytes += len;
+            // After a size flush, a remainder from this same receive inherits the call's original
+            // readability time. That may flush it slightly early, but can never violate the
+            // configured latency budget by stamping it later than it was actually available.
+            if (output_buffers.empty()) { policy.note_batch_started(socket_readable_at); }
+            output_buffers.emplace_back(composite::immutable_buffer<uint8_t>(
+                std::move(buffers[i].value()).take(len)));
+            if (policy.flush_for(output_buffers.size(), clock::now())
+                == receive_batch_policy::flush_reason::size) {
+                flush_output(false);
+            }
+        }
+        m_pending_output_packets.store(output_buffers.size(), std::memory_order_relaxed);
+        m_metrics.bytes_received.add(batch_bytes);
+
+        if (policy.flush_for(output_buffers.size(), clock::now())
+            == receive_batch_policy::flush_reason::deadline) {
+            flush_output(true);
+        }
+
+        for (std::size_t i = 0; i < msgs_recvd; ++i) {
+            buffers[i].reset();
+        }
+        if (!acquire_buffers(0, msgs_recvd)) {
+            flush_output(true);
+            return;
+        }
+        // Socket diagnostics are observational only. They do not alter batching policy.
+        if (receive_now - last_safety_observe >= std::chrono::milliseconds(250)) {
+            observe_socket_memory();
+        }
     }
+
+    flush_output(true);
 }
 
 } // namespace udp

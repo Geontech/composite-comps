@@ -81,44 +81,34 @@ Intel DPDK (Data Plane Development Kit) userspace networking.
 | `frame_count` | uint32 | 8192 | Number of pre-allocated frame buffers in the pool |
 | `autodiscovery_timeout` | uint32 | 10 | Timeout in seconds for packet size auto-discovery (recvmmsg only) |
 
-### recvmmsg Adaptive Coalescing
+### recvmmsg Output Batching
 
-The standard UDP backend waits for the socket to become readable, then uses the measured packet
-rate to briefly coalesce datagrams before draining the socket with nonblocking `recvmmsg()` calls.
-It drains until the socket is empty and publishes each received group downstream as a batch. This
-keeps the receiver immediately stoppable while amortizing both syscall and downstream queue costs.
+The standard UDP backend uses a fixed, interruptible window after the socket becomes readable so
+additional datagrams can accumulate before a nonblocking `recvmmsg()` call. Packets returned by
+successive calls are accumulated in userspace and published downstream with one `send_batch()`
+when the requested output size is reached. A deadline measured from initial socket readability
+bounds requested batching latency and flushes partial batches for sparse or stopped streams.
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `recvmmsg.target_batch` | uint32 | 0 | Desired packets per first syscall; 0 selects 75% of `num_msgs` |
-| `recvmmsg.min_coalesce_us` | uint32 | 0 | Lower bound for the adaptive coalescing interval |
-| `recvmmsg.max_coalesce_us` | uint32 | 0 | Upper bound for the adaptive interval; 0 disables coalescing |
-| `recvmmsg.adaptation_interval_ms` | uint32 | 250 | Packet-rate measurement/update interval |
+| `recvmmsg.receive_batch_wait_us` | uint32 | 100 | Fixed pre-receive accumulation window; clamped to 5000 µs |
+| `recvmmsg.output_batch_size` | uint32 | 0 | Packets per downstream publication; 0 selects `num_msgs` |
+| `recvmmsg.max_batch_delay_us` | uint32 | 1000 | Maximum age of the oldest packet in a partial output batch; 0 flushes each receive result immediately |
 
-Adaptive coalescing is deliberately opt-in: both an explicit `recv_buf_size` and a nonzero
-`max_coalesce_us` are required. The backend reads back the effective `SO_RCVBUF` after the kernel
-applies its limits, conservatively estimates per-packet socket-memory cost, and permits intentional
-coalescing to consume at most 25% of that effective buffer. It clamps both `target_batch` and the
-live interval to that budget.
+Setting `max_batch_delay_us` to zero also disables the pre-receive accumulation window: a zero
+total latency budget cannot fund a nonzero `receive_batch_wait_us`.
 
-The controller estimates packets per second with an EWMA and computes the nominal delay needed to
-reach `target_batch`. `SO_MEMINFO` supplies live receive-memory occupancy and kernel-drop feedback.
-A kernel drop, pool stall, or receive-memory occupancy above 25% of the effective buffer
-immediately suppresses the sleep for one adaptation interval (re-triggering extends it, and
-occupancy re-arms until it falls back below 12.5%). The learned nominal delay is retained across
-this safety latch, so recovery after a transient event is bounded by the latch duration rather
-than a full EWMA relearn; the EWMA is also not taught from windows affected by a latch. A full
-receive vector is counted as load information only — the drain loop already continues nonblocking
-to `EAGAIN`, and sustained overload surfaces through the kernel-drop and occupancy signals. The
-nominal delay is additionally capped at the time to fill half the receive vector, so scheduling
-jitter cannot routinely fill the vector; keep `target_batch` at or below half of `num_msgs` (or
-raise `num_msgs`) for full effect. A 5% deadband keeps packet-rate noise from continuously moving
-the delay. After one second without traffic, the old rate estimate is discarded and reseeded
-directly from the next measurement window. All properties in the `recvmmsg` object are runtime
-reconfigurable (the receiver is reconstructed).
+`receive_batch_wait_us` is the CPU/latency dial: a larger value generally returns more packets per
+receive syscall. If a call fills the entire `num_msgs` vector, the backend skips both waits and
+continues receiving immediately until a non-full result indicates that the observed backlog has
+cleared. Linux timer slack and ordinary scheduler latency can extend an actual wait beyond the
+configured value, so these are requested batching bounds rather than hard real-time guarantees.
 
-The policy lives in `socket/coalesce_controller.hpp`, a pure clock-injected class covered by
-deterministic unit tests (`tests/coalesce_controller_tests.cpp`).
+`num_msgs` and `output_batch_size` are intentionally independent. The former caps one kernel
+receive vector; the latter controls downstream ring-publication amortization. A receive call can
+therefore produce multiple output batches, and a partial output batch can span multiple receive
+calls. All properties in the `recvmmsg` object are runtime reconfigurable (the receiver is
+reconstructed).
 
 Example:
 ```json
@@ -126,10 +116,9 @@ Example:
   "num_msgs": 256,
   "recv_buf_size": 16777216,
   "recvmmsg": {
-    "target_batch": 192,
-    "min_coalesce_us": 0,
-    "max_coalesce_us": 10000,
-    "adaptation_interval_ms": 250
+    "receive_batch_wait_us": 100,
+    "output_batch_size": 64,
+    "max_batch_delay_us": 1000
   }
 }
 ```
@@ -374,30 +363,23 @@ Runtime statistics are logged every 5 seconds at debug level:
 
 ### recvmmsg
 - `pkts_recvd`: Total packets received since component start
-- `recv_syscalls`: Total `recvmmsg()` calls, including the final `EAGAIN` drain calls
-- `estimated_pps`: Current EWMA packet-rate estimate
-- `coalesce_us`: Most recent per-cycle actual sleep (after safety clamping)
-- `nominal_coalesce_us`: Learned nominal delay (the controller's steady-state target)
-- `coalesce_target_batch`: Effective target after applying the socket-capacity safety limit
+- `recv_syscalls`: Total `recvmmsg()` calls
+- `wait_syscalls`: Total outer socket waits and fixed-window waits
+- `total_receive_syscalls`: Sum of receive and wait syscalls
+- `full_receive_vectors`: Calls that filled all `num_msgs` slots and activated the backlog fast path
+- `receive_batch_wait_us`: Effective fixed accumulation window after safety clamping
+- `output_batch_size`: Configured downstream publication target
+- `max_batch_delay_us`: Configured maximum hold time for a partial output batch
+- `output_batches`: Total downstream batch publications
+- `partial_batch_flushes`: Publications forced by a deadline, shutdown, or error before full
+- `pending_output_packets`: Packets currently retained in the userspace output accumulator
 - `effective_recv_buf`: Effective kernel `SO_RCVBUF` accounting limit after clamping
-- `estimated_packet_charge`: Conservative socket-memory charge used for safety calculations
+- `estimated_packet_charge`: Conservative estimate of per-packet kernel socket-memory use
 - `socket_rmem_bytes`: Most recently observed receive-memory allocation
 - `socket_rmem_peak_bytes`: Maximum observed receive-memory allocation since the previous stats
   report (reset on read; catches pressure between the instantaneous samples)
 - `kernel_drops`: Packets dropped at this UDP socket according to `SO_MEMINFO`
-- `congest_kernel_drop` / `congest_rmem_pressure` / `congest_pool_stall`: Cumulative safety-latch
-  triggers by reason
-- `congest_full_vector`: Receive calls that returned the entire vector (informational, no latch)
-- `latch_entries`: Distinct safety-latch entries; `latch_active`, `latch_reason`, and
-  `latch_remaining_us` describe the current latch state
-- `idle_model_resets`: Rate-model resets after one second without traffic
-- `zero_sleep_reason`: Why the last computed sleep was zero (`none`, `disabled`, `latched`,
-  `warming_up`, `below_min`, `capacity`)
-- `interval_cycles` / `interval_coalesced_pct`: Drain cycles in the last adaptation window and the
-  percentage that coalesced
-- `interval_sleep_min_us` / `interval_sleep_mean_us` / `interval_sleep_max_us`: Sleep distribution
-  over the last adaptation window's coalesced cycles (the instantaneous `coalesce_us` can alias
-  rapid changes)
+- `congest_pool_stall`: Pool-acquisition stall episodes
 - `pool_capacity` / `pool_outstanding` / `pool_available`: Slab-pool occupancy, proving or
   disproving downstream buffer retention
 - `pool_stall_backoff_us`: Total time the receive thread has waited for pool buffers
@@ -433,11 +415,13 @@ remains reserved for filtering and receiver-internal errors.
 ### High CPU usage
 **Problem:** Component consuming excessive CPU when idle
 
-The recvmmsg backend sleeps indefinitely when the socket is empty and is woken by either data or an
-explicit stop event. Its adaptive coalescing wait also sleeps interruptibly. Persistent CPU usage
-therefore indicates an active stream, downstream backpressure, or repeated pool-acquisition stalls.
+The recvmmsg backend sleeps indefinitely when both the socket and output accumulator are empty. A
+partial batch uses an interruptible deadline. Persistent CPU usage therefore indicates an active
+stream, downstream backpressure, or repeated pool-acquisition stalls.
 
-For more syscall amortization, raise `recvmmsg.target_batch` or `recvmmsg.max_coalesce_us`.
+For fewer receive syscalls, raise `recvmmsg.receive_batch_wait_us`; for fewer downstream ring
+publications, raise `recvmmsg.output_batch_size`. Keep `max_batch_delay_us` within the
+application's latency budget and qualify CPU, kernel drops, and downstream ring drops together.
 
 ### DPDK initialization failure
 **Problem:** "DPDK support not compiled in" or DPDK port initialization errors
