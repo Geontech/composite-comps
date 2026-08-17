@@ -88,15 +88,25 @@ auto pkt_parser::property_change_handler(const composite::properties::json& diff
 auto pkt_parser::process() -> composite::retval {
     using enum composite::retval;
 
-    // Get input data if available
-    auto pkt = m_in_port.try_get();
-    if (!pkt) {
+    const auto count = m_in_port.get_batch(std::span{m_input_batch});
+    if (count == 0) {
         // No input: NOOP so the worker arms the read-doorbell and parks until upstream
         // delivers, instead of busy-spinning process() and burning a core while idle. At
         // end-of-stream the base promotes this NOOP to FINISH (no buffered state to flush).
         return NOOP;
     }
-    auto& [data, _, __] = *pkt;
+
+    // Protocol detection and parser metadata are ordered stream state. Drain a
+    // bounded input batch with one ring-head publication, but process each
+    // datagram sequentially to preserve exactly the scalar semantics.
+    for (std::size_t i = 0; i < count; ++i) {
+        process_packet(std::move(m_input_batch[i]));
+    }
+    return NORMAL;
+}
+
+auto pkt_parser::process_packet(input_port_t::queue_type packet) -> void {
+    auto& [data, _, __] = packet;
 
     // The packet bytes are UNTRUSTED (raw UDP). A malformed/short datagram must
     // never propagate an exception out of process() — that would FINISH the
@@ -129,7 +139,7 @@ auto pkt_parser::process() -> composite::retval {
 
         if (!m_active_parser) {
             drop("unknown packet protocol");
-            return NORMAL;
+            return;
         }
     }
 
@@ -151,7 +161,7 @@ auto pkt_parser::process() -> composite::retval {
             m_consecutive_parse_failures = 0;
             m_drop_warned = false;  // re-arm the drop warning for the (likely new) stream
         }
-        return NORMAL;
+        return;
     }
 
     // Log any warnings from parser
@@ -171,12 +181,11 @@ auto pkt_parser::process() -> composite::retval {
     }
 
     // Send data (carrying the current metadata) if parser says we should and
-    // metadata has been initialized.
+    // metadata has been initialized. Keep this scalar: parsed packets have distinct timestamps,
+    // while output_port::send_batch intentionally applies one timestamp to the complete batch.
     if (m_init_metadata && result.should_send) [[likely]] {
         m_out_port.send_data(std::move(result.payload), result.timestamp, m_metadata_shared);
     }
-
-    return NORMAL;
 }
 
 COMPOSITE_REGISTER_SIMPLE(pkt_parser)

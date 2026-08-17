@@ -25,6 +25,7 @@
 #include <composite/metrics/metrics.hpp>
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -45,9 +46,14 @@ public:
     auto process() -> composite::retval override;
 
 private:
+    static constexpr std::size_t INPUT_BATCH_SIZE{128};
+
+    auto process_packet(input_port_t::queue_type packet) -> void;
+
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
+    std::array<input_port_t::queue_type, INPUT_BATCH_SIZE> m_input_batch;
 
     // Properties
     struct_props::signal_overrides m_signal_overrides;

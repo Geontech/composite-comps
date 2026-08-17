@@ -643,14 +643,17 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                 }
                 const auto len = msgs[i].msg_len;
                 batch_bytes += len;
-                output_buffers.emplace_back(
-                    composite::immutable_buffer<uint8_t>(std::move(buffers[i].value())).slice(0, len));
+                // Narrow the external view before adopting it. This transfers the
+                // pool handle straight through immutable_buffer and send_batch
+                // without the refcount bump/decrement pairs from convert+slice.
+                output_buffers.emplace_back(composite::immutable_buffer<uint8_t>(
+                    std::move(buffers[i].value()).take(len)));
             }
 
             // One immutable consumer gets one downstream ring publication for the entire receive
             // batch. Fan-out/mutable connections retain output_port's safe per-buffer fallback.
             m_out_port->send_batch(output_buffers, {});
-            output_buffers.clear(); // release our shares before waiting for pool replacements
+            output_buffers.clear(); // send_batch consumed every accepted/dropped buffer
             m_metrics.bytes_received.add(batch_bytes);
 
             for (std::size_t i = 0; i < msgs_recvd; ++i) {

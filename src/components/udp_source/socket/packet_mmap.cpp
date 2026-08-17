@@ -40,15 +40,18 @@
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <poll.h>
-#include <thread>
+#include <span>
 #include <stdexcept>
+#include <thread>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 constexpr std::size_t DEFAULT_FRAME_SIZE_BYTES = 2048;
+constexpr std::size_t FORWARD_BATCH_SIZE = 128;
 constexpr std::size_t MAX_IDLE_SPINS = 1024;
 constexpr auto IDLE_BACKOFF = std::chrono::microseconds(50);
 
@@ -249,13 +252,26 @@ auto packet_mmap::receive(std::stop_token token) -> void {
     std::size_t idle_spins = 0;
     std::size_t stalled_slot = SIZE_MAX;  // slot we last warned about being held, or none
 
+    // Forward at most a quarter of the ring at once. Each queued external buffer pins its
+    // PACKET_MMAP slot until the downstream consumer releases it, so a fixed batch of 128 would
+    // create avoidable self-backpressure for small configured rings.
+    const auto forward_batch_size = std::max<std::size_t>(
+        1, std::min<std::size_t>(FORWARD_BATCH_SIZE, m_frame_count / 4));
+
     // Metric accumulators. This is a single-frame-at-a-time poll loop with no syscall batch, so
     // instead sum counts locally while draining a run of ready frames and record them with one
     // atomic add each when the drain ends (a stall, catching up to the kernel, or exit) — rather
     // than a locked RMW per packet. flush() is a no-op once drained, so the idle spin only pays
     // the atomics on its first iteration after a burst.
     uint64_t acc_pkts = 0, acc_bytes = 0, acc_dropped = 0;
+    std::vector<composite::immutable_buffer<uint8_t>> output_buffers;
+    output_buffers.reserve(forward_batch_size);
     auto flush = [&] {
+        if (!output_buffers.empty()) {
+            m_metrics.batch_sizes.record(static_cast<double>(output_buffers.size()));
+            m_out_port->send_batch(std::span{output_buffers}, {});
+            output_buffers.clear();
+        }
         if (acc_pkts != 0) {
             m_pkts_recvd.fetch_add(acc_pkts, std::memory_order_relaxed);
             m_metrics.packets_received.add(acc_pkts);
@@ -280,7 +296,10 @@ auto packet_mmap::receive(std::stop_token token) -> void {
         // refill). Loading tp_status first would leave a window where recv sees (USER-original,
         // held-just-cleared) and re-reads stale bytes.
         if (m_ring_buffer->slot_held[frame_idx].load(std::memory_order_acquire)) {
-            flush();  // downstream is stalled — publish whatever we accumulated before backing off
+            // Flush BEFORE waiting: the current accumulator may itself own this slot after a ring
+            // rotation. Publishing those buffers lets downstream release it; moving this flush
+            // below the wait would turn self-backpressure into a permanent stall.
+            flush();
             if (frame_idx != stalled_slot) {
                 stalled_slot = frame_idx;
                 m_logger->warn("packet_mmap: ring slot {} still held downstream a full rotation "
@@ -342,8 +361,11 @@ auto packet_mmap::receive(std::stop_token token) -> void {
                         auto buffer = composite::external_buffer<uint8_t>(
                             payload, payload_len,
                             frame_release{hdr, m_ring_buffer, static_cast<uint32_t>(frame_idx)});
-                        m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
+                        output_buffers.emplace_back(std::move(buffer));
                         forwarded = true;
+                        if (output_buffers.size() == forward_batch_size) {
+                            flush();
+                        }
                     }
                 }
             }

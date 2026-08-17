@@ -170,6 +170,20 @@ struct redetect_harness {
         }
         return emitted;
     }
+
+    // Enqueue a producer batch, invoke process() exactly once, and verify that
+    // the component's bounded get_batch drain handles the complete ordered run.
+    auto feed_batch(std::vector<composite::immutable_buffer<uint8_t>> packets) -> std::size_t {
+        src.send_batch(std::span{packets}, composite::timestamp{0, 0});
+        uut->process();
+        std::size_t emitted = 0;
+        while (sink.size() > 0) {
+            auto [buf, ts, md] = sink.get_data();
+            last_md = md;
+            ++emitted;
+        }
+        return emitted;
+    }
 };
 
 namespace {
@@ -244,6 +258,19 @@ int main() {
     check(h.active_name() == "sdds", "re-detects and re-locks on the next valid packet");
     check(emitted == 1, "output resumes after re-detection");
     check(h.failures() == 0, "clean state after re-lock");
+
+    // --- 3b. One process cycle drains a complete producer batch -------------------
+    {
+        redetect_harness hb;
+        std::vector<composite::immutable_buffer<uint8_t>> packets;
+        for (std::size_t i = 0; i < 32; ++i) {
+            packets.push_back(make_sdds());
+        }
+        check(hb.feed_batch(std::move(packets)) == 32,
+              "one process cycle parses and forwards a 32-packet input batch");
+        check(hb.active_name() == "sdds", "batch preserves ordered protocol lock-in");
+        check(hb.last_md != nullptr, "last packet in parser batch carries metadata");
+    }
 
     // --- 4. VITA 49.1: metadata stays shared across data packets AND context repeats ----
     // V49.1 delegates to the inner V49 parser, which stamps the transport annotation itself.

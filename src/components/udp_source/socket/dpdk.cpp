@@ -38,7 +38,9 @@
 #include <thread>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <utility>
+#include <vector>
 #include <arpa/inet.h>
 
 namespace {
@@ -46,10 +48,9 @@ struct mbuf_release {
     rte_mbuf* mbuf{};
     // external_buffer<uint8_t> invokes its deleter as release(uint8_t*) (the data pointer). The
     // mbuf to free is captured as a member, so the pointer argument is unused.
-    void operator()(uint8_t* /*data*/) {
+    void operator()(uint8_t* /*data*/) const {
         if (mbuf) {
             rte_pktmbuf_free(mbuf);
-            mbuf = nullptr;
         }
     }
 };
@@ -287,6 +288,8 @@ auto dpdk::stop_recv() -> void {
 
 auto dpdk::receive(std::stop_token token) -> void {
     auto* pkts = m_rx_burst.data();
+    std::vector<composite::immutable_buffer<uint8_t>> output_buffers;
+    output_buffers.reserve(m_config.burst_size);
     while (!token.stop_requested()) [[likely]] {
 
         // Receive burst of packets from DPDK port
@@ -311,6 +314,7 @@ auto dpdk::receive(std::stop_token token) -> void {
         // after the burst, instead of a locked RMW per packet on the hot path.
         uint64_t acc_recv = 0, acc_bytes = 0, acc_dropped = 0;
 
+        output_buffers.clear();
         // Process each received packet
         for (uint16_t i = 0; i < nb_rx; i++) {
             struct rte_mbuf* mbuf = pkts[i];
@@ -339,11 +343,16 @@ auto dpdk::receive(std::stop_token token) -> void {
                     payload.length,
                     mbuf_release{mbuf}
                 );
-                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
+                output_buffers.emplace_back(std::move(buffer));
             } else {
                 ++acc_dropped;
                 rte_pktmbuf_free(mbuf);
             }
+        }
+
+        if (!output_buffers.empty()) {
+            m_out_port->send_batch(std::span{output_buffers}, {});
+            output_buffers.clear();
         }
 
         // One atomic add per counter for the whole burst (a burst of only IGMP queries adds none).
