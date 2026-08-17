@@ -81,7 +81,50 @@ Intel DPDK (Data Plane Development Kit) userspace networking.
 | `frame_count` | uint32 | 8192 | Number of pre-allocated frame buffers in the pool |
 | `autodiscovery_timeout` | uint32 | 10 | Timeout in seconds for packet size auto-discovery (recvmmsg only) |
 
-**Runtime reconfigurable:** `interface`, `ip_addr`, `port`, `num_msgs`, `frame_count`
+### recvmmsg Adaptive Coalescing
+
+The standard UDP backend waits for the socket to become readable, then uses the measured packet
+rate to briefly coalesce datagrams before draining the socket with nonblocking `recvmmsg()` calls.
+It drains until the socket is empty and publishes each received group downstream as a batch. This
+keeps the receiver immediately stoppable while amortizing both syscall and downstream queue costs.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `recvmmsg.target_batch` | uint32 | 0 | Desired packets per first syscall; 0 selects 75% of `num_msgs` |
+| `recvmmsg.min_coalesce_us` | uint32 | 0 | Lower bound for the adaptive coalescing interval |
+| `recvmmsg.max_coalesce_us` | uint32 | 0 | Upper bound for the adaptive interval; 0 disables coalescing |
+| `recvmmsg.adaptation_interval_ms` | uint32 | 250 | Packet-rate measurement/update interval |
+
+Adaptive coalescing is deliberately opt-in: both an explicit `recv_buf_size` and a nonzero
+`max_coalesce_us` are required. The backend reads back the effective `SO_RCVBUF` after the kernel
+applies its limits, conservatively estimates per-packet socket-memory cost, and permits intentional
+coalescing to consume at most 25% of that effective buffer. It clamps both `target_batch` and the
+live interval to that budget.
+
+The controller estimates packets per second with an EWMA and computes the nominal delay needed to
+reach `target_batch`. `SO_MEMINFO` supplies live receive-memory occupancy and kernel-drop feedback.
+A full receive vector, pool stall, high socket occupancy, or kernel drop immediately disables
+coalescing for eight clean drain cycles. The EWMA cannot raise the delay
+while this congestion latch is active. After one second without traffic, the old rate estimate is
+discarded. All properties in the `recvmmsg` object are runtime reconfigurable (the receiver is
+reconstructed).
+
+Example:
+```json
+{
+  "num_msgs": 256,
+  "recv_buf_size": 16777216,
+  "recvmmsg": {
+    "target_batch": 192,
+    "min_coalesce_us": 0,
+    "max_coalesce_us": 10000,
+    "adaptation_interval_ms": 250
+  }
+}
+```
+
+**Runtime reconfigurable:** `interface`, `ip_addr`, `port`, `num_msgs`, `frame_count`, `overrides`,
+and `recvmmsg`
 
 ### Overrides
 
@@ -320,6 +363,18 @@ Runtime statistics are logged every 5 seconds at debug level:
 
 ### recvmmsg
 - `pkts_recvd`: Total packets received since component start
+- `recv_syscalls`: Total `recvmmsg()` calls, including the final `EAGAIN` drain calls
+- `estimated_pps`: Current EWMA packet-rate estimate
+- `coalesce_us`: Current adaptive coalescing interval
+- `coalesce_target_batch`: Effective target after applying the socket-capacity safety limit
+- `effective_recv_buf`: Effective kernel `SO_RCVBUF` accounting limit after clamping
+- `estimated_packet_charge`: Conservative socket-memory charge used for safety calculations
+- `socket_rmem_bytes`: Most recently observed receive-memory allocation
+- `kernel_drops`: Packets dropped at this UDP socket according to `SO_MEMINFO`
+
+Kernel receive-queue drops are also exported separately as the
+`udp_source.kernel_drops` counter; they are not mixed into `udp_source.packets_dropped`, which
+remains reserved for filtering and receiver-internal errors.
 
 ### packet_mmap
 - `pkts_recvd`: Total packets received by userspace since component start
@@ -348,11 +403,11 @@ Runtime statistics are logged every 5 seconds at debug level:
 ### High CPU usage
 **Problem:** Component consuming excessive CPU when idle
 
-**Note:** This is intentional for low-latency operation. The component uses:
-- 1ms poll timeout
-- 50μs backoff when waiting for frame pool slots
+The recvmmsg backend sleeps indefinitely when the socket is empty and is woken by either data or an
+explicit stop event. Its adaptive coalescing wait also sleeps interruptibly. Persistent CPU usage
+therefore indicates an active stream, downstream backpressure, or repeated pool-acquisition stalls.
 
-For lower CPU usage at the cost of latency, consider patching with longer timeouts.
+For more syscall amortization, raise `recvmmsg.target_batch` or `recvmmsg.max_coalesce_us`.
 
 ### DPDK initialization failure
 **Problem:** "DPDK support not compiled in" or DPDK port initialization errors

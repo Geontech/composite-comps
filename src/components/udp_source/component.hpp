@@ -45,11 +45,22 @@ struct dpdk_config {
     std::string src_ip;                     // Source IP for IGMP (enables IGMP if dst is multicast)
 }; // struct dpdk_config
 
+struct recvmmsg_config {
+    // Zero selects 75% of num_msgs. Leaving headroom lets a delayed wakeup absorb jitter
+    // without immediately filling the receive vector and requiring another syscall.
+    uint32_t target_batch{};
+    uint32_t min_coalesce_us{};
+    uint32_t max_coalesce_us{};
+    uint32_t adaptation_interval_ms{250};
+}; // struct recvmmsg_config
+
 } // namespace struct_props
 
 COMPOSITE_STRUCT(struct_props::overrides, msg_size);
 COMPOSITE_STRUCT(struct_props::dpdk_config,
     port_id, queue_id, mempool_name, burst_size, igmp_respond_to_queries, src_ip);
+COMPOSITE_STRUCT(struct_props::recvmmsg_config,
+    target_batch, min_coalesce_us, max_coalesce_us, adaptation_interval_ms);
 
 class udp_source : public composite::component {
     static constexpr std::string_view RECVMMSG = "recvmmsg";
@@ -86,6 +97,7 @@ private:
     uint32_t m_recv_buf_size{};
     uint32_t m_autodiscovery_timeout{10};
     struct_props::overrides m_overrides;
+    struct_props::recvmmsg_config m_recvmmsg;
     struct_props::dpdk_config m_dpdk;
 
     // Members
@@ -99,6 +111,7 @@ private:
     composite::metrics::counter<uint64_t>* m_packets_received{nullptr};
     composite::metrics::counter<uint64_t>* m_bytes_received{nullptr};
     composite::metrics::counter<uint64_t>* m_packets_dropped{nullptr};
+    composite::metrics::counter<uint64_t>* m_kernel_drops{nullptr};
     composite::metrics::histogram* m_batch_sizes{nullptr};
 
     auto start_receiver_locked() -> void;

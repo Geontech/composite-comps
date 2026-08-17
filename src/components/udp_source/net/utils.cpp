@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <net/if.h>
 #include <netinet/ether.h>
 #include <string>
@@ -109,12 +110,29 @@ auto create_ip_mreq(int fd, std::string_view interface, std::string_view ip_addr
 }
 
 auto set_socket_recv_buffer(int fd, std::size_t size) -> void {
-    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) < 0) {
+    if (size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        ::close(fd);
+        throw std::invalid_argument("receive buffer size exceeds SO_RCVBUF integer range");
+    }
+    const auto requested = static_cast<int>(size);
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) < 0) {
         ::close(fd);
         throw std::runtime_error(
             std::format("failed to set receive buffer size: {}", std::strerror(errno))
         );
     }
+}
+
+auto get_socket_recv_buffer(int fd) -> std::size_t {
+    int effective{};
+    socklen_t len = sizeof(effective);
+    if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effective, &len) < 0) {
+        ::close(fd);
+        throw std::runtime_error(
+            std::format("failed to read effective receive buffer size: {}", std::strerror(errno))
+        );
+    }
+    return effective > 0 ? static_cast<std::size_t>(effective) : 0;
 }
 
 auto set_socket_reuse_addr(int fd, bool enable) -> void {

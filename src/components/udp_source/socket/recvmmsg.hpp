@@ -24,6 +24,7 @@
 #include <composite/buffers/slab_pool.hpp>
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string_view>
 #include <thread>
@@ -46,15 +47,33 @@ public:
 
 private:
     auto receive(std::stop_token token) -> void;
+    auto signal_stop() noexcept -> void;
+    auto clear_stop_signal() noexcept -> void;
+    auto record_kernel_drop_snapshot(uint32_t drops) noexcept -> void;
 
     output_port_t* m_out_port{nullptr};
     int m_socket{-1};
+    int m_stop_fd{-1};
     std::jthread m_recv_thread;
     std::size_t m_frame_size{};
     std::size_t m_frame_count{};
     std::size_t m_autodiscovery_timeout{};
     std::shared_ptr<composite::slab_pool<uint8_t>> m_pool;
     std::size_t m_batch_size{128};
+    std::size_t m_coalesce_target_batch{};
+    std::chrono::microseconds m_min_coalesce{};
+    std::chrono::microseconds m_max_coalesce{};
+    std::chrono::milliseconds m_adaptation_interval{250};
+    std::size_t m_effective_recv_buf{};
+    std::size_t m_conservative_packet_charge{};
+    bool m_recv_buf_explicit{false};
+
+    std::atomic<uint64_t> m_recv_syscalls{0};
+    std::atomic<uint64_t> m_estimated_pps{0};
+    std::atomic<uint64_t> m_coalesce_us{0};
+    std::atomic<uint64_t> m_socket_rmem_bytes{0};
+    std::atomic<uint64_t> m_kernel_drops{0};
+    std::atomic<uint32_t> m_accounted_kernel_drops{0};
 
 }; // class recvmmsg
 

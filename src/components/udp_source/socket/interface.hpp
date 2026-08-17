@@ -41,6 +41,7 @@ struct metrics {
     composite::metrics::counter<uint64_t>& packets_received;
     composite::metrics::counter<uint64_t>& bytes_received;
     composite::metrics::counter<uint64_t>& packets_dropped;
+    composite::metrics::counter<uint64_t>& kernel_drops;
     composite::metrics::histogram& batch_sizes;
 }; // struct metrics
 
@@ -98,6 +99,16 @@ struct config {
      * Only applies to recvmmsg socket type when msg_size is not set.
      */
     std::size_t autodiscovery_timeout{10};
+
+    /**
+     * Adaptive recvmmsg coalescing controls. A target of zero selects 75% of batch_size.
+     * The receive thread estimates the stream packet rate and waits long enough after an
+     * empty-to-readable transition to build approximately this many queued datagrams.
+     */
+    std::size_t coalesce_target_batch{};
+    std::size_t min_coalesce_us{};
+    std::size_t max_coalesce_us{};
+    std::size_t adaptation_interval_ms{250};
 
     /**
      * @brief Optional metrics for the receiver.

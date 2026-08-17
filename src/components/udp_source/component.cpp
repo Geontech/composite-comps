@@ -53,6 +53,7 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_property("frame_count", m_frame_count, RUNTIME);
     add_property("autodiscovery_timeout", m_autodiscovery_timeout).units("seconds");
     add_property("overrides", m_overrides, RUNTIME);
+    add_property("recvmmsg", m_recvmmsg, RUNTIME);
     add_property("dpdk", m_dpdk);
 
     // Create metrics via the base helpers, which label each series with this component's
@@ -64,6 +65,8 @@ udp_source::udp_source(std::string_view id) : composite::component(id) {
         "udp_source.bytes_received", "Total bytes received from network", "bytes");
     m_packets_dropped = &create_counter(
         "udp_source.packets_dropped", "Packets dropped due to filtering or errors");
+    m_kernel_drops = &create_counter(
+        "udp_source.kernel_drops", "Packets dropped by the kernel receive queue");
     m_batch_sizes = &create_histogram_pow2(
         "udp_source.batch_sizes", "Distribution of packets received per batch", "1",
         10);  // 10 buckets: 1, 2, 4, 8, ..., 512
@@ -74,6 +77,7 @@ auto udp_source::create_metrics() -> udp::metrics {
         .packets_received = *m_packets_received,
         .bytes_received = *m_bytes_received,
         .packets_dropped = *m_packets_dropped,
+        .kernel_drops = *m_kernel_drops,
         .batch_sizes = *m_batch_sizes
     };
 }
@@ -82,10 +86,14 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
     (void)diff;
     logger()->trace(std::source_location::current().function_name());
 
-    // If we're transitioning to inactive, just stop the receiver
+    // If we're transitioning to inactive, stop and release the receiver. A later
+    // activation reconstructs it from the current properties, and releasing it
+    // here drops this component's ownership of backend resources (including the
+    // recvmmsg slab pool once any downstream buffers still in flight are freed).
     if (!m_active) {
         std::scoped_lock lock(m_receiver_mtx);
         stop_receiver_locked();
+        m_receiver.reset();
         return;
     }
 
@@ -105,6 +113,10 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
         .batch_size = m_num_msgs,
         .frame_count = m_frame_count,
         .autodiscovery_timeout = m_autodiscovery_timeout,
+        .coalesce_target_batch = m_recvmmsg.target_batch,
+        .min_coalesce_us = m_recvmmsg.min_coalesce_us,
+        .max_coalesce_us = m_recvmmsg.max_coalesce_us,
+        .adaptation_interval_ms = m_recvmmsg.adaptation_interval_ms,
         .metrics = create_metrics()
     };
     if (m_overrides.msg_size.has_value()) {
