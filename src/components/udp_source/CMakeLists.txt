@@ -95,3 +95,8 @@ endif()
 install(TARGETS udp_source
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+
+# Tests
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

@@ -103,11 +103,22 @@ live interval to that budget.
 
 The controller estimates packets per second with an EWMA and computes the nominal delay needed to
 reach `target_batch`. `SO_MEMINFO` supplies live receive-memory occupancy and kernel-drop feedback.
-A full receive vector, pool stall, high socket occupancy, or kernel drop immediately disables
-coalescing for eight clean drain cycles. The EWMA cannot raise the delay
-while this congestion latch is active. After one second without traffic, the old rate estimate is
-discarded. All properties in the `recvmmsg` object are runtime reconfigurable (the receiver is
-reconstructed).
+A kernel drop, pool stall, or receive-memory occupancy above 25% of the effective buffer
+immediately suppresses the sleep for one adaptation interval (re-triggering extends it, and
+occupancy re-arms until it falls back below 12.5%). The learned nominal delay is retained across
+this safety latch, so recovery after a transient event is bounded by the latch duration rather
+than a full EWMA relearn; the EWMA is also not taught from windows affected by a latch. A full
+receive vector is counted as load information only — the drain loop already continues nonblocking
+to `EAGAIN`, and sustained overload surfaces through the kernel-drop and occupancy signals. The
+nominal delay is additionally capped at the time to fill half the receive vector, so scheduling
+jitter cannot routinely fill the vector; keep `target_batch` at or below half of `num_msgs` (or
+raise `num_msgs`) for full effect. A 5% deadband keeps packet-rate noise from continuously moving
+the delay. After one second without traffic, the old rate estimate is discarded and reseeded
+directly from the next measurement window. All properties in the `recvmmsg` object are runtime
+reconfigurable (the receiver is reconstructed).
+
+The policy lives in `socket/coalesce_controller.hpp`, a pure clock-injected class covered by
+deterministic unit tests (`tests/coalesce_controller_tests.cpp`).
 
 Example:
 ```json
@@ -365,12 +376,31 @@ Runtime statistics are logged every 5 seconds at debug level:
 - `pkts_recvd`: Total packets received since component start
 - `recv_syscalls`: Total `recvmmsg()` calls, including the final `EAGAIN` drain calls
 - `estimated_pps`: Current EWMA packet-rate estimate
-- `coalesce_us`: Current adaptive coalescing interval
+- `coalesce_us`: Most recent per-cycle actual sleep (after safety clamping)
+- `nominal_coalesce_us`: Learned nominal delay (the controller's steady-state target)
 - `coalesce_target_batch`: Effective target after applying the socket-capacity safety limit
 - `effective_recv_buf`: Effective kernel `SO_RCVBUF` accounting limit after clamping
 - `estimated_packet_charge`: Conservative socket-memory charge used for safety calculations
 - `socket_rmem_bytes`: Most recently observed receive-memory allocation
+- `socket_rmem_peak_bytes`: Maximum observed receive-memory allocation since the previous stats
+  report (reset on read; catches pressure between the instantaneous samples)
 - `kernel_drops`: Packets dropped at this UDP socket according to `SO_MEMINFO`
+- `congest_kernel_drop` / `congest_rmem_pressure` / `congest_pool_stall`: Cumulative safety-latch
+  triggers by reason
+- `congest_full_vector`: Receive calls that returned the entire vector (informational, no latch)
+- `latch_entries`: Distinct safety-latch entries; `latch_active`, `latch_reason`, and
+  `latch_remaining_us` describe the current latch state
+- `idle_model_resets`: Rate-model resets after one second without traffic
+- `zero_sleep_reason`: Why the last computed sleep was zero (`none`, `disabled`, `latched`,
+  `warming_up`, `below_min`, `capacity`)
+- `interval_cycles` / `interval_coalesced_pct`: Drain cycles in the last adaptation window and the
+  percentage that coalesced
+- `interval_sleep_min_us` / `interval_sleep_mean_us` / `interval_sleep_max_us`: Sleep distribution
+  over the last adaptation window's coalesced cycles (the instantaneous `coalesce_us` can alias
+  rapid changes)
+- `pool_capacity` / `pool_outstanding` / `pool_available`: Slab-pool occupancy, proving or
+  disproving downstream buffer retention
+- `pool_stall_backoff_us`: Total time the receive thread has waited for pool buffers
 
 Kernel receive-queue drops are also exported separately as the
 `udp_source.kernel_drops` counter; they are not mixed into `udp_source.packets_dropped`, which

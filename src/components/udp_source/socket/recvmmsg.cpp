@@ -20,6 +20,7 @@
 #include <composite/buffers/external_buffer.hpp>
 
 #include "net/utils.hpp"
+#include "coalesce_controller.hpp"
 #include "recvmmsg.hpp"
 
 #include <arpa/inet.h>
@@ -260,6 +261,13 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
         m_logger->warn("recvmmsg target_batch {} exceeds the 25% SO_RCVBUF safety budget; "
                        "clamping target to {}", requested_target, m_coalesce_target_batch);
     }
+    if (m_max_coalesce > std::chrono::microseconds::zero()
+        && m_coalesce_target_batch > m_batch_size / 2) {
+        m_logger->warn("recvmmsg target_batch {} exceeds half the receive vector ({}); the "
+                       "adaptive delay is capped at the half-vector fill time so scheduling "
+                       "jitter cannot routinely fill the vector. Raise num_msgs for more "
+                       "coalescing headroom", m_coalesce_target_batch, m_batch_size);
+    }
     m_out_port = port;
     clear_stop_signal();
     m_recv_thread = std::jthread(&recvmmsg::receive, this);
@@ -300,6 +308,7 @@ auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
         const auto count = static_cast<std::size_t>(memory_len) / sizeof(memory[0]);
         if (count > SK_MEMINFO_RMEM_ALLOC) {
             m_socket_rmem_bytes.store(memory[SK_MEMINFO_RMEM_ALLOC], std::memory_order_relaxed);
+            note_rmem_observation(memory[SK_MEMINFO_RMEM_ALLOC]);
         }
         if (count > SK_MEMINFO_DROPS) {
             m_kernel_drops.store(memory[SK_MEMINFO_DROPS], std::memory_order_relaxed);
@@ -311,12 +320,49 @@ auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
     stats["recv_syscalls"] = std::to_string(m_recv_syscalls.load());
     stats["estimated_pps"] = std::to_string(m_estimated_pps.load());
     stats["coalesce_us"] = std::to_string(m_coalesce_us.load());
+    stats["nominal_coalesce_us"] = std::to_string(m_nominal_coalesce_us.load());
     stats["coalesce_target_batch"] = std::to_string(m_coalesce_target_batch);
     stats["effective_recv_buf"] = std::to_string(m_effective_recv_buf);
     stats["estimated_packet_charge"] = std::to_string(m_conservative_packet_charge);
     stats["socket_rmem_bytes"] = std::to_string(m_socket_rmem_bytes.load());
+    // Interval maximum, reset on read: the instantaneous sample above can miss pressure that
+    // occurred between the five-second reports.
+    stats["socket_rmem_peak_bytes"] = std::to_string(
+        m_socket_rmem_peak_bytes.exchange(0, std::memory_order_relaxed));
     stats["kernel_drops"] = std::to_string(m_kernel_drops.load());
+    stats["congest_full_vector"] = std::to_string(m_congest_full_vector.load());
+    stats["congest_pool_stall"] = std::to_string(m_congest_pool_stall.load());
+    stats["congest_kernel_drop"] = std::to_string(m_congest_kernel_drop.load());
+    stats["congest_rmem_pressure"] = std::to_string(m_congest_rmem_pressure.load());
+    stats["latch_entries"] = std::to_string(m_latch_entries.load());
+    stats["latch_active"] = std::to_string(m_latch_active.load());
+    stats["latch_reason"] = std::string{coalesce_controller::to_string(
+        static_cast<coalesce_controller::congestion_reason>(m_latch_reason.load()))};
+    stats["latch_remaining_us"] = std::to_string(m_latch_remaining_us.load());
+    stats["idle_model_resets"] = std::to_string(m_idle_model_resets.load());
+    stats["zero_sleep_reason"] = std::string{coalesce_controller::to_string(
+        static_cast<coalesce_controller::zero_sleep_reason>(m_zero_sleep_reason.load()))};
+    stats["pool_stall_backoff_us"] = std::to_string(m_pool_stall_backoff_us.load());
+    const auto interval_cycles = m_interval_cycles.load();
+    const auto interval_coalesced = m_interval_coalesced_cycles.load();
+    stats["interval_cycles"] = std::to_string(interval_cycles);
+    stats["interval_coalesced_pct"] = std::to_string(
+        interval_cycles > 0 ? interval_coalesced * 100 / interval_cycles : 0);
+    stats["interval_sleep_min_us"] = std::to_string(m_interval_sleep_min_us.load());
+    stats["interval_sleep_mean_us"] = std::to_string(m_interval_sleep_mean_us.load());
+    stats["interval_sleep_max_us"] = std::to_string(m_interval_sleep_max_us.load());
+    if (m_pool) {
+        stats["pool_capacity"] = std::to_string(m_pool->capacity());
+        stats["pool_outstanding"] = std::to_string(m_pool->outstanding());
+        stats["pool_available"] = std::to_string(m_pool->available());
+    }
     return stats;
+}
+
+auto recvmmsg::note_rmem_observation(uint64_t bytes) noexcept -> void {
+    auto prev = m_socket_rmem_peak_bytes.load(std::memory_order_relaxed);
+    while (prev < bytes && !m_socket_rmem_peak_bytes.compare_exchange_weak(
+               prev, bytes, std::memory_order_relaxed, std::memory_order_relaxed)) {}
 }
 
 auto recvmmsg::record_kernel_drop_snapshot(uint32_t drops) noexcept -> void {
@@ -353,7 +399,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
     // Acquire buffers from pool and set up iovecs
     auto acquire_buffer = [&](std::size_t idx) -> bool {
         constexpr auto ACQUIRE_BACKOFF = std::chrono::microseconds(50);
-        bool first_attempt = true;
+        std::optional<std::chrono::steady_clock::time_point> stall_start;
         while (!token.stop_requested()) {
             if (auto buf = m_pool->acquire()) {
                 buffers[idx] = std::move(buf);
@@ -366,11 +412,17 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                 msgs[idx].msg_hdr.msg_name = nullptr;
                 msgs[idx].msg_hdr.msg_namelen = 0;
                 msgs[idx].msg_len = 0;
+                if (stall_start) {
+                    m_pool_stall_backoff_us.fetch_add(static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - *stall_start).count()),
+                        std::memory_order_relaxed);
+                }
                 return true;
             }
-            if (first_attempt) {
+            if (!stall_start) {
                 pool_stalled = true;
-                first_attempt = false;
+                stall_start = std::chrono::steady_clock::now();
             }
             std::this_thread::sleep_for(ACQUIRE_BACKOFF);
         }
@@ -384,21 +436,54 @@ auto recvmmsg::receive(std::stop_token token) -> void {
     pool_stalled = false; // initial pool population is not downstream congestion
 
     using clock = std::chrono::steady_clock;
-    constexpr double RATE_EWMA_ALPHA = 0.2;
     constexpr auto IDLE_RATE_RESET = std::chrono::seconds(1);
-    constexpr std::size_t CONGESTION_CLEAN_CYCLES = 8;
-    constexpr uint64_t COALESCE_RMEM_DIVISOR = 4; // intentional delay may use at most 25%
 
-    auto rate_window_start = clock::now();
-    uint64_t rate_window_packets = 0;
+    // The safety latch holds the actual sleep at zero for one adaptation window after the last
+    // safety signal: long enough to drain and re-observe a healthy socket, short enough that a
+    // transient event costs milliseconds of coalescing rather than an EWMA relearn. The learned
+    // nominal delay is retained across the latch (see coalesce_controller).
+    auto controller = coalesce_controller(
+        coalesce_controller::settings{
+            .target_batch = m_coalesce_target_batch,
+            .batch_size = m_batch_size,
+            .min_coalesce = m_min_coalesce,
+            .max_coalesce = m_max_coalesce,
+            .adaptation_interval = m_adaptation_interval,
+            .latch_hold = m_adaptation_interval,
+        },
+        clock::now());
     uint64_t recv_syscalls = 0;
-    double estimated_pps = 0.0;
-    double nominal_coalesce_us = 0.0;
-    std::size_t congestion_clean_cycles_remaining = 0;
     const bool adaptive_enabled = m_max_coalesce > std::chrono::microseconds::zero();
     std::optional<clock::time_point> last_receive_error_log;
     uint64_t suppressed_receive_errors = 0;
     m_coalesce_us.store(0, std::memory_order_relaxed);
+
+    auto publish_controller = [&](clock::time_point now) {
+        const auto& counters = controller.counters();
+        m_estimated_pps.store(static_cast<uint64_t>(controller.estimated_pps()),
+                              std::memory_order_relaxed);
+        m_nominal_coalesce_us.store(static_cast<uint64_t>(controller.nominal_us()),
+                                    std::memory_order_relaxed);
+        m_congest_full_vector.store(counters.full_vector, std::memory_order_relaxed);
+        m_congest_pool_stall.store(counters.pool_stall, std::memory_order_relaxed);
+        m_congest_kernel_drop.store(counters.kernel_drop, std::memory_order_relaxed);
+        m_congest_rmem_pressure.store(counters.rmem_pressure, std::memory_order_relaxed);
+        m_latch_entries.store(counters.latch_entries, std::memory_order_relaxed);
+        m_idle_model_resets.store(counters.idle_resets, std::memory_order_relaxed);
+        m_latch_active.store(controller.latch_active(now) ? 1 : 0, std::memory_order_relaxed);
+        m_latch_reason.store(static_cast<uint8_t>(controller.latch_reason()),
+                             std::memory_order_relaxed);
+        m_latch_remaining_us.store(controller.latch_remaining_us(now),
+                                   std::memory_order_relaxed);
+        m_zero_sleep_reason.store(static_cast<uint8_t>(controller.zero_reason()),
+                                  std::memory_order_relaxed);
+        const auto& interval = controller.interval();
+        m_interval_cycles.store(interval.cycles, std::memory_order_relaxed);
+        m_interval_coalesced_cycles.store(interval.coalesced_cycles, std::memory_order_relaxed);
+        m_interval_sleep_min_us.store(interval.min_sleep_us, std::memory_order_relaxed);
+        m_interval_sleep_mean_us.store(interval.mean_sleep_us, std::memory_order_relaxed);
+        m_interval_sleep_max_us.store(interval.max_sleep_us, std::memory_order_relaxed);
+    };
 
     struct socket_memory_snapshot {
         uint64_t allocated{};
@@ -433,74 +518,46 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         };
     };
 
-    auto enter_congestion = [&] {
-        congestion_clean_cycles_remaining = CONGESTION_CLEAN_CYCLES;
-        nominal_coalesce_us = 0.0;
-        m_coalesce_us.store(0, std::memory_order_relaxed);
-    };
-
-    auto observe_socket_memory = [&](bool& cycle_congested)
-        -> std::optional<socket_memory_snapshot> {
+    auto last_safety_observe = clock::now();
+    auto observe_socket_memory = [&]() -> std::optional<socket_memory_snapshot> {
+        last_safety_observe = clock::now();
         auto snapshot = read_socket_memory();
         if (!snapshot) { return std::nullopt; }
         m_socket_rmem_bytes.store(snapshot->allocated, std::memory_order_relaxed);
+        note_rmem_observation(snapshot->allocated);
         m_kernel_drops.store(snapshot->drops, std::memory_order_relaxed);
         record_kernel_drop_snapshot(static_cast<uint32_t>(snapshot->drops));
 
+        const auto now = clock::now();
         if (have_drop_baseline && snapshot->drops != last_kernel_drops) {
             // SK_MEMINFO_DROPS is u32. Unsigned subtraction preserves the delta across its wrap
             // (assuming fewer than 2^32 drops between observations, which is unavoidable here).
             const auto delta = static_cast<uint32_t>(snapshot->drops)
                 - static_cast<uint32_t>(last_kernel_drops);
-            if (congestion_clean_cycles_remaining == 0) {
-                m_logger->warn("UDP socket dropped {} packet(s); disabling coalescing until {} clean drains",
-                               delta, CONGESTION_CLEAN_CYCLES);
+            if (controller.enter_congestion(
+                    coalesce_controller::congestion_reason::kernel_drop, now)) {
+                m_logger->warn("UDP socket dropped {} packet(s); suspending coalescing "
+                               "(learned delay retained)", delta);
             }
-            cycle_congested = true;
-            enter_congestion();
         }
         last_kernel_drops = snapshot->drops;
         have_drop_baseline = true;
 
-        if (snapshot->limit > 0
-            && snapshot->allocated >= snapshot->limit / COALESCE_RMEM_DIVISOR) {
-            cycle_congested = true;
-            enter_congestion();
+        if (snapshot->limit > 0) {
+            // Hysteresis: latch at 25% occupancy; while latched for occupancy, keep re-arming
+            // until it falls below 12.5% so boundary chatter cannot flap the latch.
+            const auto rmem_latched = controller.latch_active(now)
+                && controller.latch_reason()
+                    == coalesce_controller::congestion_reason::rmem_pressure;
+            const auto divisor = rmem_latched
+                ? coalesce_controller::RMEM_DIVISOR * 2
+                : coalesce_controller::RMEM_DIVISOR;
+            if (snapshot->allocated >= snapshot->limit / divisor) {
+                controller.enter_congestion(
+                    coalesce_controller::congestion_reason::rmem_pressure, now);
+            }
         }
         return snapshot;
-    };
-
-    auto update_rate_and_interval = [&](std::size_t packets) {
-        rate_window_packets += packets;
-        const auto now = clock::now();
-        const auto elapsed = now - rate_window_start;
-        if (elapsed < m_adaptation_interval) { return; }
-
-        const auto elapsed_seconds = std::chrono::duration<double>(elapsed).count();
-        // Backpressure stretches wall-clock receive intervals and would make this estimate falsely
-        // low. Do not teach the feed-forward controller while a safety latch is active.
-        if (congestion_clean_cycles_remaining == 0) {
-            const auto measured_pps = static_cast<double>(rate_window_packets) / elapsed_seconds;
-            estimated_pps = estimated_pps == 0.0
-                ? measured_pps
-                : RATE_EWMA_ALPHA * measured_pps + (1.0 - RATE_EWMA_ALPHA) * estimated_pps;
-
-            double desired_us = static_cast<double>(m_min_coalesce.count());
-            if (estimated_pps > 0.0 && m_coalesce_target_batch > 1) {
-                desired_us = (static_cast<double>(m_coalesce_target_batch - 1) * 1'000'000.0)
-                    / estimated_pps;
-            }
-            desired_us = std::clamp(desired_us,
-                static_cast<double>(m_min_coalesce.count()),
-                static_cast<double>(m_max_coalesce.count()));
-            // Keep a floating-point accumulator so sub-microsecond convergence is not lost to
-            // integral duration truncation.
-            nominal_coalesce_us += RATE_EWMA_ALPHA * (desired_us - nominal_coalesce_us);
-        }
-        m_estimated_pps.store(static_cast<uint64_t>(estimated_pps), std::memory_order_relaxed);
-        m_recv_syscalls.store(recv_syscalls, std::memory_order_relaxed);
-        rate_window_packets = 0;
-        rate_window_start = now;
     };
 
     while (!token.stop_requested()) {
@@ -529,42 +586,24 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         if (clock::now() - wait_started >= IDLE_RATE_RESET) {
             // A stopped/restarted or intermittent source should not inherit a stale rate from the
             // previous run. Start conservatively and relearn from the new stream.
-            estimated_pps = 0.0;
-            nominal_coalesce_us = 0.0;
-            rate_window_packets = 0;
-            rate_window_start = clock::now();
+            controller.on_idle_reset(clock::now());
             m_estimated_pps.store(0, std::memory_order_relaxed);
             m_coalesce_us.store(0, std::memory_order_relaxed);
         }
 
-        bool cycle_congested = false;
         pool_stalled = false;
-        auto memory_before = observe_socket_memory(cycle_congested);
+        auto memory_before = observe_socket_memory();
 
-        // COALESCE: the EWMA supplies a nominal delay, but socket capacity and the congestion latch
-        // have absolute priority. With no SO_MEMINFO support, retain the same conservative static
-        // budget using the verified SO_RCVBUF value and one packet already queued.
-        uint64_t allocated = memory_before
+        // COALESCE: the controller supplies the sleep from its learned nominal delay; socket
+        // capacity and the safety latch have absolute priority inside compute_sleep. With no
+        // SO_MEMINFO support, retain the same conservative static budget using the verified
+        // SO_RCVBUF value and one packet already queued.
+        const uint64_t allocated = memory_before
             ? memory_before->allocated : m_conservative_packet_charge;
-        uint64_t limit = memory_before && memory_before->limit > 0
+        const uint64_t limit = memory_before && memory_before->limit > 0
             ? memory_before->limit : m_effective_recv_buf;
-        double actual_coalesce_us = 0.0;
-        if (congestion_clean_cycles_remaining == 0
-            && estimated_pps > 0.0
-            && nominal_coalesce_us > 0.0
-            && limit / COALESCE_RMEM_DIVISOR > allocated) {
-            const auto safe_bytes = limit / COALESCE_RMEM_DIVISOR - allocated;
-            const auto capacity_us = static_cast<double>(safe_bytes) * 1'000'000.0
-                / (estimated_pps * static_cast<double>(m_conservative_packet_charge));
-            actual_coalesce_us = std::min(nominal_coalesce_us, capacity_us);
-            if (actual_coalesce_us < static_cast<double>(m_min_coalesce.count())) {
-                actual_coalesce_us = 0.0; // never violate the capacity ceiling to satisfy a minimum
-            }
-            actual_coalesce_us = std::min(
-                actual_coalesce_us, static_cast<double>(m_max_coalesce.count()));
-        }
-        const auto current_coalesce = std::chrono::microseconds(
-            static_cast<int64_t>(std::max(0.0, actual_coalesce_us)));
+        const auto current_coalesce = controller.compute_sleep(
+            clock::now(), allocated, limit, m_conservative_packet_charge);
         m_coalesce_us.store(current_coalesce.count(), std::memory_order_relaxed);
 
         if (current_coalesce > std::chrono::microseconds::zero()) {
@@ -621,13 +660,26 @@ auto recvmmsg::receive(std::stop_token token) -> void {
             if (recvd == 0) { break; }
 
             const auto msgs_recvd = static_cast<std::size_t>(recvd);
-            // Backlog signals are evaluated before rate sampling so stalls/full vectors cannot
-            // train the EWMA toward a longer delay.
-            if (msgs_recvd == m_batch_size) {
-                cycle_congested = true;
-                enter_congestion();
+            const auto batch_now = clock::now();
+
+            // A continuously busy drain may never reach EAGAIN, so the pre-coalesce safety
+            // sample alone cannot bound how stale drop/occupancy feedback gets. Re-observe on
+            // the adaptation cadence — and BEFORE on_packets(), so a drop or unsafe occupancy
+            // discovered by this sample taints the current window before it can roll and train
+            // the model. Also keeps telemetry fresh for the stats thread.
+            if (batch_now - last_safety_observe >= m_adaptation_interval) {
+                observe_socket_memory();
+                m_recv_syscalls.store(recv_syscalls, std::memory_order_relaxed);
+                publish_controller(batch_now);
             }
-            update_rate_and_interval(msgs_recvd);
+
+            if (msgs_recvd == m_batch_size) {
+                // Load information only, never a latch: this drain loop already continues
+                // nonblocking to EAGAIN, and sustained overload surfaces through the
+                // kernel-drop and receive-memory safety signals.
+                controller.note_full_vector();
+            }
+            controller.on_packets(msgs_recvd, batch_now);
 
             m_pkts_recvd.fetch_add(msgs_recvd, std::memory_order_relaxed);
             m_metrics.packets_received.add(msgs_recvd);
@@ -661,20 +713,19 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                 if (!acquire_buffer(i)) { return; }
             }
             if (pool_stalled) {
-                cycle_congested = true;
-                enter_congestion();
+                controller.enter_congestion(
+                    coalesce_controller::congestion_reason::pool_stall, clock::now());
+                pool_stalled = false; // count distinct stall episodes, not one per drain pass
             }
         }
 
         // The next cycle's pre-coalesce observation catches drops that occurred during this drain.
         // Keeping that sample (rather than reusing a stale post-drain value across WAIT) preserves
         // the occupancy guard while avoiding a second SO_MEMINFO syscall per cycle.
-        if (!cycle_congested && congestion_clean_cycles_remaining > 0) {
-            --congestion_clean_cycles_remaining;
-        }
-        // This is a single-writer statistic. Publish once per complete drain rather than paying
-        // for an atomic RMW on every syscall in the hot path.
+        // These are single-writer statistics. Publish once per complete drain rather than paying
+        // for atomic RMWs on every syscall in the hot path.
         m_recv_syscalls.store(recv_syscalls, std::memory_order_relaxed);
+        publish_controller(clock::now());
     }
 }
 
