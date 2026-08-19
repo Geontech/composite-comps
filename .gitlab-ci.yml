@@ -1,0 +1,473 @@
+# composite-comps CI -- build, ABI/install contract, and sanitizer gates for the component fleet.
+#
+# FRAMEWORK ACQUISITION. Every job here stages the framework FROM SOURCE at a pinned ref into a
+# clean prefix and builds the fleet only against that, so a qualification run is always against one
+# known framework install rather than whatever happened to be present.
+#
+# Running the fast jobs *inside* the published `composite:<ver>-devel` image would be closer to what
+# a customer gets, but it does not work for a GitLab job: the devel image
+# declares `USER 10001:10001` and .gitlab-ci.yml has no per-job user override, so the job cannot
+# install the fleet's own build dependencies (fftw, openssl, zlib). The published-SDK path is
+# therefore proven by `build:container` (docker build can `USER root`), not by these jobs.
+
+stages:
+  - lint
+  - build
+  - sanitize
+  - publish
+
+variables:
+  # The framework release the fleet is qualified against. Keep in lockstep with
+  # COMPS_COMPOSITE_VERSION in CMakeLists.txt -- build:test asserts they agree.
+  COMPOSITE_VERSION: "0.5.0"
+  # The ref to stage from. Normally the tag; overridable so the fleet stays buildable before the
+  # framework tag exists; switch it to the tag once that tag is published and qualified.
+  COMPOSITE_REF: "v0.5.0"
+  COMPOSITE_REPO: "https://github.com/geontech/composite.git"
+  STAGED_FRAMEWORK: "/opt/staged-framework"
+  GIT_DEPTH: "50"
+  # The published framework images the fleet image is built ON and runs ON. The fleet does not
+  # compile the framework: the ABI in the image must provably be the reviewed one. Release builds
+  # pass DIGESTS (composite:0.5.0-devel@sha256:...); tags are acceptable for branch pipelines.
+  COMPOSITE_DEVEL_IMAGE: "geontech/composite:0.5.0-devel"
+  COMPOSITE_RUNTIME_IMAGE: "geontech/composite:0.5.0"
+
+# ---------------------------------------------------------------------------
+# Stage the framework from source, with the SAME sanitizer setting the fleet will use.
+#
+# This is what makes the sanitizer jobs meaningful: TSan needs the framework instrumented too,
+# and an uninstrumented libcomposite would silently hide races that cross the API boundary.
+# COMPOSITE_PREFIX is what every CMakePresets entry reads (see the hidden `base` preset), so
+# after this the jobs are plain `cmake --preset <name>`.
+# ---------------------------------------------------------------------------
+.framework:
+  image: gcc:14
+  variables:
+    COMPS_SANITIZER: ""
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake git ninja-build pkg-config
+        nlohmann-json3-dev libfftw3-dev libssl-dev zlib1g-dev
+    - cmake --version && g++ --version | head -1
+    - git clone --depth 1 --branch "$COMPOSITE_REF" "$COMPOSITE_REPO" /tmp/composite
+    - >-
+      cmake -S /tmp/composite -B /tmp/composite/build -G Ninja
+      -DCMAKE_BUILD_TYPE=Debug
+      -DCOMPOSITE_INSTALL=ON
+      -DCOMPOSITE_BUILD_TESTS=OFF
+      -DCOMPOSITE_SANITIZER="$COMPS_SANITIZER"
+      -DCMAKE_INSTALL_PREFIX="$STAGED_FRAMEWORK"
+    - cmake --build /tmp/composite/build --target install --parallel "$(nproc)"
+    - export COMPOSITE_PREFIX="$STAGED_FRAMEWORK"
+
+# ---------------------------------------------------------------------------
+# Formatting. ADVISORY ONLY for now: .clang-format is checked in so the config is shared with
+# the framework, but the fleet tree has never been formatted, so this reports rather than gates.
+# Reformatting the whole tree is a deliberate, separate commit -- it rewrites git blame across
+# every component and has no business landing inside a release window. Drop allow_failure once
+# that commit exists.
+# ---------------------------------------------------------------------------
+lint:format:
+  stage: lint
+  image: gcc:14
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clang-format
+  script:
+    - clang-format --version
+    - >-
+      clang-format --dry-run --Werror
+      $(find include src test -name '*.hpp' -o -name '*.cpp')
+
+# ---------------------------------------------------------------------------
+# The build gate: Debug + tests + warnings-as-errors, and the whole ctest suite.
+#
+# The suite includes the 12 generated ABI tests, which dlopen every shipped module and drive
+# create() through the real handshake. That is the fleet's load-bearing gate: components ship as
+# MODULE DSOs, so an ABI or link mistake is invisible until dlopen -- a module with unresolved
+# symbols links with exit 0.
+# ---------------------------------------------------------------------------
+build:test:
+  stage: build
+  extends: .framework
+  script:
+    # The fleet's declared framework requirement must match what CI stages, or the gate is
+    # qualifying something the release does not describe.
+    - |
+      declared="$(sed -n 's/^set(COMPS_COMPOSITE_VERSION "\([^"]*\)".*/\1/p' CMakeLists.txt)"
+      test -n "$declared"
+      test "$declared" = "$COMPOSITE_VERSION" || {
+        echo "CMakeLists declares composite $declared but CI stages $COMPOSITE_VERSION"; exit 1; }
+    - cmake --preset ci
+    - cmake --build --preset ci --parallel "$(nproc)"
+    - ctest --preset ci
+
+# ---------------------------------------------------------------------------
+# The install/packaging contract -- what the container image will copy.
+# ---------------------------------------------------------------------------
+build:install:
+  stage: build
+  extends: .framework
+  script:
+    - cmake --preset install -DCMAKE_INSTALL_PREFIX="$CI_PROJECT_DIR/_install"
+    - cmake --build --preset install --parallel "$(nproc)"
+    - manifest="$CI_PROJECT_DIR/_install/share/composite-comps/manifest.json"
+    - test -f "$manifest"
+    - cat "$manifest"
+    # Every installed module must appear in the manifest. The reverse direction cannot break:
+    # CMake generates the manifest from the same list it installs from.
+    - |
+      set -eu
+      count=0
+      for so in $(find "$CI_PROJECT_DIR/_install" -name 'lib*.so'); do
+        m=$(basename "$so" .so); m=${m#lib}
+        grep -q "\"$m\"" "$manifest" || { echo "installed module $m is absent from the manifest"; exit 1; }
+        count=$((count + 1))
+      done
+      test "$count" -gt 0
+      echo "$count modules installed, all present in the manifest"
+    # No unresolved shared-library dependencies in any shipped module.
+    # This is the check that would have caught ws_sink's missing runtime openssl/zlib.
+    #
+    # The staged framework is not on the default loader path, so it must be named explicitly --
+    # without this every module reports `libcomposite.so.0.5 => not found` and the check is a
+    # false positive rather than a gate. In the runtime image the framework lives in
+    # /usr/local/lib64 with an ld.so.conf entry, so build:container needs no equivalent.
+    - |
+      set -eu
+      export LD_LIBRARY_PATH="$STAGED_FRAMEWORK/lib64:$STAGED_FRAMEWORK/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      for so in $(find "$CI_PROJECT_DIR/_install" -name 'lib*.so'); do
+        if ldd "$so" | grep 'not found'; then
+          echo "unresolved dependency in $so"; exit 1
+        fi
+      done
+      echo "all modules fully resolved (LD_LIBRARY_PATH=$LD_LIBRARY_PATH)"
+    # The fleet installs component modules and its manifest. Nothing else -- a dependency that
+    # starts installing its own SDK into our prefix (IXWebSocket did) ships in the image and
+    # becomes redistribution we owe notices for.
+    - |
+      set -eu
+      unexpected=$(find "$CI_PROJECT_DIR/_install" -type f \
+        ! -name 'lib*.so' ! -name 'manifest.json' | sort)
+      if [ -n "$unexpected" ]; then
+        echo "unexpected files in the install tree:"; echo "$unexpected"; exit 1
+      fi
+      echo "install tree is modules + manifest only"
+  artifacts:
+    paths: ["_install/share/composite-comps/manifest.json"]
+    expire_in: 1 month
+
+# Build the documented option combinations so the optional paths do not rot.
+# `portable` also proves nothing in the fleet needs -march=x86-64-v2 or -ffast-math to compile,
+# which is the precondition for any future non-x86 port.
+build:options-matrix:
+  stage: build
+  extends: .framework
+  parallel:
+    matrix:
+      - PRESET: "portable"
+      - PRESET: "release"
+  script:
+    - cmake --preset "$PRESET"
+    - cmake --build --preset "$PRESET" --parallel "$(nproc)"
+    - ctest --preset "$PRESET"
+
+# udp_source/socket/dpdk.cpp and socket/igmp.cpp compile ONLY when the framework itself was
+# built with DPDK (COMPS_HAS_DPDK is detected from composite's interface definitions, never set
+# by hand). This is the only job that sees them, so it is the only thing keeping them compiling.
+# No NIC or hugepages here: compile coverage is the goal.
+build:dpdk:
+  stage: build
+  image: gcc:14
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq cmake git ninja-build pkg-config libdpdk-dev
+        nlohmann-json3-dev libfftw3-dev libssl-dev zlib1g-dev
+    - pkg-config --modversion libdpdk
+    - git clone --depth 1 --branch "$COMPOSITE_REF" "$COMPOSITE_REPO" /tmp/composite
+    - >-
+      cmake -S /tmp/composite -B /tmp/composite/build -G Ninja
+      -DCMAKE_BUILD_TYPE=Release -DCOMPOSITE_INSTALL=ON -DCOMPOSITE_BUILD_TESTS=OFF
+      -DCOMPOSITE_USE_DPDK=ON -DCMAKE_INSTALL_PREFIX="$STAGED_FRAMEWORK"
+    - cmake --build /tmp/composite/build --target install --parallel "$(nproc)"
+    - export COMPOSITE_PREFIX="$STAGED_FRAMEWORK"
+  script:
+    # If the probe does not fire, dpdk.cpp/igmp.cpp are never compiled and this job is a green
+    # build that checked nothing. Assert the probe, do not just hope for it.
+    - cmake --preset dpdk 2>&1 | tee /tmp/cfg.log
+    - |
+      grep -q 'framework has DPDK; udp_source DPDK backend enabled' /tmp/cfg.log || {
+        echo "DPDK probe did not fire -- dpdk.cpp/igmp.cpp were NOT compiled"; exit 1; }
+    - cmake --build --preset dpdk --parallel "$(nproc)"
+
+# ---------------------------------------------------------------------------
+# Sanitizer gates. The framework is staged with the MATCHING sanitizer (see .framework).
+# ---------------------------------------------------------------------------
+sanitize:address:
+  stage: sanitize
+  extends: .framework
+  variables:
+    COMPS_SANITIZER: "address,undefined"
+  script:
+    - cmake --preset asan-ubsan
+    - cmake --build --preset asan-ubsan --parallel "$(nproc)"
+    # Includes pkt_parser_fuzz, the untrusted-input gate for the OOB-read guards.
+    - ctest --preset asan-ubsan
+
+sanitize:thread:
+  stage: sanitize
+  extends: .framework
+  variables:
+    COMPS_SANITIZER: "thread"
+  script:
+    - cmake --preset tsan
+    - cmake --build --preset tsan --parallel "$(nproc)"
+    # 69 of the 73 tests: the four ws_sink integration tests are not registered under TSan
+    # because IXWebSocket reports a lock-order-inversion in its own transport
+    # (IXWebSocketTransport.cpp:212) -- third-party, and the same position the framework takes
+    # on its httplib test. Handled in CMake, so no -E filter is needed here.
+    #
+    # psd/fft/exp_smooth are loadable under TSan only because include/simd_fmv.hpp compiles
+    # their multiversioned kernels down to the default version; GCC implements function
+    # multiversioning with IFUNC resolvers, which run before the TSan runtime exists.
+    - ctest --preset tsan
+
+# ---------------------------------------------------------------------------
+# Docker-in-Docker, isolated to the image jobs.
+#
+# Lifted from the framework's CI, comments included, because each line there was hard-won:
+# deliberately untagged (the project's default runners already permit the pinned dind service);
+# client and daemon pinned to identical versions; DOCKER_AUTH_CONFIG unset after the runner has
+# pulled the job images (Docker CLI 29 consumes that variable itself and rejects the runner's
+# credsStore form, aborting Buildx sessions); and the TLS endpoint materialized as a named context
+# whose automatic daemon-backed builder is used, rather than nesting a docker-container builder
+# inside dind.
+# ---------------------------------------------------------------------------
+.docker:
+  image: docker:29.1.3-cli
+  services:
+    - name: docker:29.1.3-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker version
+    - docker context create comps-dind
+    - export DOCKER_CONTEXT=comps-dind
+    - docker buildx inspect --bootstrap
+
+# ---------------------------------------------------------------------------
+# Build both image targets and assert the packaging contract. No registry credentials are
+# available here and nothing is pushed: branch and merge-request pipelines prove the contract only.
+#
+# Every assertion below was validated by hand against a locally built image before being written
+# as a gate, including the smoke sequence.
+# ---------------------------------------------------------------------------
+build:container:
+  stage: build
+  extends: .docker
+  script:
+    - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - export IMAGE_VERSION="$(sed -n 's/^project(composite-comps VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+    - test -n "$IMAGE_VERSION"
+    - export FRAMEWORK_VERSION="$(sed -n 's/^set(COMPS_COMPOSITE_VERSION "\([^"]*\)".*/\1/p' CMakeLists.txt)"
+    - test -n "$FRAMEWORK_VERSION"
+    - |
+      for target in runtime runtime-smoke; do
+        docker buildx build \
+          --file docker/Dockerfile.rocky9 \
+          --platform linux/amd64 \
+          --target "$target" \
+          --build-arg COMPOSITE_DEVEL_IMAGE="$COMPOSITE_DEVEL_IMAGE" \
+          --build-arg COMPOSITE_RUNTIME_IMAGE="$COMPOSITE_RUNTIME_IMAGE" \
+          --build-arg IMAGE_CREATED="$IMAGE_CREATED" \
+          --build-arg IMAGE_REVISION="$CI_COMMIT_SHA" \
+          --build-arg IMAGE_VERSION="$IMAGE_VERSION" \
+          --build-arg IMAGE_SOURCE="$CI_PROJECT_URL" \
+          --build-arg COMPOSITE_VERSION="$FRAMEWORK_VERSION" \
+          --tag "composite-comps:ci-$target" \
+          --load .
+      done
+
+    # --- non-root, and no build toolchain leaked from the SDK base ---------
+    - test "$(docker image inspect --format '{{.Config.User}}' composite-comps:ci-runtime)" = "10001:10001"
+    - >-
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime -c
+      'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++; test ! -e /usr/local/include/composite'
+
+    # --- the CAP_NET_RAW binary is gone and must stay gone ----------------
+    # The previous image shipped a setcap'd duplicate of the CLI. packet_mmap and DPDK are
+    # deployment choices (--cap-add NET_RAW), never a file capability baked into a public image.
+    - >-
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime -c
+      'test ! -e /usr/local/bin/composite-cli-priv'
+
+    # --- the module set, cross-checked against the generated manifest -----
+    # The manifest is the fleet's provenance record (the fleet versions independently of the
+    # framework, so the tag cannot tell you what is inside). It must agree with what shipped.
+    - |
+      set -eu
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime -c '
+        set -eu
+        manifest=/usr/local/share/composite-comps/manifest.json
+        test -f "$manifest"
+        count=0
+        for so in /usr/local/lib64/lib*.so; do
+          m=$(basename "$so" .so); m=${m#lib}
+          grep -q "\"$m\"" "$manifest" || { echo "installed module $m absent from the manifest"; exit 1; }
+          count=$((count + 1))
+        done
+        test "$count" -gt 0
+        echo "$count modules installed, all present in the manifest"'
+
+    # --- no unresolved shared-library dependencies ------------------------
+    # This is the check that catches a missing runtime package: ws_sink links TLS-enabled
+    # IXWebSocket, and the previous image installed neither openssl-libs nor zlib, so it could
+    # never have loaded. It passes on a build host (those libraries are present there) and fails
+    # here, which is the whole point of asserting it in the image.
+    - |
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime -c '
+        set -eu
+        fail=0
+        for so in /usr/local/lib64/lib*.so; do
+          if ldd "$so" | grep -q "not found"; then echo "UNRESOLVED: $so"; ldd "$so" | grep "not found"; fail=1; fi
+        done
+        test $fail -eq 0 && echo "all modules fully resolved"'
+
+    # --- licences: ours plus every vendored dependency's ------------------
+    - >-
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime -c
+      'set -eu; test -s /usr/share/licenses/composite-comps/LICENSE;
+       for dep in ixwebsocket vrtgen; do ls /usr/share/licenses/composite-comps/third-party/"$dep"/* >/dev/null; done'
+
+    # --- shipped example pipelines ---------------------------------------
+    - >-
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime -c
+      'ls /usr/share/composite-comps/examples/*.json >/dev/null'
+
+    # --- OCI + Red Hat labels -------------------------------------------
+    # The framework base sets its own name/version/description, and a label can be overwritten but
+    # never removed: left alone this image would identify itself as the framework. Assert the
+    # restated values so a base-image bump cannot quietly undo it, and assert the framework pairing
+    # is recorded -- with independent fleet versioning, the tag does not imply it.
+    - |
+      set -eu
+      img=composite-comps:ci-runtime
+      test "$(docker image inspect --format '{{index .Config.Labels "name"}}' "$img")" = "composite-comps"
+      test "$(docker image inspect --format '{{index .Config.Labels "version"}}' "$img")" = "$IMAGE_VERSION"
+      test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img")" = "$IMAGE_VERSION"
+      test "$(docker image inspect --format '{{index .Config.Labels "license"}}' "$img")" = "LGPL-3.0-or-later"
+      test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.licenses"}}' "$img")" = "LGPL-3.0-or-later"
+      test "$(docker image inspect --format '{{index .Config.Labels "vendor"}}' "$img")" = "Geon Technologies, LLC"
+      test "$(docker image inspect --format '{{index .Config.Labels "com.geontech.composite.version"}}' "$img")" = "$FRAMEWORK_VERSION"
+
+    # --- the smoke gate: every shipped module loads, configures, and shuts down cleanly ---
+    # docker/smoke/smoke.json instantiates ALL 11 modules. That is what turns "the modules dlopen"
+    # (which ctest's abi_smoke already proves) into "the modules configure and run in the image".
+    - docker run --detach --name comps-smoke composite-comps:ci-runtime-smoke
+    - |
+      ready=0
+      for attempt in $(seq 1 60); do
+        if docker logs comps-smoke 2>&1 | grep -q 'REST server listening'; then ready=1; break; fi
+        sleep 0.25
+      done
+      test "$ready" = 1
+    - |
+      if docker logs comps-smoke 2>&1 | grep -iE 'error|threw|failed to load'; then
+        echo "a module failed to load or configure"; exit 1
+      fi
+    - docker kill --signal TERM comps-smoke
+    - test "$(docker wait comps-smoke)" = 0
+  after_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker rm -f comps-smoke 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Publish to Docker Hub.
+#
+# Build once, push under the source-SHA tag with SBOM and max provenance, test the
+# registry-resolved artifact, then promote that same manifest to the release aliases. Promotion
+# never triggers a second compilation.
+#
+# Uses the SAME four protected variables as the framework's publish job -- DOCKERHUB_NAMESPACE,
+# DOCKERHUB_LOGIN, DOCKERHUB_TOKEN, DOCKERHUB_REPOSITORY -- so credentials and namespace are
+# configured identically in both projects and the repository name is CI configuration rather than
+# something hardcoded here. Set DOCKERHUB_REPOSITORY=composite-comps in this project's settings.
+#
+# Manual even on a protected release tag: the protected environment supplies the approval and
+# audit boundary.
+# ---------------------------------------------------------------------------
+publish:dockerhub:
+  stage: publish
+  extends: .docker
+  resource_group: dockerhub-composite-comps
+  environment:
+    name: dockerhub-production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/'
+      when: manual
+    - when: never
+  script:
+    - test -n "$DOCKERHUB_NAMESPACE"
+    - test -n "$DOCKERHUB_LOGIN"
+    - test -n "$DOCKERHUB_TOKEN"
+    - test -n "$DOCKERHUB_REPOSITORY"
+    - export IMAGE_NAME="$DOCKERHUB_NAMESPACE/$DOCKERHUB_REPOSITORY"
+    - export IMAGE_VERSION="${CI_COMMIT_TAG#v}"
+    - export PROJECT_VERSION="$(sed -n 's/^project(composite-comps VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+    - export FRAMEWORK_VERSION="$(sed -n 's/^set(COMPS_COMPOSITE_VERSION "\([^"]*\)".*/\1/p' CMakeLists.txt)"
+    # The tag must match the FLEET's own version. Deliberately no assertion relating the tag to the
+    # framework version: the fleet versions independently of the framework, so a tag that implied a
+    # framework release would be wrong. The pairing is recorded in the image label and manifest.
+    - export RELEASE_BASE_VERSION="${IMAGE_VERSION%%-rc.*}"
+    - test "$RELEASE_BASE_VERSION" = "$PROJECT_VERSION"
+    - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - export SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA"
+    - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.rocky9
+      --platform linux/amd64
+      --target runtime
+      --build-arg COMPOSITE_DEVEL_IMAGE="$COMPOSITE_DEVEL_IMAGE"
+      --build-arg COMPOSITE_RUNTIME_IMAGE="$COMPOSITE_RUNTIME_IMAGE"
+      --build-arg IMAGE_CREATED="$IMAGE_CREATED"
+      --build-arg IMAGE_REVISION="$CI_COMMIT_SHA"
+      --build-arg IMAGE_VERSION="$IMAGE_VERSION"
+      --build-arg IMAGE_SOURCE="$CI_PROJECT_URL"
+      --build-arg COMPOSITE_VERSION="$FRAMEWORK_VERSION"
+      --tag "$SHA_TAG"
+      --provenance=mode=max
+      --sbom=true
+      --push
+      .
+    # Test the REGISTRY-resolved artifact, not the local build, before adding any release alias.
+    - docker pull "$SHA_TAG"
+    - >-
+      docker run --rm --entrypoint /bin/bash "$SHA_TAG" -c
+      'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++;
+       test ! -e /usr/local/bin/composite-cli-priv;
+       test -f /usr/local/share/composite-comps/manifest.json;
+       ls /usr/local/lib64/lib*.so >/dev/null'
+    - test "$(docker image inspect --format '{{index .Config.Labels "com.geontech.composite.version"}}' "$SHA_TAG")" = "$FRAMEWORK_VERSION"
+    # Promote the tested manifest. imagetools create re-tags; it does not rebuild.
+    - docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION" "$SHA_TAG"
+    # A release candidate gets its exact tag and nothing else: it must never move the minor alias
+    # or latest.
+    - |
+      case "$IMAGE_VERSION" in
+        *-rc.*) ;;
+        *)
+          minor="${IMAGE_VERSION%.*}"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor" "$SHA_TAG"
+          docker buildx imagetools create --tag "$IMAGE_NAME:latest" "$SHA_TAG"
+          ;;
+      esac
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION"
+  after_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker logout 2>/dev/null || true

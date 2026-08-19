@@ -1,0 +1,68 @@
+{
+  "_comment": "CI smoke graph: instantiates EVERY shipped module, so the container gate proves each one loads, configures, and survives shutdown -- not merely that it dlopens. No connections: this is a module-load and lifecycle gate, not a dataflow test.",
+  "components": [
+    {
+      "id": "smoke_exp_smooth",
+      "library": "exp_smooth",
+      "args": {
+        "type": "f32"
+      }
+    },
+    {
+      "id": "smoke_fft",
+      "library": "fft",
+      "args": {
+        "type": "cf32"
+      }
+    },
+    {
+      "id": "smoke_file_writer",
+      "library": "file_writer",
+      "properties": {
+        "filename": "/tmp/smoke.bin"
+      }
+    },
+    {
+      "id": "smoke_framer",
+      "library": "framer",
+      "args": {
+        "type": "cf32"
+      }
+    },
+    {
+      "id": "smoke_histogram",
+      "library": "histogram"
+    },
+    {
+      "id": "smoke_pkt_builder",
+      "library": "pkt_builder"
+    },
+    {
+      "id": "smoke_pkt_parser",
+      "library": "pkt_parser"
+    },
+    {
+      "id": "smoke_psd",
+      "library": "psd",
+      "args": {
+        "type": "f32"
+      }
+    },
+    {
+      "id": "smoke_udp_sink",
+      "library": "udp_sink"
+    },
+    {
+      "id": "smoke_udp_source",
+      "library": "udp_source"
+    },
+    {
+      "id": "smoke_ws_sink",
+      "library": "ws_sink",
+      "args": {
+        "type": "cf32"
+      }
+    }
+  ],
+  "connections": []
+}
