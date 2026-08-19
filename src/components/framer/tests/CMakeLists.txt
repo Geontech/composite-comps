@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2025 Geon Technologies, LLC
+# Copyright (C) 2024 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -14,86 +14,49 @@
 # for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see http://www.gnu.org/licenses/.
+# along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-# Framer component unit tests
+# Framer component unit tests.
+#
+# Both targets link framer_objs rather than recompiling ../component.cpp, so the tested
+# code is the same objects, built with the same flags, as libframer.so ships.
+#
+# The -mavx2/-mfma/-mavx512* options these targets used to carry are gone on purpose.
+# convert_variant.hpp selects its SIMD path at RUNTIME via __builtin_cpu_supports(), and
+# each kernel carries its own [[gnu::target("avx2")]] / [[gnu::target("avx512f,...")]]
+# attribute, so the ISA-specific code compiles and is reachable at any -march. The flags
+# therefore never gated which paths were tested -- they only let the compiler emit AVX
+# elsewhere in the TU, which (a) made the tested component.cpp differ in codegen from the
+# shipped module and (b) risked SIGILL on a runner without AVX-512, since
+# check_cxx_compiler_flag only proves the COMPILER accepts the flag. Neither test source
+# uses an intrinsic directly.
 
-# Fetch Catch2 for testing
-include(FetchContent)
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG v3.11.0
+add_executable(converter_tests converter_tests.cpp)
+target_link_libraries(converter_tests
+    PRIVATE
+        framer_objs
+        Catch2::Catch2WithMain
+        Threads::Threads
 )
-FetchContent_MakeAvailable(Catch2)
-
-# Find threading library (needed for std::call_once in converters)
-find_package(Threads REQUIRED)
-
-# Helper function to create a pool test target
-function(add_pool_test TEST_NAME SOURCE_FILE)
-    add_executable(${TEST_NAME} ${SOURCE_FILE})
-    target_link_libraries(${TEST_NAME}
-        PRIVATE
-            Catch2::Catch2WithMain
-            composite::composite
-            Threads::Threads
-    )
-    target_include_directories(${TEST_NAME}
-        PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/..
-            ${PROJECT_SOURCE_DIR}/include
-    )
-    target_compile_features(${TEST_NAME} PRIVATE cxx_std_23)
-    target_compile_options(${TEST_NAME} PRIVATE -mavx2 -mfma)
-
-    # Check if AVX512 is available
-    include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512)
-    if(COMPILER_SUPPORTS_AVX512)
-        target_compile_options(${TEST_NAME} PRIVATE -mavx512f -mavx512bw -mavx512vl -mavx512dq)
-    endif()
-endfunction()
 
 # NOTE: the overlapped framing ring was lifted into the framework (composite::overlap_ring);
 # its unit tests now live there as test_overlap_ring. Only framer-specific tests remain here.
-
-# Converter tests (variant-based converters)
-add_pool_test(converter_tests converter_tests.cpp)
-
-# Integration tests
-add_executable(framer_integration_tests framer_integration_tests.cpp ../component.cpp)
+add_executable(framer_integration_tests framer_integration_tests.cpp)
 target_link_libraries(framer_integration_tests
     PRIVATE
+        framer_objs
         Catch2::Catch2WithMain
-        composite::composite
         Threads::Threads
 )
-target_include_directories(framer_integration_tests
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${PROJECT_SOURCE_DIR}/include
-)
-target_compile_features(framer_integration_tests PRIVATE cxx_std_23)
-target_compile_options(framer_integration_tests PRIVATE -mavx2 -mfma)
-
-# Check AVX512 for integration tests
-if(COMPILER_SUPPORTS_AVX512)
-    target_compile_options(framer_integration_tests PRIVATE -mavx512f -mavx512bw -mavx512vl -mavx512dq)
-endif()
-
-# Register tests with CTest
-include(CTest)
-include(Catch)
 
 catch_discover_tests(converter_tests)
 catch_discover_tests(framer_integration_tests)
 
-# Install test executables (optional)
 install(TARGETS
     converter_tests
     framer_integration_tests
     RUNTIME DESTINATION bin/tests
+    COMPONENT Tests
     OPTIONAL
 )

@@ -51,22 +51,28 @@ static void check_load(const std::string& lib, const char* id, const char* type,
 }
 
 int main(int argc, char** argv) {
-    const std::string d = argc > 1 ? argv[1] : ".";
-    auto lib = [&](const char* sub, const char* name) { return d + "/src/components/" + sub + "/lib" + name + ".so"; };
+    // Driven by argv so test/abi/CMakeLists.txt can generate one ctest per ENABLED module
+    // rather than carrying a hardcoded list that silently misses the next component added.
+    //
+    // usage: abi_smoke <module.so> <id> [type] [--expect-reject]
+    if (argc < 3) {
+        std::printf("usage: abi_smoke <module.so> <id> [type] [--expect-reject]\n");
+        return 2;
+    }
+    const std::string lib = argv[1];
+    const char* id = argv[2];
+    const char* type = nullptr;
+    bool expect_ok = true;
+    for (int i = 3; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--expect-reject") {
+            expect_ok = false;
+        } else {
+            type = argv[i];
+        }
+    }
 
-    // Custom ids (NOT the component's old hardcoded name) prove id-honoring.
-    check_load(lib("udp_source", "udp_source"), "src1",  nullptr, true);
-    check_load(lib("pkt_parser", "pkt_parser"), "pp1",   nullptr, true);
-    check_load(lib("file_writer", "file_writer"), "fw1", nullptr, true);   // was: loadable only as "file_writer"
-    check_load(lib("histogram",  "histogram"),  "hist1", nullptr, true);   // was: loadable only as "histogram"
-    check_load(lib("exp_smooth", "exp_smooth"), "es1",   "f32",   true);   // was: unloadable through the loader
-    check_load(lib("fft",        "fft"),        "fft1",  "cf32",  true);
-    check_load(lib("psd",        "psd"),        "psd1",  "f32",   true);
-    check_load(lib("framer",     "framer"),     "fr1",   "cf32",  true);
+    check_load(lib, id, type, expect_ok);
 
-    // Negative: an unknown type fails cleanly (throw -> caller maps to null), not a crash.
-    check_load(lib("fft", "fft"), "bad", "bogus", false);
-
-    std::printf(failures ? "\n%d FAILURE(S)\n" : "\nALL ABI SMOKE CHECKS PASSED\n", failures);
+    std::printf(failures ? "\n%d FAILURE(S)\n" : "\nABI SMOKE PASSED\n", failures);
     return failures ? 1 : 0;
 }

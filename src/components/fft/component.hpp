@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include "simd_fmv.hpp"
 
 // T is expected to be std::complex<float> or std::complex<double>.
 //
@@ -64,15 +65,19 @@ protected:
 
 private:
     // Fused copy + window with SIMD variants (use only their arguments — thread-safe in work()).
-    [[gnu::target("default")]]
+    COMPS_FMV_DEFAULT
     auto copy_and_window(const composite::immutable_buffer<T>& input,
                          composite::mutable_buffer<T>& output, const window_t* window) -> void;
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f")]]
     auto copy_and_window(const composite::immutable_buffer<T>& input,
                          composite::mutable_buffer<T>& output, const window_t* window) -> void;
+#endif
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2")]]
     auto copy_and_window(const composite::immutable_buffer<T>& input,
                          composite::mutable_buffer<T>& output, const window_t* window) -> void;
+#endif
 
     // Immutable per-task config snapshot. property_change_handler runs under park (the main
     // ingest/retire worker quiesced), but the POOL workers running work() do NOT park — so they

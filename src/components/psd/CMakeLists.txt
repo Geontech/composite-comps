@@ -17,38 +17,8 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
-project(psd VERSION 0.1.0 LANGUAGES CXX)
-include(GNUInstallDirs)
-
-# Set the C++ version required
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Set compile flags
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Custom compile options
-add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
-
-# Library
-add_library(psd MODULE
-    component.cpp
-)
-# Includes
-target_include_directories(psd
-    PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
-)
-target_link_libraries(psd
-    PRIVATE
-    composite::composite
-)
-# Install
-install(TARGETS psd
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+comps_add_component(psd
+    SOURCES  component.cpp
+    FAST_MATH
+    ABI_TYPE f32
 )

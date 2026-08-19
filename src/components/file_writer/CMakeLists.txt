@@ -14,34 +14,13 @@
 # for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see http://www.gnu.org/licenses/.
+# along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
-project(file_writer VERSION 0.1.0 LANGUAGES CXX)
-include(GNUInstallDirs)
-
-# Set the C++ version required
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Set compile flags
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Library
-add_library(file_writer MODULE
-    component.cpp
-)
-# Link
-target_link_libraries(file_writer
-    PRIVATE
-    composite::composite
-)
-# Install
-install(TARGETS file_writer
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+# NOTE: file_writer carries no -march baseline, unlike every other component. Preserved rather
+# than silently changed -- it is a byte-copy path with no SIMD or math, so the baseline buys it
+# nothing, but the inconsistency is worth a deliberate decision rather than drift.
+comps_add_component(file_writer
+    SOURCES component.cpp
+    NO_ARCH_BASELINE
 )

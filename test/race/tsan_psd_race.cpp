@@ -23,14 +23,18 @@
 #include <string>
 #include <thread>
 
-#include <spdlog/spdlog.h>
+// The framework's public logging facade, NOT spdlog directly: composite keeps spdlog as a
+// PRIVATE implementation dependency behind composite::logger, so it is not on a consumer's
+// include path. This file used to #include <spdlog/spdlog.h> and relied on an undefined
+// ${SPDLOG_INC} in the old standalone tsan-test/CMakeLists.txt -- which is why it never built.
+#include <composite/core/logger.hpp>
 
 using namespace composite;
 using composite::properties::config_type;
 using json = composite::properties::json;
 
 int main() {
-    spdlog::set_level(spdlog::level::off);
+    composite::set_global_log_level(composite::log_level::off);
 
     auto comp = std::make_shared<psd<float>>("psd_race");
     comp->set_properties(json{{"num_workers", 2}, {"power_based_normalization", true}},

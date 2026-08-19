@@ -18,9 +18,7 @@
  */
 
 #include "component.hpp"
-#include "parsers/sdds_parser.hpp"
-#include "parsers/vita49_parser.hpp"
-#include "parsers/vita49dot1_parser.hpp"
+#include "parsers/parser_table.hpp"
 
 #include <composite/core/register.hpp>
 
@@ -70,16 +68,14 @@ auto pkt_parser::property_change_handler(const composite::properties::json& diff
     m_drop_warned = false;
     m_consecutive_parse_failures = 0;
 
-    // Register parsers based on configuration
-    if (m_signal_overrides.transport.empty() || m_signal_overrides.transport == "sdds") {
-        m_parsers.push_back(std::make_unique<parsers::sdds_parser>(m_signal_overrides));
-    }
-    // Note: Order matters - try V49.1 before V49 since V49.1 is more specific
-    if (m_signal_overrides.transport.empty() || m_signal_overrides.transport == "vita49.1") {
-        m_parsers.push_back(std::make_unique<parsers::vita49dot1_parser>(m_signal_overrides));
-    }
-    if (m_signal_overrides.transport.empty() || m_signal_overrides.transport == "vita49") {
-        m_parsers.push_back(std::make_unique<parsers::vita49_parser>(m_signal_overrides));
+    // Register parsers from the table, which is already ordered most-specific-first (V49.1 before
+    // V49, and so on). The set of parsers lives in parsers/parser_table.hpp -- adding one does not
+    // touch this file. An empty `transport` override selects every parser and lets can_parse()
+    // detection choose; a non-empty one pins a single protocol.
+    for (const auto& entry : parsers::parser_table()) {
+        if (m_signal_overrides.transport.empty() || m_signal_overrides.transport == entry.transport) {
+            m_parsers.push_back(entry.make(m_signal_overrides));
+        }
     }
 
     logger()->trace("Registered {} protocol parsers", m_parsers.size());

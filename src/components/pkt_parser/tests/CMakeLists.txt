@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2025 Geon Technologies, LLC
+# Copyright (C) 2024 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -17,48 +17,21 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-# Untrusted-input fuzz/regression for the protocol parsers. Compiles the overlay +
-# parser translation units directly (no DSO) so it can be built under sanitizers.
-# For real coverage of the OOB-read guards, configure with
-#   -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
-add_executable(pkt_parser_fuzz
-    fuzz_parsers.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../overlay/sdds.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../overlay/vita49.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/sdds_parser.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/vita49_parser.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/vita49dot1_parser.cpp
-)
-target_include_directories(pkt_parser_fuzz
-    PRIVATE
-    ${vrtgen_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-)
-target_link_libraries(pkt_parser_fuzz
-    PRIVATE
-    composite::composite
-)
+# Untrusted-input fuzz/regression for the protocol parsers. Links pkt_protocols (no
+# component, no module registration) so it can be built under sanitizers.
+# Real coverage of the OOB-read guards comes from the asan-ubsan preset.
+add_executable(pkt_parser_fuzz fuzz_parsers.cpp)
+target_link_libraries(pkt_parser_fuzz PRIVATE pkt_protocols)
 add_test(NAME pkt_parser_fuzz COMMAND pkt_parser_fuzz)
 
 # Protocol auto-re-detection: drives the real component's process() through connected
-# ports and asserts on the detection state machine. Compiles the component + parser TUs
-# directly (no DSO) so it links standalone against composite.
-add_executable(pkt_parser_redetect
-    redetect_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../component.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../overlay/sdds.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../overlay/vita49.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/sdds_parser.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/vita49_parser.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../parsers/vita49dot1_parser.cpp
-)
-target_include_directories(pkt_parser_redetect
-    PRIVATE
-    ${vrtgen_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/..
-)
-target_link_libraries(pkt_parser_redetect
-    PRIVATE
-    composite::composite
-)
+# ports and asserts on the detection state machine, so it needs the component objects too.
+add_executable(pkt_parser_redetect redetect_test.cpp)
+# Both object libraries directly: object files do not propagate transitively.
+target_link_libraries(pkt_parser_redetect PRIVATE pkt_parser_objs pkt_protocols)
 add_test(NAME pkt_parser_redetect COMMAND pkt_parser_redetect)
+
+# The parser table's probe order is behavior; pin it.
+add_executable(parser_table_tests parser_table_tests.cpp)
+target_link_libraries(parser_table_tests PRIVATE pkt_protocols Catch2::Catch2WithMain)
+catch_discover_tests(parser_table_tests)

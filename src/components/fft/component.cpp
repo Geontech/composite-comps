@@ -28,6 +28,7 @@
 #include <format>
 #include <immintrin.h>
 #include <pthread.h>
+#include "simd_fmv.hpp"
 
 template <typename T>
 fft<T>::fft(std::string_view id)
@@ -187,7 +188,7 @@ auto fft<T>::work(composite::immutable_buffer<T> in, composite::timestamp ts,
 
 // Fused copy + window: scalar fallback
 template <typename T>
-[[gnu::target("default")]]
+COMPS_FMV_DEFAULT
 auto fft<T>::copy_and_window(
   const composite::immutable_buffer<T>& input,
   composite::mutable_buffer<T>& output,
@@ -203,6 +204,7 @@ auto fft<T>::copy_and_window(
 }
 
 // Fused copy + window: AVX-512
+#if COMPS_FMV_ENABLED
 template <typename T>
 [[gnu::target("avx512f")]]
 auto fft<T>::copy_and_window(
@@ -238,8 +240,10 @@ auto fft<T>::copy_and_window(
         out[i] = in[i] * w[i];
     }
 }
+#endif
 
 // Fused copy + window: AVX2
+#if COMPS_FMV_ENABLED
 template <typename T>
 [[gnu::target("avx2")]]
 auto fft<T>::copy_and_window(
@@ -275,6 +279,7 @@ auto fft<T>::copy_and_window(
         out[i] = in[i] * w[i];
     }
 }
+#endif
 
 // Explicit template instantiations
 template class fft<std::complex<float>>;

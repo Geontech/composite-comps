@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2024-2025 Geon Technologies, LLC
+# Copyright (C) 2024 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -14,52 +14,19 @@
 # for more details.
 #
 # You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see http://www.gnu.org/licenses/.
+# along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
-project(fft VERSION 0.1.0 LANGUAGES CXX)
-include(GNUInstallDirs)
-
-# Set the C++ version required
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Set compile flags
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Custom compile options
-add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
-
-# Find FFTW via pkg-config
+# FFTW via pkg-config. Kept in variable form (not IMPORTED_TARGET) so the link line
+# stays as it was; converting to IMPORTED_TARGET / PkgConfig:: targets is a separate change.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFTW3F REQUIRED fftw3f)
 pkg_check_modules(FFTW3 REQUIRED fftw3)
 
-# Library
-add_library(fft MODULE
-    component.cpp
-)
-# Includes
-target_include_directories(fft
-    PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
-    ${FFTW3F_INCLUDE_DIRS}
-    ${FFTW3_INCLUDE_DIRS}
-)
-target_link_libraries(fft
-    PRIVATE
-    composite::composite
-    ${FFTW3F_LIBRARIES}
-    ${FFTW3_LIBRARIES}
-    fftw3f_threads
-    fftw3_threads
-)
-# Install
-install(TARGETS fft
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+comps_add_component(fft
+    SOURCES  component.cpp
+    INCLUDES ${FFTW3F_INCLUDE_DIRS} ${FFTW3_INCLUDE_DIRS}
+    LINK     ${FFTW3F_LIBRARIES} ${FFTW3_LIBRARIES} fftw3f_threads fftw3_threads
+    FAST_MATH
+    ABI_TYPE cf32
 )

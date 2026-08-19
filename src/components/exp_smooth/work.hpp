@@ -25,6 +25,7 @@
 #include <immintrin.h>
 #include <limits>
 #include <stdexcept>
+#include "simd_fmv.hpp"
 
 template <typename T>
 class work {};
@@ -112,12 +113,13 @@ private:
     }
 
     // MFV target: scalar baseline
-    [[gnu::target("default")]]
+    COMPS_FMV_DEFAULT
     static auto process_impl(float* curr, float* prev, std::size_t size, float alpha) -> void {
         process_scalar_range(curr, prev, 0, size, alpha);
     }
 
     // MFV target: AVX2 with alignment check
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2,fma")]]
     static auto process_impl(float* curr, float* prev, std::size_t size, float alpha) -> void {
         auto curr_addr = reinterpret_cast<std::uintptr_t>(curr);
@@ -130,8 +132,10 @@ private:
             process_scalar_range(curr, prev, 0, size, alpha);
         }
     }
+#endif
 
     // MFV target: AVX-512 with alignment check and AVX2 fallback
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f,avx512dq")]]
     static auto process_impl(float* curr, float* prev, std::size_t size, float alpha) -> void {
         auto curr_addr = reinterpret_cast<std::uintptr_t>(curr);
@@ -147,6 +151,7 @@ private:
             process_scalar_range(curr, prev, 0, size, alpha);
         }
     }
+#endif
 
     float m_alpha{1.0f};
 };
@@ -232,12 +237,13 @@ private:
     }
 
     // MFV target: scalar baseline
-    [[gnu::target("default")]]
+    COMPS_FMV_DEFAULT
     static auto process_impl(double* curr, double* prev, std::size_t size, double alpha) -> void {
         process_scalar_range(curr, prev, 0, size, alpha);
     }
 
     // MFV target: AVX2 with alignment check
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2,fma")]]
     static auto process_impl(double* curr, double* prev, std::size_t size, double alpha) -> void {
         auto curr_addr = reinterpret_cast<std::uintptr_t>(curr);
@@ -250,8 +256,10 @@ private:
             process_scalar_range(curr, prev, 0, size, alpha);
         }
     }
+#endif
 
     // MFV target: AVX-512 with alignment check and AVX2 fallback
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f,avx512dq")]]
     static auto process_impl(double* curr, double* prev, std::size_t size, double alpha) -> void {
         auto curr_addr = reinterpret_cast<std::uintptr_t>(curr);
@@ -267,6 +275,7 @@ private:
             process_scalar_range(curr, prev, 0, size, alpha);
         }
     }
+#endif
 
     double m_alpha{1.0};
 };

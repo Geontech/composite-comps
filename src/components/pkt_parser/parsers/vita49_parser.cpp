@@ -23,14 +23,22 @@
 #include <algorithm>
 #include <bit>
 #include <format>
+#include <type_traits>
 
 namespace parsers {
 
 namespace {
-    // VITA 49 Data Item Format ranges (per spec section 9.5.7)
-    constexpr uint32_t MAX_SIGNED_FORMAT = 0x07;    // Formats 0x00-0x07 are signed integer
-    constexpr uint32_t MIN_UNSIGNED_FORMAT = 0x10;  // Formats 0x10-0x17 are unsigned integer
-                                                    // Formats 0x08-0x0F are floating point
+    // VITA 49 Data Item Format ranges (per spec section 9.5.7).
+    //
+    // Typed to DataItemFormat's underlying type rather than a fixed uint32_t: these are
+    // compared against std::to_underlying(format->data_item_format()), and hardcoding an
+    // unsigned type made both comparisons signed/unsigned mismatches (-Wsign-compare, the
+    // only two warnings in the fleet once -Wall -Wextra -Wpedantic actually reached it).
+    // Deriving the type keeps that true if vrtgen ever changes the enum's base.
+    using format_code_t = std::underlying_type_t<vrtgen::packing::DataItemFormat>;
+    constexpr format_code_t MAX_SIGNED_FORMAT = 0x07;    // 0x00-0x07 signed integer
+    constexpr format_code_t MIN_UNSIGNED_FORMAT = 0x10;  // 0x10-0x17 unsigned integer
+                                                         // 0x08-0x0F floating point
 } // anonymous namespace
 
 vita49_parser::vita49_parser(const struct_props::signal_overrides& overrides,

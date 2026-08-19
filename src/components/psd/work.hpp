@@ -27,6 +27,7 @@
 #include <immintrin.h>
 #include <limits>
 #include <numeric>
+#include "simd_fmv.hpp"
 
 /*
  * =====================================================================================
@@ -121,7 +122,7 @@ public:
         m_norm_const = val;
     }
 
-    [[gnu::target("default")]]
+    COMPS_FMV_DEFAULT
     auto process(const cplx_data_type& data) -> real_data_type {
         // Make output data
         auto psd = composite::make_aligned_buffer_uninitialized<float>(ALIGNMENT, data.size());
@@ -134,6 +135,7 @@ public:
         return psd;
     }
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f")]]
     auto process(const cplx_data_type& data) -> real_data_type {
         // Constant registers
@@ -235,7 +237,9 @@ public:
 
         return psd;
     }
+#endif
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2,fma")]]
     auto process(const cplx_data_type& data) -> real_data_type {
         // Constant registers
@@ -321,6 +325,7 @@ public:
 
         return psd;
     }
+#endif
 
 private:
     float m_norm_const{1};
@@ -356,7 +361,7 @@ public:
         m_norm_const = val;
     }
 
-    [[gnu::target("default")]]
+    COMPS_FMV_DEFAULT
     auto process(const cplx_data_type& data) -> real_data_type {
         // Make output data
         auto psd = composite::make_aligned_buffer_uninitialized<double>(ALIGNMENT, data.size());
@@ -369,6 +374,7 @@ public:
         return psd;
     }
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f,avx512dq")]]
     auto process(const cplx_data_type& data) -> real_data_type {
         // Constant registers
@@ -453,6 +459,7 @@ public:
 
         return psd;
     }
+#endif
 
 private:
     double m_norm_const{1};
