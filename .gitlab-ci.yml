@@ -20,17 +20,27 @@ variables:
   # The framework release the fleet is qualified against. Keep in lockstep with
   # COMPS_COMPOSITE_VERSION in CMakeLists.txt -- build:test asserts they agree.
   COMPOSITE_VERSION: "0.5.0"
-  # The ref to stage from. Normally the tag; overridable so the fleet stays buildable before the
-  # framework tag exists; switch it to the tag once that tag is published and qualified.
-  COMPOSITE_REF: "v0.5.0"
+  # The ref to stage from. v0.5.0 does not exist yet -- the framework's newest 0.5 tag is
+  # v0.5.0-rc.1, whose project version IS 0.5.0, so find_package(composite 0.5.0) is satisfied and
+  # build:test's declared-version assertion holds. Move this to v0.5.0 when that tag is published.
+  COMPOSITE_REF: "v0.5.0-rc.1"
   COMPOSITE_REPO: "https://github.com/geontech/composite.git"
   STAGED_FRAMEWORK: "/opt/staged-framework"
   GIT_DEPTH: "50"
   # The published framework images the fleet image is built ON and runs ON. The fleet does not
-  # compile the framework: the ABI in the image must provably be the reviewed one. Release builds
-  # pass DIGESTS (composite:0.5.0-devel@sha256:...); tags are acceptable for branch pipelines.
-  COMPOSITE_DEVEL_IMAGE: "geontech/composite:0.5.0-devel"
-  COMPOSITE_RUNTIME_IMAGE: "geontech/composite:0.5.0"
+  # compile the framework: the ABI in the image must provably be the reviewed one.
+  #
+  # The tag tracks COMPOSITE_REF. The framework publishes an image per release tag, and a release
+  # candidate keeps its full prerelease tag rather than moving `latest` or a minor alias, so there
+  # is no `0.5` or `latest` to point at while 0.5.0 is still an RC. Keep this in step with
+  # COMPOSITE_REF above.
+  #
+  # For an actual release publication, pin by DIGEST rather than tag, e.g.
+  #   geontech/composite:0.5.0-rc.1-devel@sha256:d34e3fe1598ddac63a6a882d7cd05cf8b712ac6cca8a0decc21360e4d51965da
+  #   geontech/composite:0.5.0-rc.1@sha256:c106cce0cb4ee3430de39bf0d399ab99bdf019cca06905df6ac1ab184d9c7564
+  COMPOSITE_IMAGE_TAG: "0.5.0-rc.1"
+  COMPOSITE_DEVEL_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}-devel"
+  COMPOSITE_RUNTIME_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}"
 
 # ---------------------------------------------------------------------------
 # Stage the framework from source, with the SAME sanitizer setting the fleet will use.
@@ -427,6 +437,13 @@ publish:dockerhub:
     - test "$RELEASE_BASE_VERSION" = "$PROJECT_VERSION"
     - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     - export SHA_TAG="$IMAGE_NAME:sha-$CI_COMMIT_SHORT_SHA"
+    # The fleet image is built ON the published framework images. If they are absent, say so plainly
+    # instead of failing inside buildx: the framework must publish before the fleet can.
+    - |
+      for base in "$COMPOSITE_DEVEL_IMAGE" "$COMPOSITE_RUNTIME_IMAGE"; do
+        docker manifest inspect "$base" >/dev/null 2>&1 || {
+          echo "base image '$base' is not published; the framework must be released first"; exit 1; }
+      done
     - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
     - >-
       docker buildx build
