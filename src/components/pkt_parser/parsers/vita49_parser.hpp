@@ -59,6 +59,7 @@ public:
     auto on_activated() -> void override {
         m_emitted = false;
         m_tsf_warn = false;  // re-arm the sample-count warning for the (likely new) stream
+        m_ext_warn = false;  // re-arm the extension-data warning too
         m_pkt_count = 0;     // sequence restarts; the first packet skips the gap check
     }
 
@@ -72,6 +73,7 @@ private:
     std::optional<std::endian> m_ov_endianness;
     uint16_t m_pkt_count{0};
     bool m_tsf_warn{false};
+    bool m_ext_warn{false};  ///< one-shot: an extension-data packet reached parse()
     bool m_emitted{false};  ///< false until this parser has published metadata since (re)activation
 
 }; // class vita49_parser

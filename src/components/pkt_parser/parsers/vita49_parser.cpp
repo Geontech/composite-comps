@@ -24,6 +24,7 @@
 #include <bit>
 #include <format>
 #include <type_traits>
+#include <utility>
 
 namespace parsers {
 
@@ -73,7 +74,11 @@ auto vita49_parser::can_parse(const composite::immutable_buffer<uint8_t>& data) 
 
     // Overlay and check packet type
     auto packet = overlay::v49(std::span{data.data(), data.size()});
-    return packet.is_data() || packet.is_ext_data() || packet.is_context();
+    // Deliberately NOT is_ext_data(): parse() has no extension-data handling, so claiming those
+    // packets here made this parser win detection for a stream it cannot decode. Leaving them
+    // unclaimed lets the component report an unknown protocol -- and lets a downstream parser that
+    // DOES implement the extension format claim them (see parsers/parser_table.hpp).
+    return packet.is_data() || packet.is_context();
 }
 
 auto vita49_parser::parse(
@@ -171,6 +176,21 @@ auto vita49_parser::parse(
         }
 
         result.should_send = false;  // Context packets don't carry data
+    } else {
+        // Neither a data nor a context packet. Reachable even with can_parse() narrowed, because
+        // protocol lock-in keeps calling parse() for every packet on the stream once vita49 is the
+        // active parser -- so an extension-data (or command) packet can still arrive here.
+        //
+        // Previously this fell through to a default-constructed parse_result, whose should_send
+        // defaults to TRUE: the component forwarded an EMPTY payload with a zero timestamp
+        // downstream, silently, uncounted, as though it were valid data. Drop it and say so once.
+        result.should_send = false;
+        if (!m_ext_warn) {
+            result.warning = std::format(
+                "unsupported VITA 49 packet type {} (extension/command); dropping these packets",
+                static_cast<unsigned>(std::to_underlying(packet.header().packet_type())));
+            m_ext_warn = true;
+        }
     }
 
     // Adjust fractional timestamp if in sample count mode. Reads the effective current sample

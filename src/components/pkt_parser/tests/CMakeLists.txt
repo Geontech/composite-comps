@@ -35,3 +35,9 @@ add_test(NAME pkt_parser_redetect COMMAND pkt_parser_redetect)
 add_executable(parser_table_tests parser_table_tests.cpp)
 target_link_libraries(parser_table_tests PRIVATE pkt_protocols Catch2::Catch2WithMain)
 catch_discover_tests(parser_table_tests)
+
+# VITA 49 packet-type contract: what vita49_parser claims, and what it does with a packet type it
+# cannot decode.
+add_executable(vita49_packet_type_tests vita49_packet_type_tests.cpp)
+target_link_libraries(vita49_packet_type_tests PRIVATE pkt_protocols Catch2::Catch2WithMain)
+catch_discover_tests(vita49_packet_type_tests)
