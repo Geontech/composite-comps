@@ -553,22 +553,35 @@ publish:dockerhub:
     - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - |
       set -eu
-      resolve() {
-        ref="$1"
-        docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' 2>/dev/null \
-          | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])' 2>/dev/null \
-          || { echo ""; }
-      }
-      BASE_DIGEST="$(resolve "$STAGING_IMAGE:$CI_COMMIT_SHA")"
-      DPDK_DIGEST="$(resolve "$STAGING_IMAGE:$CI_COMMIT_SHA-dpdk")"
-      if [ -z "$BASE_DIGEST" ] || [ -z "$DPDK_DIGEST" ]; then
-        echo "no staged images for $CI_COMMIT_SHA in $STAGING_IMAGE."
-        echo "build:container did not run (or did not pass) for this commit, so there is nothing"
-        echo "tested to promote. Re-run the pipeline on the branch commit first."
-        exit 1
-      fi
-      echo "BASE_REF=$STAGING_IMAGE@$BASE_DIGEST" > /tmp/refs.env
-      echo "DPDK_REF=$STAGING_IMAGE@$DPDK_DIGEST" >> /tmp/refs.env
+      # The digest is the sha256 of the manifest's own bytes, so hashing `--raw` computes it by
+      # definition -- for an image index or a single manifest alike.
+      #
+      # NOT a `--format` template piped through python3 or jq, which was here first and could never
+      # have worked: neither interpreter exists in docker:*-cli, which is Alpine-based. The pipeline
+      # failed on every invocation, `|| echo ""` turned that into an empty digest, and the empty
+      # digest was reported downstream as "nothing was staged" -- so a correctly staged commit was
+      # indistinguishable from a missing one, and the job blamed build:container for its own bug.
+      : > /tmp/refs.env
+      for entry in "BASE_REF|" "DPDK_REF|-dpdk"; do
+        var="${entry%%|*}"
+        src="$STAGING_IMAGE:$CI_COMMIT_SHA${entry#*|}"
+        # Capture first, hash second. As one pipeline the status would be sha256sum's, which
+        # succeeds whatever inspect did, so a genuinely absent image would still look resolvable.
+        if ! raw="$(docker buildx imagetools inspect "$src" --raw 2>/dev/null)"; then
+          echo "could not resolve staged image: $src"
+          echo "Either no pipeline has staged images for $CI_COMMIT_SHA, or this job cannot read"
+          echo "$STAGING_IMAGE. Run a branch pipeline on that commit so build:container stages and"
+          echo "blesses the images, then re-run. Refusing to rebuild and publish an artifact that"
+          echo "was never tested."
+          exit 1
+        fi
+        digest="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+        # A digest is a fixed shape; anything else means the resolution above changed behaviour.
+        echo "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+          || { echo "unparseable digest for $src: [$digest]"; exit 1; }
+        echo "$var=$STAGING_IMAGE@$digest" >> /tmp/refs.env
+        echo "resolved $src -> $digest"
+      done
       cat /tmp/refs.env
     - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
 
