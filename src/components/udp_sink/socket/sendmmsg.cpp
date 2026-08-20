@@ -20,6 +20,7 @@
 #include "sendmmsg.hpp"
 
 #include <arpa/inet.h>
+#include <stdexcept>
 #include <cstring>
 #include <format>
 #include <net/if.h>
@@ -28,7 +29,37 @@
 
 namespace udp_tx {
 
+namespace {
+// Staging-buffer ceilings. A UDP payload cannot exceed 65507 bytes, and the kernel caps a single
+// sendmmsg() vector at UIO_MAXIOV (1024), so neither dimension has a legitimate reason to be
+// larger. Bounding both is what makes batch_size * max_packet_size safe to compute.
+constexpr uint32_t MAX_BATCH_SIZE = 1024;
+constexpr uint32_t MAX_PACKET_SIZE = 65507;
+} // namespace
+
 sendmmsg_tx::sendmmsg_tx(const config& cfg) : m_config(cfg) {
+    // Validate the staging-buffer dimensions before anything else. The component validates these
+    // properties too, but this class must not trust a config it did not build: every bound below
+    // is load-bearing for the memcpy in send().
+    //
+    // batch_size == 0 would resize the data buffer to nothing (making every send an overflow) and
+    // make `m_batch_queue.size() >= batch_size` true immediately, flushing on every packet.
+    // max_packet_size == 0 would do the same to the per-datagram budget.
+    if (m_config.batch_size == 0 || m_config.max_packet_size == 0) {
+        throw std::invalid_argument(std::format(
+            "sendmmsg_tx: batch_size and max_packet_size must be non-zero (got {} and {})",
+            m_config.batch_size, m_config.max_packet_size));
+    }
+    if (m_config.batch_size > MAX_BATCH_SIZE || m_config.max_packet_size > MAX_PACKET_SIZE) {
+        throw std::invalid_argument(std::format(
+            "sendmmsg_tx: batch_size {} exceeds {} or max_packet_size {} exceeds {}",
+            m_config.batch_size, MAX_BATCH_SIZE, m_config.max_packet_size, MAX_PACKET_SIZE));
+    }
+    // Both operands are bounded above, so the product cannot overflow size_t on any supported
+    // platform; compute it in size_t regardless rather than in the uint32_t the config uses.
+    const auto buffer_bytes =
+        static_cast<std::size_t>(m_config.batch_size) * static_cast<std::size_t>(m_config.max_packet_size);
+
     m_socket_fd = create_socket();
     if (m_socket_fd < 0) {
         throw std::runtime_error("Failed to create UDP socket");
@@ -41,7 +72,7 @@ sendmmsg_tx::sendmmsg_tx(const config& cfg) : m_config(cfg) {
 
     // Pre-allocate data buffer (batch_size * max packet size)
     m_max_packet_size = m_config.max_packet_size;
-    m_data_buffer.resize(m_config.batch_size * m_max_packet_size);
+    m_data_buffer.resize(buffer_bytes);
     m_data_buffer_pos = 0;
 
     m_config.logger->info("sendmmsg_tx initialized: batch_size={}, batch_timeout_us={}",
@@ -76,12 +107,37 @@ auto sendmmsg_tx::send(const std::string& ip, uint16_t port, std::span<const uin
         return -1;
     }
 
-    // Copy packet data into pre-allocated buffer
+    // Copy packet data into the pre-allocated staging buffer.
     auto data_size = data.size();
+
+    // A datagram larger than the configured maximum can never be staged: the flush below frees
+    // at most the whole buffer, so retrying would not help. Reject it here, before any buffer
+    // arithmetic. Previously this was unchecked and the memcpy ran off the end of the
+    // allocation with an upstream-controlled length.
+    if (data_size > m_max_packet_size) {
+        m_config.logger->error("dropping {}-byte datagram: exceeds max_packet_size={}",
+                               data_size, m_max_packet_size);
+        m_total_errors++;
+        return -1;
+    }
+
     if (m_data_buffer_pos + data_size > m_data_buffer.size()) {
-        // Buffer full - shouldn't happen if batch_size is respected, but flush and retry
+        // Not enough room left in this batch: flush what is queued, which resets the write
+        // position to the start of the buffer.
         flush_locked();
         m_data_buffer_pos = 0;
+    }
+
+    // Re-check after the flush. flush_locked() is not guaranteed to have freed space -- it can
+    // fail, and a caller-supplied buffer smaller than one datagram would leave nothing to free.
+    // The datagram is already known to fit within max_packet_size, so this can only trip on a
+    // pathological configuration; failing the send beats corrupting the heap.
+    if (m_data_buffer_pos + data_size > m_data_buffer.size()) {
+        m_config.logger->error(
+            "dropping {}-byte datagram: staging buffer has {} of {} bytes free after flush",
+            data_size, m_data_buffer.size() - m_data_buffer_pos, m_data_buffer.size());
+        m_total_errors++;
+        return -1;
     }
 
     std::memcpy(m_data_buffer.data() + m_data_buffer_pos, data.data(), data_size);

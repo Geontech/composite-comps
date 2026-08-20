@@ -27,6 +27,16 @@
 #include <chrono>
 #include <optional>
 #include <sstream>
+#include <format>
+
+namespace {
+// Ceilings for the sendmmsg staging buffer's two dimensions. A UDP datagram cannot exceed
+// 65507 bytes of payload, so a larger max_packet_size can only waste memory. The batch ceiling
+// is well above any useful sendmmsg vector (the kernel caps a single call at UIO_MAXIOV = 1024)
+// and exists so batch_size * max_packet_size cannot be driven into an absurd allocation.
+constexpr uint32_t MAX_BATCH_SIZE = 1024;
+constexpr uint32_t MAX_PACKET_SIZE_LIMIT = 65507;
+} // namespace
 
 namespace {
 
@@ -57,9 +67,21 @@ udp_sink::udp_sink(std::string_view id) : composite::component(id) {
     add_property("stream_id_key", m_stream_id_key, RUNTIME);
     add_property("socket_timeout_s", m_socket_timeout_s, RUNTIME).units("s");
     add_property("send_buf_size", m_send_buf_size).units("bytes");
-    add_property("batch_size", m_batch_size, RUNTIME);
+    // batch_size and max_packet_size size the sendmmsg staging buffer
+    // (batch_size * max_packet_size). Zero for either makes the buffer unusable -- a zero
+    // batch_size allocates nothing and flushes on every packet -- and unbounded values invite
+    // an allocation the process cannot satisfy. batch_size is RUNTIME, so these are reachable
+    // from a property write on a running graph, not only from the initial config.
+    //
+    // The sender re-checks all of this itself: it must not trust a config it did not build.
+    add_property("batch_size", m_batch_size, RUNTIME)
+        .validate([](const uint32_t& v) { return v > 0 && v <= MAX_BATCH_SIZE; },
+                  std::format("batch_size must be in [1, {}]", MAX_BATCH_SIZE));
     add_property("batch_timeout_us", m_batch_timeout_us, RUNTIME).units("us");
-    add_property("max_packet_size", m_max_packet_size).units("bytes");
+    add_property("max_packet_size", m_max_packet_size)
+        .validate([](const uint32_t& v) { return v > 0 && v <= MAX_PACKET_SIZE_LIMIT; },
+                  std::format("max_packet_size must be in [1, {}] bytes", MAX_PACKET_SIZE_LIMIT))
+        .units("bytes");
     add_property("bind_interface", m_bind_interface);
     add_property("default_dest_ip", m_default_dest_ip, RUNTIME);
     add_property("default_dest_port", m_default_dest_port, RUNTIME);

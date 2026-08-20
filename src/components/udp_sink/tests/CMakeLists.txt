@@ -28,8 +28,20 @@ target_link_libraries(udp_sink_integration_tests
 
 catch_discover_tests(udp_sink_integration_tests)
 
+# Staging-buffer bounds. Links udp_sink_objs for the sender implementation; meaningful under the
+# asan-ubsan preset, where a regression is a reported heap overflow rather than a silent one.
+add_executable(sendmmsg_bounds_tests sendmmsg_bounds_tests.cpp)
+target_link_libraries(sendmmsg_bounds_tests
+    PRIVATE
+        udp_sink_objs
+        Catch2::Catch2WithMain
+        Threads::Threads
+)
+catch_discover_tests(sendmmsg_bounds_tests)
+
 install(TARGETS
     udp_sink_integration_tests
+    sendmmsg_bounds_tests
     RUNTIME DESTINATION bin/tests
     COMPONENT Tests
     OPTIONAL
