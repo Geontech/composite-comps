@@ -25,7 +25,7 @@ pkg_check_modules(FFTW3 REQUIRED fftw3)
 
 comps_add_component(fft
     SOURCES  component.cpp
-    INCLUDES ${FFTW3F_INCLUDE_DIRS} ${FFTW3_INCLUDE_DIRS}
+    SYSTEM_INCLUDES ${FFTW3F_INCLUDE_DIRS} ${FFTW3_INCLUDE_DIRS}
     LINK     ${FFTW3F_LIBRARIES} ${FFTW3_LIBRARIES} fftw3f_threads fftw3_threads
     FAST_MATH
     ABI_TYPE cf32

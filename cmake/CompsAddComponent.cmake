@@ -31,6 +31,8 @@ option(COMPS_MODULE_NO_UNDEFINED "Link component modules with --no-undefined" ON
 #     OBJECTS  <...>          sibling OBJECT libraries whose code this module contains
 #     LINK     <...>          extra libraries (PUBLIC on the object library)
 #     INCLUDES <...>          extra include directories (PUBLIC)
+#     SYSTEM_INCLUDES <...>   third-party include directories, added as SYSTEM so our warning
+#                             flags do not fire on headers we do not own
 #     DEFINES  <...>          extra compile definitions (PUBLIC)
 #     STANDARD <n>            override COMPS_CXX_STANDARD
 #     ABI_TYPE <t>            data type create() needs, for templated components
@@ -58,7 +60,7 @@ function(comps_add_component name)
     cmake_parse_arguments(PARSE_ARGV 1 ARG
         "FAST_MATH;NO_ARCH_BASELINE;LTO_RELEASE"   # options
         "STANDARD;ABI_TYPE"                         # one-value
-        "SOURCES;OBJECTS;LINK;INCLUDES;DEFINES")    # multi-value
+        "SOURCES;OBJECTS;LINK;INCLUDES;SYSTEM_INCLUDES;DEFINES")  # multi-value
 
     if(NOT ARG_SOURCES)
         message(FATAL_ERROR "comps_add_component(${name}): SOURCES is required")
@@ -89,6 +91,14 @@ function(comps_add_component name)
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${COMPS_SOURCE_DIR}/include      # fleet-wide shared headers (simd_fmv.hpp, windows.hpp)
         ${ARG_INCLUDES})
+    # Third-party headers, added as SYSTEM so -Wall -Wextra -Wpedantic do not fire on code we do
+    # not own. This is not cosmetic: DPDK's headers use anonymous structs, flexible array members,
+    # compound literals and volatile increments, every one of which -Wpedantic/-Wvolatile reports.
+    # With COMPS_WERROR=ON that failed the build on warnings from /usr/include/dpdk -- our warning
+    # policy must apply to our code and stop there.
+    if(ARG_SYSTEM_INCLUDES)
+        target_include_directories(${name}_objs SYSTEM PUBLIC ${ARG_SYSTEM_INCLUDES})
+    endif()
     if(ARG_DEFINES)
         target_compile_definitions(${name}_objs PUBLIC ${ARG_DEFINES})
     endif()
@@ -177,7 +187,8 @@ endfunction()
 # ---------------------------------------------------------------------------
 function(comps_add_object_library name)
     cmake_parse_arguments(PARSE_ARGV 1 ARG
-        "FAST_MATH;NO_ARCH_BASELINE" "STANDARD" "SOURCES;LINK;INCLUDES;DEFINES")
+        "FAST_MATH;NO_ARCH_BASELINE" "STANDARD"
+        "SOURCES;LINK;INCLUDES;SYSTEM_INCLUDES;DEFINES")
 
     if(NOT ARG_SOURCES)
         message(FATAL_ERROR "comps_add_object_library(${name}): SOURCES is required")
@@ -200,6 +211,9 @@ function(comps_add_object_library name)
     target_compile_features(${name} PUBLIC cxx_std_${_std})
     target_include_directories(${name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
                                         ${COMPS_SOURCE_DIR}/include ${ARG_INCLUDES})
+    if(ARG_SYSTEM_INCLUDES)
+        target_include_directories(${name} SYSTEM PUBLIC ${ARG_SYSTEM_INCLUDES})
+    endif()
     if(ARG_DEFINES)
         target_compile_definitions(${name} PUBLIC ${ARG_DEFINES})
     endif()

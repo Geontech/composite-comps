@@ -216,7 +216,9 @@ else()
         message(FATAL_ERROR
             "vrtgen headers not found at '${vrtgen_SOURCE_DIR}/include'")
     endif()
-    target_include_directories(comps_vrtgen INTERFACE ${vrtgen_SOURCE_DIR}/include)
+    # SYSTEM: vrtgen's headers are third-party, so our -Wall -Wextra -Wpedantic must not
+    # fire on them -- with COMPS_WERROR=ON that would fail the build on someone else's code.
+    target_include_directories(comps_vrtgen SYSTEM INTERFACE ${vrtgen_SOURCE_DIR}/include)
 endif()
 
 # --- DPDK (a property of the framework, not of one component) --------------
