@@ -46,18 +46,19 @@ comps_add_component(udp_source
 if(COMPS_HAS_DPDK)
     target_link_directories(udp_source_objs PUBLIC ${DPDK_LIBRARY_DIRS})
 
-    # DPDK's headers cannot satisfy -Wpedantic: they use flexible array members, compound
-    # literals, anonymous structs, and a zero-size array member not at the end of a struct.
+    # DPDK's headers cannot satisfy a pedantic C++ build: flexible array members, compound
+    # literals, anonymous structs, a zero-size array member not at the end of a struct, and
+    # volatile increments in rte_spinlock.h.
     #
-    # SYSTEM_INCLUDES above is necessary but NOT sufficient. GCC suppresses ordinary warnings from
-    # system headers -- that is what silenced -Wvolatile from rte_spinlock.h -- but it does NOT
-    # suppress -Wpedantic diagnostics there, so with COMPS_WERROR=ON the build still failed on
-    # someone else's headers. Relax exactly one flag, on exactly the two translation units that
-    # include DPDK, so -Wall and -Wextra still apply to this code and the rest of the fleet keeps
-    # -Wpedantic.
+    # Relaxing these two flags on exactly the two translation units that include DPDK is the fix,
+    # NOT marking the include directory SYSTEM. SYSTEM_INCLUDES is still right in principle, but it
+    # cannot be relied on here: measured in the Rocky 9 / GCC 14 toolchain the images actually ship,
+    # DPDK's include dir arrives as a plain -I and CMake emits no -isystem for it at all. And even
+    # where -isystem does apply, GCC still reports -Wpedantic diagnostics from system headers.
+    # -Wall and -Wextra still apply to this code; the other 22 component TUs keep -Wpedantic.
     set_source_files_properties(socket/dpdk.cpp socket/igmp.cpp
         TARGET_DIRECTORY udp_source_objs
-        PROPERTIES COMPILE_OPTIONS "-Wno-pedantic")
+        PROPERTIES COMPILE_OPTIONS "-Wno-pedantic;-Wno-volatile")
 endif()
 
 if(BUILD_TESTING)

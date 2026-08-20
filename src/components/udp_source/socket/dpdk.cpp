@@ -510,6 +510,43 @@ auto dpdk::extract_udp_payload(rte_mbuf* mbuf) -> udp_payload {
     return result;
 }
 
+// Resolve, once, the xstats ids for this queue's packet/byte/error counters, then read them.
+//
+// The generic names DPDK synthesises are rx_q<N>_packets / _bytes / _errors. They are
+// driver-supplied: if this PMD does not publish them the lookup fails, and the fields are omitted
+// rather than reported as a misleading zero.
+auto dpdk::add_queue_stats(std::map<std::string, std::string>& stats) -> void {
+    if (m_queue_xstats_missing) {
+        return;
+    }
+    static constexpr std::array<const char*, QUEUE_XSTAT_COUNT> suffixes{"packets", "bytes", "errors"};
+    static constexpr std::array<const char*, QUEUE_XSTAT_COUNT> keys{"hw_q_pkts", "hw_q_bytes", "hw_q_errors"};
+
+    if (!m_queue_xstats_resolved) {
+        for (std::size_t i = 0; i < QUEUE_XSTAT_COUNT; ++i) {
+            const auto name = std::format("rx_q{}_{}", m_resolved_queue_id, suffixes[i]);
+            if (rte_eth_xstats_get_id_by_name(m_resolved_port_id, name.c_str(),
+                                              &m_queue_xstat_ids[i]) != 0) {
+                m_logger->debug("DPDK port {} queue {}: no per-queue xstat '{}'; omitting "
+                                "hw_q_* counters", m_resolved_port_id, m_resolved_queue_id, name);
+                m_queue_xstats_missing = true;
+                return;
+            }
+        }
+        m_queue_xstats_resolved = true;
+    }
+
+    std::array<uint64_t, QUEUE_XSTAT_COUNT> values{};
+    if (rte_eth_xstats_get_by_id(m_resolved_port_id, m_queue_xstat_ids.data(), values.data(),
+                                 static_cast<unsigned int>(values.size())) < 0) {
+        return;   // transient read failure; the port-level counters above still went out
+    }
+    for (std::size_t i = 0; i < QUEUE_XSTAT_COUNT; ++i) {
+        stats[keys[i]] = std::to_string(values[i]);
+    }
+}
+
+
 auto dpdk::get_stats() -> std::map<std::string, std::string> {
     std::map<std::string, std::string> stats;
 
@@ -534,13 +571,12 @@ auto dpdk::get_stats() -> std::map<std::string, std::string> {
         stats["hw_rx_errors"] = std::to_string(eth_stats.ierrors);
         stats["hw_rx_nombuf"] = std::to_string(eth_stats.rx_nombuf);
 
-        // Per-queue stats (for our queue only)
-        if (m_resolved_queue_id < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
-            stats["hw_q_pkts"] = std::to_string(eth_stats.q_ipackets[m_resolved_queue_id]);
-            stats["hw_q_bytes"] = std::to_string(eth_stats.q_ibytes[m_resolved_queue_id]);
-            stats["hw_q_errors"] = std::to_string(eth_stats.q_errors[m_resolved_queue_id]);
-        }
     }
+
+    // Per-queue counters for OUR queue. These matter rather than being a nicety: the DPDK manager
+    // hands out individual queues on a shared port, so the port-level counters above aggregate
+    // every component bound to that interface, not just this one.
+    add_queue_stats(stats);
 
     return stats;
 }

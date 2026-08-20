@@ -78,6 +78,9 @@ public:
     auto start_recv(output_port_t* port) -> void override;
     auto stop_recv() -> void override;
     auto get_stats() -> std::map<std::string, std::string> override;
+    // Append this queue's hardware counters, resolving their xstats ids on first use.
+    auto add_queue_stats(std::map<std::string, std::string>& stats) -> void;
+
 
 private:
     auto receive(std::stop_token token) -> void;
@@ -97,6 +100,22 @@ private:
     uint16_t m_resolved_port_id{0};
     uint16_t m_resolved_queue_id{0};
     bool m_queue_allocated{false};
+
+    // Per-queue hardware counters, resolved once by NAME through the xstats API.
+    //
+    // rte_eth_stats carried q_ipackets[]/q_ibytes[]/q_errors[] arrays indexed by queue, and those
+    // were removed from the struct (absent in DPDK 25.11, which is what the published images ship).
+    // xstats is the surviving route, and it is also the portable one: rte_eth_xstats_get_id_by_name
+    // has existed for many releases, so this compiles against old and new DPDK alike.
+    //
+    // Resolved lazily and cached because a name lookup walks the driver's whole xstats table, and
+    // get_stats() is called on the stats thread's cadence. Names are driver-supplied: a PMD that
+    // does not publish per-queue counters simply leaves these unresolved and the fields are omitted
+    // rather than reported as zero.
+    static constexpr std::size_t QUEUE_XSTAT_COUNT = 3;   // packets, bytes, errors
+    std::array<uint64_t, QUEUE_XSTAT_COUNT> m_queue_xstat_ids{};
+    bool m_queue_xstats_resolved{false};
+    bool m_queue_xstats_missing{false};   // one-shot: looked up and the driver has none
 
     // DPDK resources (obtained from framework)
     rte_mempool* m_mempool{nullptr};
