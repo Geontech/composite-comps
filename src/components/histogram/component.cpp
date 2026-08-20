@@ -31,6 +31,11 @@ namespace {
     constexpr uint32_t LOOKUP_BITS = 16;
     constexpr std::size_t LOOKUP_SIZE = std::size_t{1} << LOOKUP_BITS;
     constexpr uint16_t LOOKUP_PIVOT = uint16_t{1} << (LOOKUP_BITS - 1);
+    // The widest sample this component can bin. The binning dispatch is int8_t/int16_t, and the
+    // value-histogram allocates 1 << source_bits bins -- so an unbounded width from metadata is
+    // both a huge allocation (bit_width 32 asks for 2^32 bins == 34 GB) and, at 64, a shift wider
+    // than the type. Metadata is stream-supplied, so this bound is load-bearing, not cosmetic.
+    constexpr uint32_t MAX_SOURCE_BITS = 16;
 } // namespace
 
 histogram::histogram(std::string_view id) : composite::component(id) {
@@ -39,14 +44,14 @@ histogram::histogram(std::string_view id) : composite::component(id) {
     m_cfg.validate([](const histogram_config& c) {
         return c.percent_sampled > 0.0F && c.percent_sampled <= 1.0F;
     }, "percent_sampled must be in (0, 1]");
-    // percent_sampled and display_as_bits are RUNTIME-configurable; react to live changes.
+    m_cfg.validate([](const histogram_config& c) {
+        // A non-finite rate would propagate into the send threshold and never be reached.
+        return std::isfinite(c.sample_rate) && c.sample_rate >= 0.0F;
+    }, "sample_rate must be finite and non-negative");
+    // percent_sampled, display_as_bits and byteswap are RUNTIME-configurable.
     m_cfg.on_apply([this](const histogram_config&, const composite::changes<histogram_config>& ch) {
-        // percent_sampled drives both the frame-skip and per-histogram send thresholds.
-        m_skip_threshold = static_cast<uint32_t>(1.0F / m_cfg->percent_sampled);
-        if (m_sample_rate > 0.0F) {
-            m_send_threshold = static_cast<uint32_t>(m_sample_rate * m_cfg->percent_sampled);
-        }
-        // display_as_bits changes the bin count, so the accumulator must be re-sized.
+        apply_decimation();
+        // Either of these changes the bin count, so the accumulator must be re-sized.
         if (ch.changed(&histogram_config::display_as_bits)) {
             allocate_histogram();
         }
@@ -67,6 +72,19 @@ auto histogram::build_lookup() -> void {
         const auto mag = static_cast<int8_t>(
             std::min(static_cast<double>(LOOKUP_BITS), std::floor(std::log2(std::abs(val))) + 1));
         m_sample_bits[o] = (val < 0) ? static_cast<int8_t>(-mag) : mag;
+    }
+}
+
+// Recompute both thresholds from the current config. Called on initialize and on every config
+// apply, so a runtime percent_sampled change takes effect on the next frame.
+auto histogram::apply_decimation() -> void {
+    m_decimator.set_ratio(static_cast<double>(m_cfg->percent_sampled));
+    if (m_sample_rate > 0.0F && std::isfinite(m_sample_rate)) {
+        const auto samples = std::llround(static_cast<double>(m_sample_rate)
+                                        * static_cast<double>(m_cfg->percent_sampled));
+        m_send_threshold = samples > 0 ? static_cast<uint64_t>(samples) : 0;
+    } else {
+        m_send_threshold = 0;
     }
 }
 
@@ -110,17 +128,18 @@ auto histogram::process_samples(const uint8_t* bytes, std::size_t nbytes) -> voi
         }
         ++binned;
     }
-    m_histogram_samples += static_cast<uint32_t>(binned);
+    m_histogram_samples += static_cast<uint64_t>(binned);
 }
 
 auto histogram::initialize() -> void {
+    // Start from a clean slate on every initialize, so a restart does not inherit a partial
+    // accumulator, a mid-stream decimation phase, or a stale sample width.
     m_sample_rate = m_cfg->sample_rate;
-    m_skip_threshold = static_cast<uint32_t>(1.0F / m_cfg->percent_sampled);
-    if (m_sample_rate > 0.0F) {
-        m_send_threshold = static_cast<uint32_t>(m_sample_rate * m_cfg->percent_sampled);
-    }
+    m_source_bits = 16U;   // until metadata says otherwise
+    m_bits_warn = false;
+    apply_decimation();
     build_lookup();
-    allocate_histogram();
+    allocate_histogram();  // also zeroes m_histogram_samples
 }
 
 auto histogram::process() -> composite::retval {
@@ -134,15 +153,26 @@ auto histogram::process() -> composite::retval {
 
     // Stream characteristics (rate, bit width, complex, endianness) come from the metadata.
     if (meta != nullptr) {
-        if (meta->sample_rate > 0.0 && m_sample_rate != static_cast<float>(meta->sample_rate)) {
-            m_sample_rate = static_cast<float>(meta->sample_rate);
-            m_send_threshold = static_cast<uint32_t>(m_sample_rate * m_cfg->percent_sampled);
+        const auto rate = static_cast<float>(meta->sample_rate);
+        if (meta->sample_rate > 0.0 && std::isfinite(rate) && m_sample_rate != rate) {
+            m_sample_rate = rate;
+            apply_decimation();
         }
-        if (meta->format.bit_width > 0 &&
-            (m_source_bits != meta->format.bit_width || m_is_complex != meta->format.is_complex)) {
-            m_source_bits = meta->format.bit_width;
-            m_is_complex = meta->format.is_complex;
-            allocate_histogram();
+        // Sample width comes off the wire, so bound it before it reaches the allocator or a shift.
+        const auto width = meta->format.bit_width;
+        if (width > MAX_SOURCE_BITS) {
+            if (!m_bits_warn) {
+                logger()->error("ignoring unsupported sample width {} bits (max {}); continuing at "
+                                "{} bits", width, MAX_SOURCE_BITS, m_source_bits);
+                m_bits_warn = true;
+            }
+        } else if (width > 0) {
+            m_bits_warn = false;
+            if (m_source_bits != width || m_is_complex != meta->format.is_complex) {
+                m_source_bits = width;
+                m_is_complex = meta->format.is_complex;
+                allocate_histogram();
+            }
         }
         // A single byte never needs swapping; otherwise swap when the wire endianness != host.
         m_auto_byteswap = (m_source_bits != 8) && (std::endian::native != meta->format.endianness);
@@ -156,8 +186,7 @@ auto histogram::process() -> composite::retval {
     }
 
     // Decimate whole frames by percent_sampled, then bin the kept frame.
-    if (++m_skip_counter >= m_skip_threshold) {
-        m_skip_counter = 0;
+    if (m_decimator.keep()) {
         if (m_source_bits == 8) {
             process_samples<int8_t>(data.data(), data.size());
         } else {

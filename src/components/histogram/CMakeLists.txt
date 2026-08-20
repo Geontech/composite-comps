@@ -21,3 +21,7 @@ comps_add_component(histogram
     SOURCES component.cpp
     FAST_MATH
 )
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

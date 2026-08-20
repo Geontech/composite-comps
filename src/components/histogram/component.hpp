@@ -17,6 +17,8 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
+#include "frame_decimator.hpp"
+
 #include <composite/core/component.hpp>
 #include <composite/properties/config.hpp>
 #include <cstddef>
@@ -56,6 +58,7 @@ public:
 private:
     auto build_lookup() -> void;
     auto allocate_histogram() -> void;
+    auto apply_decimation() -> void;   // recompute the frame/sample thresholds from the config
     template <typename T>
     auto process_samples(const uint8_t* bytes, std::size_t nbytes) -> void;
 
@@ -69,14 +72,16 @@ private:
     // Members
     composite::mutable_buffer<uint64_t> m_histogram;
     std::vector<int8_t> m_sample_bits;
-    uint32_t m_histogram_samples{};
-    uint32_t m_skip_counter{};
-    uint32_t m_skip_threshold{1};  // = 1 / percent_sampled (whole-frame decimation)
-    uint32_t m_send_threshold{};   // = sample_rate * percent_sampled (samples per emitted histogram)
+    // 64-bit: both are long-running accumulators. At 100 Msps a 32-bit sample counter wraps in
+    // well under a minute, and a wrapped counter never reaches the send threshold again.
+    uint64_t m_histogram_samples{};
+    uint64_t m_send_threshold{};   // = sample_rate * percent_sampled (samples per emitted histogram)
+    histogram_detail::frame_decimator m_decimator{};  // whole-frame decimation by percent_sampled
 
     // Stream characteristics, tracked from metadata:
     float m_sample_rate{};
-    uint32_t m_source_bits{16};
+    uint32_t m_source_bits{16};  // sample width, from metadata (bounded; see MAX_SOURCE_BITS)
+    bool m_bits_warn{false};     // one-shot: metadata asked for an unsupported width
     bool m_is_complex{true};
     bool m_byteswap{};        // effective swap used this frame (config override, else auto)
     bool m_auto_byteswap{};   // metadata-derived swap (endianness vs host)
