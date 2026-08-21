@@ -21,7 +21,11 @@
 
 #include <composite/core/register.hpp>
 
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
+#include <format>
+#include <stdexcept>
 #include <unistd.h>
 
 file_writer::file_writer(std::string_view id) : composite::component(id) {
@@ -37,7 +41,20 @@ file_writer::~file_writer() {
 }
 
 auto file_writer::initialize() -> void {
-    m_file = ::open(m_filename.c_str(), O_CREAT|O_TRUNC|O_WRONLY, 0644);
+    // Contract: every initialize() starts a FRESH capture — O_TRUNC, byte counter reset (append
+    // is not offered in v0.5). A previous descriptor (re-initialize) must not leak.
+    if (m_file != -1) {
+        ::close(m_file);
+        m_file = -1;
+    }
+    m_file = ::open(m_filename.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (m_file < 0) {
+        // Fail the load loudly. The old code stored -1 and every later ::write failed silently:
+        // the component ran forever reporting NORMAL while writing nothing.
+        throw std::runtime_error(
+            std::format("file_writer '{}': cannot open '{}' for writing: {}", id(), m_filename, strerror(errno)));
+    }
+    m_total_bytes = 0;
 }
 
 auto file_writer::process() -> composite::retval {
@@ -58,9 +75,28 @@ auto file_writer::process() -> composite::retval {
             to_write = static_cast<std::size_t>(remaining);
         }
     }
-    if (auto num_written = ::write(m_file, data.data(), to_write); num_written != -1) {
-        m_total_bytes += static_cast<uint64_t>(num_written);
+    if (m_file < 0) {
+        // initialize() was skipped or failed; running on would silently discard the stream.
+        throw std::runtime_error(std::format("file_writer '{}': no open file (initialize() not run?)", id()));
     }
+    // Complete the write: a short write is normal kernel behaviour (signals, quotas, some
+    // filesystems), and treating it as done silently TRUNCATED the stream mid-buffer while the
+    // byte counter advanced. Retry EINTR; surface any real error as a component error finish
+    // (throwing is the framework's post-commit failure contract — the worker records
+    // finish_reason::error with this message as finish_error).
+    std::size_t written = 0;
+    while (written < to_write) {
+        const auto num_written = ::write(m_file, data.data() + written, to_write - written);
+        if (num_written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::format("file_writer '{}': write to '{}' failed after {} bytes: {}", id(),
+                                                 m_filename, m_total_bytes + written, strerror(errno)));
+        }
+        written += static_cast<std::size_t>(num_written);
+    }
+    m_total_bytes += written;
     if (m_num_bytes > 0 && m_total_bytes >= m_num_bytes) {
         return FINISH;
     }
