@@ -146,22 +146,50 @@ _comps_promote_imported(nlohmann_json::nlohmann_json)
 
 # --- IXWebSocket ---------------------------------------------------------
 # Hoisted out of src/components/ws_sink. The TLS options must be set before the
-# subproject is configured, which is why they are cache-FORCEd here.
-find_package(IXWebSocket QUIET)
-if(NOT IXWebSocket_FOUND AND NOT TARGET ixwebsocket)
-    FetchContent_Declare(IXWebSocket
-        GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
-        GIT_TAG v11.4.6
-    )
-    set(USE_TLS ON CACHE BOOL "" FORCE)
-    set(USE_OPEN_SSL ON CACHE BOOL "" FORCE)
-    # IXWEBSOCKET_INSTALL defaults TRUE, which put its entire SDK into our install tree:
-    # 51 headers, libixwebsocket.a, a CMake package config, and a .pc file. The fleet
-    # installs component modules, nothing else -- and shipping a dependency's headers in
-    # the container image is redistribution we would then owe notices for.
-    set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
-    FetchContent_MakeAvailable(IXWebSocket)
+# subproject is configured, which is why they are cache-FORCEd here. It stays at THIS
+# scope rather than moving back down: CompsFlags adds -fsanitize at directory scope
+# here, so a dependency configured from a deeper directory would miss the
+# instrumentation the sanitize jobs rely on.
+#
+# ws_sink is the only consumer, so an overlay that takes the FOSS modules from the
+# published image (-DCOMPS_BUILD_ALL=OFF) has no use for it -- and was cloning and
+# building it anyway, which on the FetchContent path costs a git clone plus a static
+# library, and drags openssl-devel/zlib-devel into the builder image for nothing.
+#
+# The per-component options are not declared until src/components/CMakeLists.txt,
+# which runs after this file, so decide the same way that file will: an explicit
+# -DCOMPS_BUILD_WS_SINK wins, else -DCOMPS_BUILD_ALL, else that option's ON default.
+# Both arrive in the cache before any option() call, so a first configure straight
+# from the command line reads correctly.
+if(DEFINED CACHE{COMPS_BUILD_WS_SINK})
+    set(_comps_want_ws_sink "$CACHE{COMPS_BUILD_WS_SINK}")
+elseif(DEFINED COMPS_BUILD_ALL)
+    set(_comps_want_ws_sink "${COMPS_BUILD_ALL}")
+else()
+    set(_comps_want_ws_sink ON)
 endif()
+
+if(_comps_want_ws_sink)
+    find_package(IXWebSocket QUIET)
+    if(NOT IXWebSocket_FOUND AND NOT TARGET ixwebsocket)
+        FetchContent_Declare(IXWebSocket
+            GIT_REPOSITORY https://github.com/machinezone/IXWebSocket.git
+            GIT_TAG v11.4.6
+        )
+        set(USE_TLS ON CACHE BOOL "" FORCE)
+        set(USE_OPEN_SSL ON CACHE BOOL "" FORCE)
+        # IXWEBSOCKET_INSTALL defaults TRUE, which put its entire SDK into our install
+        # tree: 51 headers, libixwebsocket.a, a CMake package config, and a .pc file.
+        # The fleet installs component modules, nothing else -- and shipping a
+        # dependency's headers in the container image is redistribution we would then
+        # owe notices for.
+        set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(IXWebSocket)
+    endif()
+else()
+    message(STATUS "composite-comps: ws_sink disabled; skipping IXWebSocket")
+endif()
+unset(_comps_want_ws_sink)
 
 # --- Catch2 --------------------------------------------------------------
 # Was declared five times, in five test directories. Only the first declaration
