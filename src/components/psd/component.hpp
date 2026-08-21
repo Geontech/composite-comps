@@ -27,6 +27,7 @@
 #include <composite/metrics/metrics.hpp>
 #include <composite/properties/snapshot.hpp>
 
+#include <atomic>
 #include <complex>
 #include <cstdint>
 #include <memory>
@@ -63,7 +64,15 @@ protected:
 private:
     /// Normalization constant for a given window + sample rate + mode. Pure (no member state) so
     /// it is safe to call from any pool worker. norm = 1 / (sample_rate * sum(window^2)[/size]).
-    static auto compute_norm_const(const window_t* window, T sample_rate, bool power_based) -> T;
+    /// With no window, energy mode uses the implicit rectangular window's sum(w^2) = N
+    /// (@p spectrum_size); power mode's factor is exactly 1 either way.
+    static auto compute_norm_const(const window_t* window, T sample_rate, bool power_based,
+                                   std::size_t spectrum_size) -> T;
+
+    /// Actual pool size, recorded by the framework's resize hook (main worker, pool idle) and
+    /// read in work() to divide the component-wide output-pool budget across workers.
+    auto on_workers_resized(int n) -> void override;
+    std::atomic<int> m_active_workers{1};
 
     // Properties (num_workers is owned by pipeline_component). power_based_normalization is written
     // by the engine under park; work() (pool threads, not parked) reads the published snapshot.
