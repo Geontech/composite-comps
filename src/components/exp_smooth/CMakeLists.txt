@@ -17,6 +17,9 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
+# NOTE: never add FAST_MATH here. The kernels' NaN/Inf sanitization (work.hpp) relies on
+# std::isfinite and IEEE comparisons in the scalar paths, which -ffast-math constant-folds
+# away — a -inf PSD bin would then poison the running average.
 comps_add_component(exp_smooth
     SOURCES component.cpp
     ABI_TYPE f32
