@@ -22,8 +22,10 @@
 #include <composite/core/register.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <complex>
 #include <format>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -61,6 +63,12 @@ framer<T>::framer(std::string_view id) : composite::component(id) {
     m_drops_backpressure = &create_counter(
         "framer.drops_backpressure",
         "Write batches dropped because downstream held frames past the backpressure timeout");
+    m_bytes_dropped_no_format = &create_counter(
+        "framer.bytes_dropped_no_format",
+        "Input bytes dropped while the input format was missing or unsupported");
+    m_bytes_dropped_unaligned = &create_counter(
+        "framer.bytes_dropped_unaligned",
+        "Trailing bytes discarded from buffers not aligned to sample boundaries");
 }
 
 template <typename T>
@@ -72,7 +80,10 @@ auto framer<T>::reset_state() -> void {
     m_input_format = {};  // Reset to default
     m_input_stride = 0;
     m_next_frame_start = 0;
-    m_timestamp_initialized = false;
+    m_anchors.clear();
+    m_reanchor_pending = true;
+    m_warned_no_format = false;
+    m_warned_unaligned = false;
 }
 
 template <typename T>
@@ -137,6 +148,10 @@ auto framer<T>::handle_metadata(const composite::metadata_ptr& meta) -> void {
         m_last_input_meta == nullptr || meta->sample_rate != m_last_input_meta->sample_rate;
     m_last_input_meta = meta;
 
+    // New metadata starts a new warn episode for the one-shot stream-shape warnings.
+    m_warned_no_format = false;
+    m_warned_unaligned = false;
+
     using scalar_t = typename T::value_type;
     const auto* support = find_input_format<scalar_t>(meta->format);
     if (support == nullptr) {
@@ -168,9 +183,10 @@ auto framer<T>::handle_metadata(const composite::metadata_ptr& meta) -> void {
     m_converter = support->make(needs_swap);
 
     if (rate_changed) {
-        // The sample-index -> wall-time mapping changed; re-anchor from the next buffer's
-        // timestamp instead of extrapolating the new rate across the old origin.
-        m_timestamp_initialized = false;
+        // The sample-index -> wall-time mapping changed; anchor a new segment at the next
+        // successfully written buffer instead of extrapolating the new rate across the old
+        // origin. Frames that start before that point keep the old segment's mapping.
+        m_reanchor_pending = true;
     }
 
     logger()->trace("framer: updated metadata:\n{}", m_metadata.to_string());
@@ -180,12 +196,6 @@ template <typename T>
 auto framer<T>::process_buffer(const composite::immutable_buffer<uint8_t>& buffer, composite::timestamp ts) -> void {
     if (!m_metadata_ready || m_input_stride == 0 || !m_converter || !m_pool) {
         return;
-    }
-
-    if (!m_timestamp_initialized) {
-        m_timestamp_origin = ts;
-        m_timestamp_origin_sample = m_pool->head();
-        m_timestamp_initialized = true;
     }
 
     auto span = buffer.as_span();
@@ -207,27 +217,34 @@ auto framer<T>::process_buffer(const composite::immutable_buffer<uint8_t>& buffe
                 convert(m_converter.value(), src, reinterpret_cast<scalar_t*>(dst), count * 2);
             } else {
                 // Real input: convert into the back half of the destination, then expand
-                // forward in place to complex (imag = 0). Iteration i writes scalar slots
-                // 2i and 2i+1 and reads slot count+i, which it has not yet overwritten
-                // (2i+1 < count+i+1 for all i < count), so no scratch buffer is needed.
+                // forward in place to complex (imag = 0). The expansion kernel documents
+                // why the in-place aliasing is safe; no scratch buffer is needed.
                 auto* dst_scalars = reinterpret_cast<scalar_t*>(dst);
                 convert(m_converter.value(), src, dst_scalars + count, count);
-                for (std::size_t i = 0; i < count; ++i) {
-                    const auto value = dst_scalars[count + i];
-                    dst[i] = T{value, scalar_t{0}};
-                }
+                expand_real_to_complex(dst_scalars, count);
             }
         };
 
-        if (!m_pool->write(complete_samples, produce)) {
+        // The write start position keys the timestamp anchor: this buffer's timestamp is the
+        // wall time of the first sample it lands at the current ring head.
+        const auto write_start = m_pool->head();
+        if (m_pool->write(complete_samples, produce)) {
+            if (m_reanchor_pending) {
+                // Anchor only AFTER a successful write: anchoring on arrival would bind this
+                // buffer's timestamp to ring samples it never contributed (had the write
+                // dropped, the head would not have advanced).
+                push_anchor(ts, write_start);
+            }
+        } else {
             auto diag = m_pool->get_diagnostics();
 
             m_samples_dropped->add(complete_samples);
 
-            // Dropped samples break the sample-index -> wall-time mapping (the ring head did
-            // not advance but real time did); re-anchor from the next buffer's timestamp so
-            // subsequent frame timestamps stay correct.
-            m_timestamp_initialized = false;
+            // Dropped samples break the sample-index -> wall-time mapping for everything
+            // written after them (the ring head did not advance but real time did); anchor a
+            // new segment at the next successful write. Frames already buffered keep the old
+            // segment's mapping.
+            m_reanchor_pending = true;
 
             switch (diag.last_drop_reason) {
                 case composite::overlap_ring<T>::drop_reason::BATCH_TOO_LARGE:
@@ -252,11 +269,22 @@ auto framer<T>::process_buffer(const composite::immutable_buffer<uint8_t>& buffe
         }
     }
 
-    // If there are leftover bytes, it indicates a non-sample-aligned buffer, which is now considered an error.
-    if (byte_count % m_input_stride != 0) {
-        logger()->warn("framer: received a buffer that is not aligned to sample boundaries ({} bytes, stride {}). "
-                       "Partial sample handling has been disabled, so leftover bytes will be discarded.",
-                       byte_count, m_input_stride);
+    // If there are leftover bytes, it indicates a non-sample-aligned buffer, which is now considered
+    // an error. Count every occurrence, but warn once per metadata episode: a persistently
+    // misaligned upstream would otherwise emit this at packet rate.
+    if (const auto leftover = byte_count % m_input_stride; leftover != 0) {
+        m_bytes_dropped_unaligned->add(leftover);
+        // The discarded fraction of a sample is lost TIME as well as lost bytes; without a
+        // re-anchor it would accumulate as timestamp drift (a fraction of a sample per
+        // misaligned buffer). Anchor the next buffer at its own timestamp instead.
+        m_reanchor_pending = true;
+        if (!m_warned_unaligned) {
+            m_warned_unaligned = true;
+            logger()->warn("framer: received a buffer that is not aligned to sample boundaries ({} bytes, stride {}). "
+                           "Partial sample handling has been disabled, so leftover bytes will be discarded "
+                           "(counted in framer.bytes_dropped_unaligned; warning once per metadata change).",
+                           byte_count, m_input_stride);
+        }
     }
 }
 
@@ -280,6 +308,12 @@ auto framer<T>::try_emit_frames() -> void {
         m_out_port.send_data(std::move(buffer_opt.value()), ts, m_out_metadata);
 
         m_next_frame_start += hop;
+    }
+
+    // Emission is monotonic in m_next_frame_start, so an anchor is dead once the NEXT anchor
+    // already covers every frame still to come. Steady state keeps exactly one anchor.
+    while (m_anchors.size() > 1 && m_anchors[1].origin_sample <= m_next_frame_start) {
+        m_anchors.erase(m_anchors.begin());
     }
 }
 
@@ -322,30 +356,61 @@ auto framer<T>::on_end_of_stream() -> void {
 }
 
 template <typename T>
+auto framer<T>::push_anchor(composite::timestamp ts, std::size_t origin_sample) -> void {
+    time_anchor anchor{.origin = ts, .origin_sample = origin_sample};
+    // The rate comes off the wire (parser metadata / user overrides); a non-finite or
+    // non-positive value must not poison the uint64 casts in compute_frame_timestamp
+    // (casting a NaN/negative long double to uint64 is UB). rate == 0 in the anchor means
+    // "no extrapolation": frames in this segment reuse the anchor time as-is.
+    if (const auto sr = m_metadata.sample_rate; std::isfinite(sr) && sr > 0.0) {
+        anchor.rate = static_cast<long double>(sr);
+        anchor.inv_rate = 1.0L / anchor.rate;
+        anchor.ps_per_sample = static_cast<long double>(framer_detail::PS_PER_SEC) / anchor.rate;
+    }
+    if (m_anchors.size() >= MAX_ANCHORS) {
+        // Discontinuities are outpacing emission; shed the oldest segment (its frames get
+        // nearest-anchor stamps) rather than grow without bound.
+        m_anchors.erase(m_anchors.begin());
+    }
+    m_anchors.push_back(anchor);
+    m_reanchor_pending = false;
+}
+
+template <typename T>
 auto framer<T>::compute_frame_timestamp(std::size_t start_sample) const -> composite::timestamp {
-    if (!m_timestamp_initialized || m_metadata.sample_rate <= 0.0) {
-        return m_timestamp_origin;
+    if (m_anchors.empty()) {
+        // Unreachable in practice: every emittable frame's samples came from a successful
+        // write, and the first successful write always pushes an anchor.
+        return {};
     }
 
-    // Handle potential underflow by checking if start_sample is less than origin
-    if (start_sample < m_timestamp_origin_sample) {
-        logger()->warn("framer: start_sample ({}) < origin_sample ({}), using origin timestamp",
-                       start_sample, m_timestamp_origin_sample);
-        return m_timestamp_origin;
+    // Newest anchor with origin_sample <= start_sample owns this frame's mapping (the list is
+    // ordered and tiny; steady state is a single element).
+    const auto* anchor = &m_anchors.front();
+    for (const auto& candidate : m_anchors) {
+        if (candidate.origin_sample > start_sample) {
+            break;
+        }
+        anchor = &candidate;
+    }
+
+    if (anchor->rate <= 0.0L || start_sample < anchor->origin_sample) {
+        // No usable rate for this segment, or the frame predates the oldest retained anchor
+        // (possible only after MAX_ANCHORS eviction): the anchor time is the best available.
+        return anchor->origin;
     }
 
     // Split the elapsed time into whole seconds plus a sub-second remainder BEFORE converting
     // to picoseconds: a single delta_samples * ps_per_sample product overflows uint64 after
     // ~213 days of continuous streaming, while the remainder term here stays under one second.
-    const auto rate = static_cast<long double>(m_metadata.sample_rate);
-    const auto delta_samples = static_cast<long double>(start_sample - m_timestamp_origin_sample);
-    const auto whole_seconds = static_cast<uint64_t>(delta_samples / rate);
+    // The divisions were precomputed when the anchor was established.
+    const auto delta_samples = static_cast<long double>(start_sample - anchor->origin_sample);
+    const auto whole_seconds = static_cast<uint64_t>(delta_samples * anchor->inv_rate);
     const auto remainder_samples =
-        std::max(delta_samples - static_cast<long double>(whole_seconds) * rate, 0.0L);
-    const auto ps_per_sample = static_cast<long double>(framer_detail::PS_PER_SEC) / rate;
-    const auto ps_rem = static_cast<uint64_t>(remainder_samples * ps_per_sample);
+        std::max(delta_samples - static_cast<long double>(whole_seconds) * anchor->rate, 0.0L);
+    const auto ps_rem = static_cast<uint64_t>(remainder_samples * anchor->ps_per_sample);
 
-    auto ts = m_timestamp_origin;
+    auto ts = anchor->origin;
     ts.seconds += whole_seconds + ps_rem / framer_detail::PS_PER_SEC;
     auto picoseconds = ts.picoseconds + (ps_rem % framer_detail::PS_PER_SEC);
     if (picoseconds >= framer_detail::PS_PER_SEC) {
@@ -361,25 +426,50 @@ template <typename T>
 auto framer<T>::process() -> composite::retval {
     using enum composite::retval;
 
-    auto pkt = m_in_port.try_get();
-    if (!pkt) {
+    // Bounded batch drain: one ring-head publication per call instead of one per packet
+    // (upstream sends per-packet). Each packet is still processed sequentially — metadata is
+    // ordered stream state — and frames are emitted after each buffer so downstream latency
+    // does not stretch with the batch.
+    const auto count = m_in_port.get_batch(std::span{m_input_batch});
+    if (count == 0) {
         // No input: NOOP so the worker parks on the read-doorbell until upstream delivers,
         // rather than busy-spinning process() while idle. At end-of-stream the base promotes this
         // NOOP to FINISH (see on_end_of_stream() for the residue flush).
         return NOOP;
     }
-    auto& [buffer, ts, meta] = *pkt;
 
-    if (meta != nullptr) {
-        handle_metadata(meta);
+    for (std::size_t i = 0; i < count; ++i) {
+        // Move the packet out so its buffer reference is released at scope end, not held in
+        // the batch array until the next drain overwrites this slot.
+        auto [buffer, ts, meta] = std::move(m_input_batch[i]);
+
+        if (meta != nullptr) {
+            handle_metadata(meta);
+        }
+
+        if (!m_metadata_ready) {
+            // No usable input format (none seen yet, or the current one is unsupported):
+            // the data cannot be framed. The metric carries the loss rate; warn once per
+            // metadata episode so a stream with no metadata at all is still visible.
+            m_bytes_dropped_no_format->add(buffer.size());
+            if (!m_warned_no_format) {
+                m_warned_no_format = true;
+                logger()->warn("framer: dropping data ({} bytes) with no usable input format "
+                               "(counted in framer.bytes_dropped_no_format)", buffer.size());
+            }
+            if (buffer.size() > 0) {
+                // Real time passed while these bytes were lost, so the sample-index ->
+                // wall-time mapping no longer holds for anything written later — even if a
+                // supported format resumes at the SAME sample rate (which would not trip the
+                // rate-change re-anchor in handle_metadata).
+                m_reanchor_pending = true;
+            }
+            continue;
+        }
+
+        process_buffer(buffer, ts);
+        try_emit_frames();
     }
-
-    if (!m_metadata_ready) {
-        return NORMAL;
-    }
-
-    process_buffer(buffer, ts);
-    try_emit_frames();
 
     return NORMAL;
 }

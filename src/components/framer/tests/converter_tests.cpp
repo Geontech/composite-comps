@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <bit>
 #include <complex>
 #include <cstdint>
 #include <vector>
@@ -392,6 +393,363 @@ TEST_CASE("converter<int16_t, float> - large remainder exposes scalar bug", "[co
         INFO("Sample " << i << " should be " << expected << " but got " << output[i]);
         REQUIRE_THAT(output[i], WithinAbs(expected, 0.001f));
     }
+}
+
+// ============================================================================
+// Vector-path byteswap coverage (counts large enough to hit the SIMD loop)
+// ============================================================================
+
+TEST_CASE("converter<int16_t, float> - byteswap large batch hits vector path", "[converter][int16][byteswap]") {
+    converter<int16_t, float> conv(true);
+
+    constexpr size_t count = 41;
+    vector<int16_t> input_i16(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto value = static_cast<int16_t>(static_cast<int>(i) * 700 - 14'000);
+        auto u = static_cast<uint16_t>(value);
+        input_i16[i] = static_cast<int16_t>(static_cast<uint16_t>((u << 8) | (u >> 8)));  // store big-endian
+    }
+
+    auto* input = reinterpret_cast<uint8_t*>(input_i16.data());
+    alignas(64) float output[count];
+    conv(input, output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<float>(static_cast<int16_t>(static_cast<int>(i) * 700 - 14'000));
+        INFO("Sample " << i);
+        REQUIRE_THAT(output[i], WithinAbs(expected, 0.001f));
+    }
+}
+
+TEST_CASE("converter<int16_t, int16_t> - byteswap large batch hits vector path", "[converter][int16][passthrough][byteswap]") {
+    converter<int16_t, int16_t> conv(true);
+
+    constexpr size_t count = 73;
+    vector<int16_t> input_i16(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto value = static_cast<int16_t>(static_cast<int>(i) * 421 - 15'000);
+        auto u = static_cast<uint16_t>(value);
+        input_i16[i] = static_cast<int16_t>(static_cast<uint16_t>((u << 8) | (u >> 8)));
+    }
+
+    auto* input = reinterpret_cast<uint8_t*>(input_i16.data());
+    alignas(64) int16_t output[count];
+    conv(input, output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<int16_t>(static_cast<int>(i) * 421 - 15'000);
+        INFO("Sample " << i);
+        REQUIRE(output[i] == expected);
+    }
+}
+
+TEST_CASE("converter<uint32_t, float> - byteswap large batch hits vector path", "[converter][cf32][byteswap]") {
+    converter<uint32_t, float> conv(true);
+
+    constexpr size_t count = 25;
+    vector<uint32_t> input_u32(count);
+    vector<float> expected(count);
+    for (size_t i = 0; i < count; ++i) {
+        expected[i] = static_cast<float>(i) * 1.25f - 3.5f;
+        auto bits = std::bit_cast<uint32_t>(expected[i]);
+        input_u32[i] = std::byteswap(bits);  // store big-endian
+    }
+
+    auto* input = reinterpret_cast<uint8_t*>(input_u32.data());
+    alignas(64) float output[count];
+    conv(input, output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        INFO("Sample " << i);
+        REQUIRE_THAT(output[i], WithinAbs(expected[i], 0.00001f));
+    }
+}
+
+// ============================================================================
+// Unsigned (offset binary) converters
+// ============================================================================
+
+TEST_CASE("converter<uint8_t, float> - offset binary conversion", "[converter][uint8]") {
+    converter<uint8_t, float> conv(false);
+
+    vector<uint8_t> input = {0, 128, 255, 127, 129};
+    vector<float> output(5);
+
+    conv(input.data(), output.data(), 5);
+
+    REQUIRE(output[0] == -128.0f);  // wire minimum -> full negative scale
+    REQUIRE(output[1] == 0.0f);     // mid-scale -> zero
+    REQUIRE(output[2] == 127.0f);   // wire maximum -> full positive scale
+    REQUIRE(output[3] == -1.0f);
+    REQUIRE(output[4] == 1.0f);
+}
+
+TEST_CASE("converter<uint8_t, float> - large remainder exposes scalar bug", "[converter][uint8][scalar][bug]") {
+    converter<uint8_t, float> conv(false);
+
+    constexpr size_t count = 25;
+    vector<uint8_t> input(count);
+    for (size_t i = 0; i < count; ++i) {
+        input[i] = static_cast<uint8_t>(i * 10);
+    }
+
+    alignas(64) float output[count];
+    for (size_t i = 0; i < count; ++i) {
+        output[i] = -9999.0f;
+    }
+
+    conv(input.data(), output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<float>(static_cast<int>(input[i]) - 128);
+        INFO("Sample " << i << " should be " << expected << " but got " << output[i]);
+        REQUIRE_THAT(output[i], WithinAbs(expected, 0.001f));
+    }
+}
+
+TEST_CASE("converter<uint16_t, float> - offset binary conversion", "[converter][uint16]") {
+    converter<uint16_t, float> conv(false);
+
+    vector<uint16_t> input_u16 = {0, 32768, 65535, 32767, 32769};
+    auto* input = reinterpret_cast<uint8_t*>(input_u16.data());
+    vector<float> output(5);
+
+    conv(input, output.data(), 5);
+
+    REQUIRE(output[0] == -32768.0f);
+    REQUIRE(output[1] == 0.0f);
+    REQUIRE(output[2] == 32767.0f);
+    REQUIRE(output[3] == -1.0f);
+    REQUIRE(output[4] == 1.0f);
+}
+
+TEST_CASE("converter<uint16_t, float> - with byteswap", "[converter][uint16][byteswap]") {
+    converter<uint16_t, float> conv(true);
+
+    // Big-endian 0x8100 = 33024 -> 33024 - 32768 = 256
+    vector<uint8_t> input = {0x81, 0x00};
+    vector<float> output(1);
+
+    conv(input.data(), output.data(), 1);
+
+    REQUIRE(output[0] == 256.0f);
+}
+
+TEST_CASE("converter<uint16_t, float> - large remainder exposes scalar bug", "[converter][uint16][scalar][bug]") {
+    converter<uint16_t, float> conv(false);
+
+    constexpr size_t count = 25;
+    vector<uint16_t> input_u16(count);
+    for (size_t i = 0; i < count; ++i) {
+        input_u16[i] = static_cast<uint16_t>(i * 2500);
+    }
+
+    auto* input = reinterpret_cast<uint8_t*>(input_u16.data());
+    alignas(64) float output[count];
+    for (size_t i = 0; i < count; ++i) {
+        output[i] = -99999.0f;
+    }
+
+    conv(input, output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<float>(static_cast<int32_t>(input_u16[i]) - 32768);
+        INFO("Sample " << i << " should be " << expected << " but got " << output[i]);
+        REQUIRE_THAT(output[i], WithinAbs(expected, 0.001f));
+    }
+}
+
+TEST_CASE("converter<uint8_t, int16_t> - offset binary conversion", "[converter][uint8][int16]") {
+    converter<uint8_t, int16_t> conv(false);
+
+    vector<uint8_t> input = {0, 128, 255, 127, 129};
+    vector<int16_t> output(5);
+
+    conv(input.data(), output.data(), 5);
+
+    REQUIRE(output[0] == -128);
+    REQUIRE(output[1] == 0);
+    REQUIRE(output[2] == 127);
+    REQUIRE(output[3] == -1);
+    REQUIRE(output[4] == 1);
+}
+
+TEST_CASE("converter<uint8_t, int16_t> - large remainder exposes scalar bug", "[converter][uint8][int16][scalar][bug]") {
+    converter<uint8_t, int16_t> conv(false);
+
+    constexpr size_t count = 41;  // AVX-512 does 32, leaves 9; AVX2 does 32, leaves 9
+    vector<uint8_t> input(count);
+    for (size_t i = 0; i < count; ++i) {
+        input[i] = static_cast<uint8_t>(i * 6);
+    }
+
+    alignas(64) int16_t output[count];
+    for (size_t i = 0; i < count; ++i) {
+        output[i] = -9999;
+    }
+
+    conv(input.data(), output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<int16_t>(static_cast<int>(input[i]) - 128);
+        INFO("Sample " << i << " should be " << expected << " but got " << output[i]);
+        REQUIRE(output[i] == expected);
+    }
+}
+
+TEST_CASE("converter<uint16_t, int16_t> - offset binary conversion", "[converter][uint16][int16]") {
+    converter<uint16_t, int16_t> conv(false);
+
+    vector<uint16_t> input_u16 = {0, 32768, 65535, 32767, 32769};
+    auto* input = reinterpret_cast<uint8_t*>(input_u16.data());
+    vector<int16_t> output(5);
+
+    conv(input, output.data(), 5);
+
+    REQUIRE(output[0] == -32768);
+    REQUIRE(output[1] == 0);
+    REQUIRE(output[2] == 32767);
+    REQUIRE(output[3] == -1);
+    REQUIRE(output[4] == 1);
+}
+
+TEST_CASE("converter<uint16_t, int16_t> - with byteswap", "[converter][uint16][int16][byteswap]") {
+    converter<uint16_t, int16_t> conv(true);
+
+    // Big-endian 0x8100 = 33024 -> 33024 - 32768 = 256
+    vector<uint8_t> input = {0x81, 0x00};
+    vector<int16_t> output(1);
+
+    conv(input.data(), output.data(), 1);
+
+    REQUIRE(output[0] == 256);
+}
+
+TEST_CASE("converter<uint16_t, int16_t> - byteswap large remainder", "[converter][uint16][int16][byteswap][scalar][bug]") {
+    converter<uint16_t, int16_t> conv(true);
+
+    constexpr size_t count = 41;
+    vector<uint16_t> input_u16(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto value = static_cast<uint16_t>(i * 1500);
+        input_u16[i] = static_cast<uint16_t>((value << 8) | (value >> 8));  // store big-endian
+    }
+
+    auto* input = reinterpret_cast<uint8_t*>(input_u16.data());
+    alignas(64) int16_t output[count];
+    for (size_t i = 0; i < count; ++i) {
+        output[i] = -9999;
+    }
+
+    conv(input, output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<int16_t>(static_cast<int32_t>(static_cast<uint16_t>(i * 1500)) - 32768);
+        INFO("Sample " << i << " should be " << expected << " but got " << output[i]);
+        REQUIRE(output[i] == expected);
+    }
+}
+
+// ============================================================================
+// int32_t -> float converter
+// ============================================================================
+
+TEST_CASE("converter<int32_t, float> - basic conversion", "[converter][int32]") {
+    converter<int32_t, float> conv(false);
+
+    vector<int32_t> input_i32 = {0, 1, -1, 1'000'000, -1'000'000, 8'388'607};
+    auto* input = reinterpret_cast<uint8_t*>(input_i32.data());
+    vector<float> output(6);
+
+    conv(input, output.data(), 6);
+
+    REQUIRE(output[0] == 0.0f);
+    REQUIRE(output[1] == 1.0f);
+    REQUIRE(output[2] == -1.0f);
+    REQUIRE(output[3] == 1'000'000.0f);
+    REQUIRE(output[4] == -1'000'000.0f);
+    REQUIRE(output[5] == 8'388'607.0f);  // exactly representable (within 24-bit mantissa)
+}
+
+TEST_CASE("converter<int32_t, float> - with byteswap", "[converter][int32][byteswap]") {
+    converter<int32_t, float> conv(true);
+
+    // Big-endian 256 = 0x00000100
+    vector<uint8_t> input = {0x00, 0x00, 0x01, 0x00};
+    vector<float> output(1);
+
+    conv(input.data(), output.data(), 1);
+
+    REQUIRE(output[0] == 256.0f);
+}
+
+TEST_CASE("converter<int32_t, float> - large remainder exposes scalar bug", "[converter][int32][scalar][bug]") {
+    converter<int32_t, float> conv(false);
+
+    constexpr size_t count = 25;
+    vector<int32_t> input_i32(count);
+    for (size_t i = 0; i < count; ++i) {
+        input_i32[i] = static_cast<int32_t>(i) * 100'000 - 1'200'000;
+    }
+
+    auto* input = reinterpret_cast<uint8_t*>(input_i32.data());
+    alignas(64) float output[count];
+    for (size_t i = 0; i < count; ++i) {
+        output[i] = -9999.0f;
+    }
+
+    conv(input, output, count);
+
+    for (size_t i = 0; i < count; ++i) {
+        auto expected = static_cast<float>(input_i32[i]);
+        INFO("Sample " << i << " should be " << expected << " but got " << output[i]);
+        REQUIRE_THAT(output[i], WithinAbs(expected, 0.001f));
+    }
+}
+
+// ============================================================================
+// Real -> complex in-place expansion kernels
+// ============================================================================
+
+TEST_CASE("expand_real_to_complex<float> - in-place aliased expansion", "[expand][float]") {
+    // Odd count exercises the vector loop AND the scalar tail; the source lives in the
+    // back half of the same buffer the expansion writes, exactly as the framer stages it.
+    constexpr size_t count = 25;
+    vector<float> buf(2 * count, -9999.0f);
+    for (size_t i = 0; i < count; ++i) {
+        buf[count + i] = static_cast<float>(i) - 12.0f;
+    }
+
+    expand_real_to_complex(buf.data(), count);
+
+    for (size_t i = 0; i < count; ++i) {
+        INFO("Sample " << i);
+        REQUIRE(buf[2 * i] == static_cast<float>(i) - 12.0f);
+        REQUIRE(buf[2 * i + 1] == 0.0f);
+    }
+}
+
+TEST_CASE("expand_real_to_complex<int16_t> - in-place aliased expansion", "[expand][int16]") {
+    constexpr size_t count = 37;
+    vector<int16_t> buf(2 * count, -9999);
+    for (size_t i = 0; i < count; ++i) {
+        buf[count + i] = static_cast<int16_t>(static_cast<int>(i) * 100 - 1800);
+    }
+
+    expand_real_to_complex(buf.data(), count);
+
+    for (size_t i = 0; i < count; ++i) {
+        INFO("Sample " << i);
+        REQUIRE(buf[2 * i] == static_cast<int16_t>(static_cast<int>(i) * 100 - 1800));
+        REQUIRE(buf[2 * i + 1] == 0);
+    }
+}
+
+TEST_CASE("expand_real_to_complex<float> - single sample", "[expand][float][edge]") {
+    vector<float> buf = {-9999.0f, 42.0f};
+    expand_real_to_complex(buf.data(), 1);
+    REQUIRE(buf[0] == 42.0f);
+    REQUIRE(buf[1] == 0.0f);
 }
 
 TEST_CASE("converter<uint32_t, float> - large remainder exposes scalar bug", "[converter][scalar][bug]") {

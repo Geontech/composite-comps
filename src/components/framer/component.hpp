@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <complex>
 #include <cstddef>
@@ -27,6 +28,7 @@
 #include <optional>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/overlap_ring.hpp>
@@ -69,14 +71,21 @@ struct framer_config {
  *
  * Conversion semantics worth knowing for spectral processing:
  *  - Integer inputs are widened numerically, NOT normalized: i8 -> float yields values in
- *    [-128, 127], i16 -> float in [-32768, 32767]. Downstream power/dB levels therefore
- *    carry a constant, input-format-dependent offset.
+ *    [-128, 127], i16 -> float in [-32768, 32767], i32 -> float keeps the raw magnitude
+ *    (rounding past float's 24-bit mantissa). Downstream power/dB levels therefore carry a
+ *    constant, input-format-dependent offset.
+ *  - Unsigned integer inputs (e.g. the SDDS unsigned data modes) are offset binary: mid-scale
+ *    is subtracted, so u8 -> [-128, 127] and u16 -> [-32768, 32767], matching the signed
+ *    ranges instead of biasing every sample by half full-scale (a DC spike downstream).
  *  - Real inputs are expanded to complex with imag = 0, which produces a conjugate-symmetric
  *    spectrum downstream.
  *
- * Frame timestamps are extrapolated from an anchor (first buffer's timestamp) by sample
- * count and sample rate; the anchor is re-established after any sample drop and on any
- * sample-rate change so extrapolation never drifts from wall time.
+ * Frame timestamps are extrapolated by sample count and sample rate from per-segment
+ * anchors: a new anchor (the next buffer's timestamp, the rate it arrived under) is
+ * established after any sample drop and on any sample-rate change, and the old anchor is
+ * kept until every frame that starts under its mapping has been emitted. A frame that
+ * straddles a discontinuity is stamped with the time of its FIRST sample, from the mapping
+ * that sample was written under.
  */
 template <typename T>
 class framer : public composite::component {
@@ -100,11 +109,18 @@ private:
     auto configure_output_metadata() -> void;
     auto process_buffer(const composite::immutable_buffer<uint8_t>& buffer, composite::timestamp ts) -> void;
     auto try_emit_frames() -> void;
+    auto push_anchor(composite::timestamp ts, std::size_t origin_sample) -> void;
     auto compute_frame_timestamp(std::size_t start_sample) const -> composite::timestamp;
 
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
+
+    // Bounded input drain: one ring-head publication per process() call instead of one per
+    // packet (upstream pkt_parser sends per-packet). Entries are moved out as they are
+    // processed so buffer references are not held across calls.
+    static constexpr std::size_t INPUT_BATCH_SIZE{128};
+    std::array<typename input_port_t::queue_type, INPUT_BATCH_SIZE> m_input_batch{};
 
     // Properties (grouped as one reflected config<T>)
     composite::config<framer_detail::framer_config> m_cfg{};
@@ -114,6 +130,11 @@ private:
     composite::metrics::counter<uint64_t>* m_samples_dropped{nullptr};
     composite::metrics::counter<uint64_t>* m_drops_batch_too_large{nullptr};
     composite::metrics::counter<uint64_t>* m_drops_backpressure{nullptr};
+    // Loss the ring never sees, counted in BYTES because it happens exactly when the sample
+    // stride is unknown or does not divide the buffer: data consumed while no usable input
+    // format is known, and trailing bytes of non-sample-aligned buffers.
+    composite::metrics::counter<uint64_t>* m_bytes_dropped_no_format{nullptr};
+    composite::metrics::counter<uint64_t>* m_bytes_dropped_unaligned{nullptr};
 
     // Metadata tracking. Metadata arrives as a shared immutable instance that upstream
     // latches, so handle_metadata() early-outs on pointer identity (the common case) —
@@ -127,6 +148,12 @@ private:
     composite::data_format m_input_format{};
     std::size_t m_input_stride{};
 
+    // One-shot warn flags (the counters carry the recurring signal; warning at packet rate
+    // on a persistently misbehaving stream would flood the log). Reset when the input
+    // metadata changes, so each new episode warns once.
+    bool m_warned_no_format{false};
+    bool m_warned_unaligned{false};
+
     // Overlapped framing ring (framework-provided): manages the sample ring + frame slots.
     std::shared_ptr<composite::overlap_ring<T>> m_pool;
     std::size_t m_next_frame_start{};  // Next frame start sample
@@ -134,12 +161,27 @@ private:
     // Type converter (AVX-optimized) - converts to scalar type (float or int16_t)
     std::optional<converter_variant<typename T::value_type>> m_converter;
 
-    // Timestamp tracking: frame timestamps extrapolate from this anchor. Cleared (forcing a
-    // re-anchor on the next buffer) after a drop and on a sample-rate change, since either
-    // one breaks the sample-index -> wall-time mapping.
-    composite::timestamp m_timestamp_origin{};
-    std::size_t m_timestamp_origin_sample{};
-    bool m_timestamp_initialized{false};
+    // Timestamp tracking. Frame timestamps extrapolate from the newest anchor whose
+    // origin_sample <= the frame's start sample, so each frame is stamped with the mapping
+    // its FIRST sample was written under. A drop or a sample-rate change marks the mapping
+    // broken (m_reanchor_pending); the next successfully written buffer contributes a new
+    // anchor at the ring position its samples landed, and frames written before that point
+    // (including one straddling the discontinuity) keep the old mapping. Old anchors are
+    // pruned as emission advances past them, so the list stays at 1 in steady state; the
+    // hard cap only matters if discontinuities outpace emission (evicting the oldest then
+    // degrades stale frames to nearest-anchor stamps rather than growing without bound).
+    // Each anchor carries the rate it was established under, with the divisions precomputed
+    // off the per-frame path.
+    struct time_anchor {
+        composite::timestamp origin{};
+        std::size_t origin_sample{};
+        long double rate{};           // 0 when the metadata rate was missing or invalid
+        long double inv_rate{};
+        long double ps_per_sample{};
+    };
+    static constexpr std::size_t MAX_ANCHORS{64};
+    std::vector<time_anchor> m_anchors;
+    bool m_reanchor_pending{true};
 
     // MUST be last: stops the framework worker before any member above destructs. The base
     // ~component stops too late (after derived members are gone), so a still-running worker's

@@ -21,481 +21,707 @@
 
 #include <array>
 #include <bit>
-#include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <immintrin.h>
-#include <mutex>
 #include <type_traits>
 #include <variant>
 
 #include <composite/core/metadata.hpp>
 
-namespace avx {
-
-template <typename T>
-constexpr bool avxable_ps =
-    std::is_same_v<T, int16_t> || std::is_same_v<T, uint16_t> ||
-    std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t>;
-
-namespace swap {
-
-inline __m128i shuffle_u16_8;
-inline __m256i shuffle_u16_16;
-inline __m256i shuffle_u32_8;
-inline __m256i shuffle_u64_4;
-inline __m512i shuffle_u16_32;
-inline __m512i shuffle_u32_16;
-inline __m512i shuffle_u64_8;
-
-inline std::once_flag avx2_once_flag;
-inline std::once_flag avx512_once_flag;
-
-[[gnu::target("avx2")]]
-inline auto init_avx2() {
-    shuffle_u16_8 = _mm_set_epi8(14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1);
-    shuffle_u16_16 = _mm256_set_epi8(
-        14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1,
-        14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1
-    );
-    shuffle_u32_8 = _mm256_set_epi8(
-        12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3,
-        12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3
-    );
-    shuffle_u64_4 = _mm256_set_epi8(
-        8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7
-    );
-}
-
-[[gnu::target("avx512f")]]
-inline auto init_avx512() {
-    init_avx2();
-    shuffle_u16_32 = _mm512_set_epi8(
-        14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1,
-        14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1,
-        14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1,
-        14,15,12,13,10,11,8,9,6,7,4,5,2,3,0,1
-    );
-    shuffle_u32_16 = _mm512_set_epi8(
-        12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3,
-        12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3,
-        12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3,
-        12,13,14,15,8,9,10,11,4,5,6,7,0,1,2,3
-    );
-    shuffle_u64_8 = _mm512_set_epi8(
-        8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7,
-        8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7
-    );
-}
-
-} // namespace swap
-
-/// SIMD tier selected at runtime for the converters below.
-enum class simd_level { scalar, avx2, avx512 };
-
-/// One CPU-feature probe shared by every converter. The avx512 tier requires BW/VL/DQ in
-/// addition to F because the converters use 8/16-bit shuffles, epi8/epi16 widening
-/// conversions, and 256-bit EVEX loads — gating on avx512f alone would dispatch illegal
-/// instructions on an F-only CPU. Also runs the one-time shuffle-mask initialization for
-/// the selected tier.
-inline auto detect_simd_level() -> simd_level {
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-        __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512dq")) {
-        std::call_once(swap::avx512_once_flag, swap::init_avx512);
-        return simd_level::avx512;
-    }
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-        std::call_once(swap::avx2_once_flag, swap::init_avx2);
-        return simd_level::avx2;
-    }
-    return simd_level::scalar;
-}
-
-} // namespace avx
+#include "simd_fmv.hpp"
 
 // ============================================================================
-// Converter callable structs - eliminates virtual function overhead
+// Wire-format converters
 // ============================================================================
+//
+// Each converter turns raw input bytes in one wire format into the framer's scalar type
+// (float or int16_t), whole buffer at a time. SIMD selection uses GCC native function
+// multiversioning (same-name run() overloads with [[gnu::target]]; see simd_fmv.hpp), so the
+// dispatch costs one resolved call per BUFFER and the vector loop lives inside the selected
+// kernel — not an indirect call per vector.
+//
+// Value semantics:
+//  - Signed integers are widened numerically, NOT normalized (i8 -> [-128, 127]).
+//  - Unsigned integers are offset binary (the wire convention for unsigned sample data, and
+//    what the SDDS unsigned data modes carry): mid-scale is subtracted, so u8 -> [-128, 127]
+//    and u16 -> [-32768, 32767], matching the signed formats' ranges. Widening them without
+//    the offset would bias every sample by half full-scale and put a spurious DC spike in
+//    downstream spectra. Bit-wise this is an XOR of the sign bit followed by the signed path.
+//  - i32 is widened to float numerically; values beyond float's 24-bit mantissa round.
+//  - f32 passes through bit-exact (modulo byte order).
+//
+// Byte order: converters take a `swap` flag (input endianness != native); 8-bit formats have
+// no byte order. The swap branch is loop-invariant and predicted; swap masks are shared
+// constants below.
 
-// Forward declarations for all converter types
+namespace framer_swap_masks {
+// pshufb control bytes for a byteswap, lowest byte first; the 16-byte pattern repeats per
+// 128-bit lane, so one 64-byte constant serves the 128/256/512-bit loads as prefixes.
+alignas(64) inline constexpr std::int8_t U16[64] = {
+    1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+    1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+    1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+    1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14,
+};
+alignas(64) inline constexpr std::int8_t U32[64] = {
+    3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+    3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+    3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+    3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12,
+};
+} // namespace framer_swap_masks
+
+/// Read a possibly-misaligned value (packet payload slices land at arbitrary byte offsets;
+/// a misaligned typed lvalue read is UB even where the hardware tolerates it).
+template <typename V>
+inline auto framer_load_unaligned(const V* p) -> V {
+    V v;
+    std::memcpy(&v, p, sizeof(V));
+    return v;
+}
+
 template <typename InputT, typename OutputT>
 struct converter;
 
-// Specialization: int8_t -> float
+// ---------------------------------------------------------------------------
+// int8 -> float (numeric widening; single-byte, no byte order)
+// ---------------------------------------------------------------------------
 template <>
 struct converter<int8_t, float> {
-    converter() {
-        init_cpu_features();
-    }
-
-    explicit converter([[maybe_unused]] bool swap) {
-        // int8_t doesn't need byteswap (single byte)
-        init_cpu_features();
-    }
+    converter() = default;
+    explicit converter(bool /*swap: single byte*/) {}
 
     auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
-        const int8_t* data = reinterpret_cast<const int8_t*>(input);
-        std::size_t processed = 0;
-
-        // Process full vectors using CPU-specific implementation
-        for (; processed + samples_per_vector <= count; processed += samples_per_vector) {
-            (this->*process_func)(data + processed, output + processed);
-        }
-
-        // Process remaining samples scalar
-        for (; processed < count; ++processed) {
-            output[processed] = static_cast<float>(data[processed]);
-        }
+        run(reinterpret_cast<const int8_t*>(input), output, count);
     }
 
 private:
-    auto init_cpu_features() -> void {
-        switch (avx::detect_simd_level()) {
-            case avx::simd_level::avx512:
-                process_func = &converter::process_avx512;
-                samples_per_vector = 16;
-                break;
-            case avx::simd_level::avx2:
-                process_func = &converter::process_avx2;
-                samples_per_vector = 8;
-                break;
-            case avx::simd_level::scalar:
-                process_func = &converter::process_single;
-                samples_per_vector = 1;
-                break;
+    static auto scalar_range(const int8_t* in, float* out, std::size_t i, std::size_t count) -> void {
+        for (; i < count; ++i) {
+            out[i] = static_cast<float>(in[i]);
         }
     }
 
-    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
-    auto process_avx512(const int8_t* data, float* dst) -> void {
-        auto loaded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data));
-        auto data_m512i = _mm512_cvtepi8_epi32(loaded);
-        auto payload_m512 = _mm512_cvtepi32_ps(data_m512i);
-        _mm512_storeu_ps(dst, payload_m512);  // Use unaligned store for safety
+    COMPS_FMV_DEFAULT
+    static auto run(const int8_t* in, float* out, std::size_t count) -> void {
+        scalar_range(in, out, 0, count);
     }
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2")]]
-    auto process_avx2(const int8_t* data, float* dst) -> void {
-        auto loaded = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(data));
-        auto data_m256i = _mm256_cvtepi8_epi32(loaded);
-        auto payload = _mm256_cvtepi32_ps(data_m256i);
-        _mm256_storeu_ps(dst, payload);  // Use unaligned store for safety
+    static auto run(const int8_t* in, float* out, std::size_t count) -> void {
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            const auto v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(in + i));
+            _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v)));
+        }
+        scalar_range(in, out, i, count);
     }
 
-    // Process single sample (for systems without AVX)
-    auto process_single(const int8_t* data, float* dst) -> void {
-        dst[0] = static_cast<float>(data[0]);
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const int8_t* in, float* out, std::size_t count) -> void {
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            const auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+            _mm512_storeu_ps(out + i, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(v)));
+        }
+        scalar_range(in, out, i, count);
     }
-
-    auto (converter::*process_func)(const int8_t*, float*) -> void = &converter::process_single;
-    std::size_t samples_per_vector{1};
+#endif
 };
 
-// Specialization: int16_t -> float
+// ---------------------------------------------------------------------------
+// uint8 (offset binary) -> float: XOR the sign bit == subtract 128, then widen
+// ---------------------------------------------------------------------------
+template <>
+struct converter<uint8_t, float> {
+    converter() = default;
+    explicit converter(bool /*swap: single byte*/) {}
+
+    auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
+        run(input, output, count);
+    }
+
+private:
+    static auto scalar_range(const uint8_t* in, float* out, std::size_t i, std::size_t count) -> void {
+        for (; i < count; ++i) {
+            out[i] = static_cast<float>(static_cast<int32_t>(in[i]) - 128);
+        }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const uint8_t* in, float* out, std::size_t count) -> void {
+        scalar_range(in, out, 0, count);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const uint8_t* in, float* out, std::size_t count) -> void {
+        const auto bias = _mm_set1_epi8(static_cast<char>(0x80));
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            auto v = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(in + i));
+            v = _mm_xor_si128(v, bias);
+            _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v)));
+        }
+        scalar_range(in, out, i, count);
+    }
+
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const uint8_t* in, float* out, std::size_t count) -> void {
+        const auto bias = _mm_set1_epi8(static_cast<char>(0x80));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+            v = _mm_xor_si128(v, bias);
+            _mm512_storeu_ps(out + i, _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(v)));
+        }
+        scalar_range(in, out, i, count);
+    }
+#endif
+};
+
+// ---------------------------------------------------------------------------
+// int16 -> float (numeric widening, optional byteswap)
+// ---------------------------------------------------------------------------
 template <>
 struct converter<int16_t, float> {
     bool byteswap{false};
 
-    converter() {
-        init_cpu_features();
-    }
-
-    explicit converter(bool swap) : byteswap(swap) {
-        init_cpu_features();
-    }
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
 
     auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
-        const int16_t* data = reinterpret_cast<const int16_t*>(input);
-        std::size_t processed = 0;
-
-        // Process full vectors using CPU-specific implementation
-        for (; processed + samples_per_vector <= count; processed += samples_per_vector) {
-            (this->*process_func)(data + processed, output + processed);
-        }
-
-        // Process remaining samples scalar
-        for (; processed < count; ++processed) {
-            int16_t value = data[processed];
-            if (byteswap) value = std::byteswap(value);
-            output[processed] = static_cast<float>(value);
-        }
+        run(reinterpret_cast<const int16_t*>(input), output, count, byteswap);
     }
 
 private:
-    auto init_cpu_features() -> void {
-        switch (avx::detect_simd_level()) {
-            case avx::simd_level::avx512:
-                process_func = &converter::process_avx512;
-                samples_per_vector = 16;
-                break;
-            case avx::simd_level::avx2:
-                process_func = &converter::process_avx2;
-                samples_per_vector = 8;
-                break;
-            case avx::simd_level::scalar:
-                process_func = &converter::process_single;
-                samples_per_vector = 1;
-                break;
+    static auto scalar_range(const int16_t* in, float* out, std::size_t i, std::size_t count, bool swap) -> void {
+        for (; i < count; ++i) {
+            auto v = framer_load_unaligned(in + i);
+            if (swap) v = std::byteswap(v);
+            out[i] = static_cast<float>(v);
         }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const int16_t* in, float* out, std::size_t count, bool swap) -> void {
+        scalar_range(in, out, 0, count, swap);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const int16_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(framer_swap_masks::U16));
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+            if (swap) v = _mm_shuffle_epi8(v, mask);
+            _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v)));
+        }
+        scalar_range(in, out, i, count, swap);
     }
 
     [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
-    auto process_avx512(const int16_t* data, float* dst) -> void {
-        auto loaded = _mm256_loadu_epi16(data);
-        if (byteswap) {
-            loaded = _mm256_shuffle_epi8(loaded, avx::swap::shuffle_u16_16);
+    static auto run(const int16_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U16));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            if (swap) v = _mm256_shuffle_epi8(v, mask);
+            _mm512_storeu_ps(out + i, _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(v)));
         }
-        auto data_m512i = _mm512_cvtepi16_epi32(loaded);
-        auto payload_m512 = _mm512_cvtepi32_ps(data_m512i);
-        _mm512_storeu_ps(dst, payload_m512);  // Use unaligned store for safety
+        scalar_range(in, out, i, count, swap);
     }
-
-    [[gnu::target("avx2")]]
-    auto process_avx2(const int16_t* data, float* dst) -> void {
-        auto loaded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data));
-        if (byteswap) {
-            loaded = _mm_shuffle_epi8(loaded, avx::swap::shuffle_u16_8);
-        }
-        auto data_m256i = _mm256_cvtepi16_epi32(loaded);
-        auto payload = _mm256_cvtepi32_ps(data_m256i);
-        _mm256_storeu_ps(dst, payload);  // Use unaligned store for safety
-    }
-
-    // Process single sample (for systems without AVX)
-    auto process_single(const int16_t* data, float* dst) -> void {
-        int16_t value = data[0];
-        if (byteswap) value = std::byteswap(value);
-        dst[0] = static_cast<float>(value);
-    }
-
-    auto (converter::*process_func)(const int16_t*, float*) -> void = &converter::process_single;
-    std::size_t samples_per_vector{1};
+#endif
 };
 
-// Specialization: uint32_t -> float (for complex_cf32 passthrough with byteswap)
+// ---------------------------------------------------------------------------
+// uint16 (offset binary) -> float: optional byteswap, XOR the sign bit, widen
+// ---------------------------------------------------------------------------
+template <>
+struct converter<uint16_t, float> {
+    bool byteswap{false};
+
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
+
+    auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
+        run(reinterpret_cast<const uint16_t*>(input), output, count, byteswap);
+    }
+
+private:
+    static auto scalar_range(const uint16_t* in, float* out, std::size_t i, std::size_t count, bool swap) -> void {
+        for (; i < count; ++i) {
+            auto v = framer_load_unaligned(in + i);
+            if (swap) v = std::byteswap(v);
+            out[i] = static_cast<float>(static_cast<int32_t>(v) - 32768);
+        }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const uint16_t* in, float* out, std::size_t count, bool swap) -> void {
+        scalar_range(in, out, 0, count, swap);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const uint16_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm_loadu_si128(reinterpret_cast<const __m128i*>(framer_swap_masks::U16));
+        const auto bias = _mm_set1_epi16(static_cast<short>(0x8000));
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+            if (swap) v = _mm_shuffle_epi8(v, mask);
+            v = _mm_xor_si128(v, bias);
+            _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(v)));
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const uint16_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U16));
+        const auto bias = _mm256_set1_epi16(static_cast<short>(0x8000));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            if (swap) v = _mm256_shuffle_epi8(v, mask);
+            v = _mm256_xor_si256(v, bias);
+            _mm512_storeu_ps(out + i, _mm512_cvtepi32_ps(_mm512_cvtepi16_epi32(v)));
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+#endif
+};
+
+// ---------------------------------------------------------------------------
+// int32 -> float (numeric widening; values beyond 24 mantissa bits round)
+// ---------------------------------------------------------------------------
+template <>
+struct converter<int32_t, float> {
+    bool byteswap{false};
+
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
+
+    auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
+        run(reinterpret_cast<const int32_t*>(input), output, count, byteswap);
+    }
+
+private:
+    static auto scalar_range(const int32_t* in, float* out, std::size_t i, std::size_t count, bool swap) -> void {
+        for (; i < count; ++i) {
+            auto v = framer_load_unaligned(in + i);
+            if (swap) v = std::byteswap(v);
+            out[i] = static_cast<float>(v);
+        }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const int32_t* in, float* out, std::size_t count, bool swap) -> void {
+        scalar_range(in, out, 0, count, swap);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const int32_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U32));
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            if (swap) v = _mm256_shuffle_epi8(v, mask);
+            _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(v));
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const int32_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm512_loadu_si512(framer_swap_masks::U32);
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm512_loadu_si512(in + i);
+            if (swap) v = _mm512_shuffle_epi8(v, mask);
+            _mm512_storeu_ps(out + i, _mm512_cvtepi32_ps(v));
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+#endif
+};
+
+// ---------------------------------------------------------------------------
+// f32 passthrough (keyed as uint32 so the optional byteswap is integer work)
+// ---------------------------------------------------------------------------
 template <>
 struct converter<uint32_t, float> {
     bool byteswap{false};
 
-    converter() {
-        init_cpu_features();
-    }
-
-    explicit converter(bool swap) : byteswap(swap) {
-        init_cpu_features();
-    }
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
 
     auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
-        const uint32_t* data = reinterpret_cast<const uint32_t*>(input);
-        std::size_t processed = 0;
-
-        // Process full vectors using CPU-specific implementation
-        for (; processed + samples_per_vector <= count; processed += samples_per_vector) {
-            (this->*process_func)(data + processed, output + processed);
+        if (!byteswap) {
+            std::memcpy(output, input, count * sizeof(float));
+            return;
         }
-
-        // Process remaining samples scalar
-        for (; processed < count; ++processed) {
-            uint32_t raw = data[processed];
-            if (byteswap) raw = std::byteswap(raw);
-            output[processed] = std::bit_cast<float>(raw);
-        }
+        run(reinterpret_cast<const uint32_t*>(input), output, count);
     }
 
 private:
-    auto init_cpu_features() -> void {
-        switch (avx::detect_simd_level()) {
-            case avx::simd_level::avx512:
-                process_func = &converter::process_avx512;
-                samples_per_vector = 16;
-                break;
-            case avx::simd_level::avx2:
-                process_func = &converter::process_avx2;
-                samples_per_vector = 8;
-                break;
-            case avx::simd_level::scalar:
-                process_func = &converter::process_single;
-                samples_per_vector = 1;
-                break;
+    // Kernels handle the byteswapping case only; the straight copy short-circuits above.
+    static auto scalar_range(const uint32_t* in, float* out, std::size_t i, std::size_t count) -> void {
+        for (; i < count; ++i) {
+            out[i] = std::bit_cast<float>(std::byteswap(framer_load_unaligned(in + i)));
         }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const uint32_t* in, float* out, std::size_t count) -> void {
+        scalar_range(in, out, 0, count);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const uint32_t* in, float* out, std::size_t count) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U32));
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            v = _mm256_shuffle_epi8(v, mask);
+            _mm256_storeu_ps(out + i, _mm256_castsi256_ps(v));
+        }
+        scalar_range(in, out, i, count);
     }
 
     [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
-    auto process_avx512(const uint32_t* data, float* dst) -> void {
-        auto data_m512i = _mm512_loadu_epi32(data);
-        if (byteswap) {
-            data_m512i = _mm512_shuffle_epi8(data_m512i, avx::swap::shuffle_u32_16);
+    static auto run(const uint32_t* in, float* out, std::size_t count) -> void {
+        const auto mask = _mm512_loadu_si512(framer_swap_masks::U32);
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm512_loadu_si512(in + i);
+            v = _mm512_shuffle_epi8(v, mask);
+            _mm512_storeu_ps(out + i, _mm512_castsi512_ps(v));
         }
-        _mm512_storeu_ps(dst, _mm512_castsi512_ps(data_m512i));  // Use unaligned store for safety
+        scalar_range(in, out, i, count);
     }
-
-    [[gnu::target("avx2")]]
-    auto process_avx2(const uint32_t* data, float* dst) -> void {
-        auto data_m256i = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
-        if (byteswap) {
-            data_m256i = _mm256_shuffle_epi8(data_m256i, avx::swap::shuffle_u32_8);
-        }
-        _mm256_storeu_ps(dst, _mm256_castsi256_ps(data_m256i));  // Use unaligned store for safety
-    }
-
-    // Process single sample (for systems without AVX)
-    auto process_single(const uint32_t* data, float* dst) -> void {
-        uint32_t raw = data[0];
-        if (byteswap) raw = std::byteswap(raw);
-        dst[0] = std::bit_cast<float>(raw);
-    }
-
-    auto (converter::*process_func)(const uint32_t*, float*) -> void = &converter::process_single;
-    std::size_t samples_per_vector{1};
+#endif
 };
 
-// Specialization: int8_t -> int16_t
+// ---------------------------------------------------------------------------
+// int8 -> int16 (numeric widening; single-byte, no byte order)
+// ---------------------------------------------------------------------------
 template <>
 struct converter<int8_t, int16_t> {
-    converter() {
-        init_cpu_features();
-    }
-
-    explicit converter([[maybe_unused]] bool swap) {
-        // int8_t doesn't need byteswap (single byte)
-        init_cpu_features();
-    }
+    converter() = default;
+    explicit converter(bool /*swap: single byte*/) {}
 
     auto operator()(const uint8_t* input, int16_t* output, std::size_t count) -> void {
-        const int8_t* data = reinterpret_cast<const int8_t*>(input);
-        std::size_t processed = 0;
-
-        // Process full vectors using CPU-specific implementation
-        for (; processed + samples_per_vector <= count; processed += samples_per_vector) {
-            (this->*process_func)(data + processed, output + processed);
-        }
-
-        // Process remaining samples scalar
-        for (; processed < count; ++processed) {
-            output[processed] = static_cast<int16_t>(data[processed]);
-        }
+        run(reinterpret_cast<const int8_t*>(input), output, count);
     }
 
 private:
-    auto init_cpu_features() -> void {
-        switch (avx::detect_simd_level()) {
-            case avx::simd_level::avx512:
-                process_func = &converter::process_avx512;
-                samples_per_vector = 32;
-                break;
-            case avx::simd_level::avx2:
-                process_func = &converter::process_avx2;
-                samples_per_vector = 16;
-                break;
-            case avx::simd_level::scalar:
-                process_func = &converter::process_single;
-                samples_per_vector = 1;
-                break;
+    static auto scalar_range(const int8_t* in, int16_t* out, std::size_t i, std::size_t count) -> void {
+        for (; i < count; ++i) {
+            out[i] = static_cast<int16_t>(in[i]);
         }
     }
 
-    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
-    auto process_avx512(const int8_t* data, int16_t* dst) -> void {
-        auto loaded = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
-        auto data_m512i = _mm512_cvtepi8_epi16(loaded);
-        _mm512_storeu_epi16(dst, data_m512i);  // Already uses unaligned store
+    COMPS_FMV_DEFAULT
+    static auto run(const int8_t* in, int16_t* out, std::size_t count) -> void {
+        scalar_range(in, out, 0, count);
     }
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2")]]
-    auto process_avx2(const int8_t* data, int16_t* dst) -> void {
-        auto loaded = _mm_loadu_si128(reinterpret_cast<const __m128i*>(data));
-        auto data_m256i = _mm256_cvtepi8_epi16(loaded);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), data_m256i);  // Already uses unaligned store
+    static auto run(const int8_t* in, int16_t* out, std::size_t count) -> void {
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            const auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), _mm256_cvtepi8_epi16(v));
+        }
+        scalar_range(in, out, i, count);
     }
 
-    // Process single sample (for systems without AVX)
-    auto process_single(const int8_t* data, int16_t* dst) -> void {
-        dst[0] = static_cast<int16_t>(data[0]);
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const int8_t* in, int16_t* out, std::size_t count) -> void {
+        std::size_t i = 0;
+        for (; i + 32 <= count; i += 32) {
+            const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            _mm512_storeu_si512(out + i, _mm512_cvtepi8_epi16(v));
+        }
+        scalar_range(in, out, i, count);
     }
-
-    auto (converter::*process_func)(const int8_t*, int16_t*) -> void = &converter::process_single;
-    std::size_t samples_per_vector{1};
+#endif
 };
 
-// Specialization: int16_t -> int16_t (passthrough with optional byteswap)
+// ---------------------------------------------------------------------------
+// uint8 (offset binary) -> int16: XOR the sign bit == subtract 128, then widen
+// ---------------------------------------------------------------------------
+template <>
+struct converter<uint8_t, int16_t> {
+    converter() = default;
+    explicit converter(bool /*swap: single byte*/) {}
+
+    auto operator()(const uint8_t* input, int16_t* output, std::size_t count) -> void {
+        run(input, output, count);
+    }
+
+private:
+    static auto scalar_range(const uint8_t* in, int16_t* out, std::size_t i, std::size_t count) -> void {
+        for (; i < count; ++i) {
+            out[i] = static_cast<int16_t>(static_cast<int32_t>(in[i]) - 128);
+        }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const uint8_t* in, int16_t* out, std::size_t count) -> void {
+        scalar_range(in, out, 0, count);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const uint8_t* in, int16_t* out, std::size_t count) -> void {
+        const auto bias = _mm_set1_epi8(static_cast<char>(0x80));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in + i));
+            v = _mm_xor_si128(v, bias);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), _mm256_cvtepi8_epi16(v));
+        }
+        scalar_range(in, out, i, count);
+    }
+
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const uint8_t* in, int16_t* out, std::size_t count) -> void {
+        const auto bias = _mm256_set1_epi8(static_cast<char>(0x80));
+        std::size_t i = 0;
+        for (; i + 32 <= count; i += 32) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            v = _mm256_xor_si256(v, bias);
+            _mm512_storeu_si512(out + i, _mm512_cvtepi8_epi16(v));
+        }
+        scalar_range(in, out, i, count);
+    }
+#endif
+};
+
+// ---------------------------------------------------------------------------
+// int16 -> int16 (passthrough; optional byteswap, straight copy short-circuits)
+// ---------------------------------------------------------------------------
 template <>
 struct converter<int16_t, int16_t> {
     bool byteswap{false};
 
-    converter() {
-        init_cpu_features();
-    }
-
-    explicit converter(bool swap) : byteswap(swap) {
-        init_cpu_features();
-    }
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
 
     auto operator()(const uint8_t* input, int16_t* output, std::size_t count) -> void {
-        const int16_t* data = reinterpret_cast<const int16_t*>(input);
-        std::size_t processed = 0;
-
-        // Process full vectors using CPU-specific implementation
-        for (; processed + samples_per_vector <= count; processed += samples_per_vector) {
-            (this->*process_func)(data + processed, output + processed);
+        if (!byteswap) {
+            std::memcpy(output, input, count * sizeof(int16_t));
+            return;
         }
-
-        // Process remaining samples scalar
-        for (; processed < count; ++processed) {
-            int16_t value = data[processed];
-            if (byteswap) value = std::byteswap(value);
-            output[processed] = value;
-        }
+        run(reinterpret_cast<const int16_t*>(input), output, count);
     }
 
 private:
-    auto init_cpu_features() -> void {
-        switch (avx::detect_simd_level()) {
-            case avx::simd_level::avx512:
-                process_func = &converter::process_avx512;
-                samples_per_vector = 32;
-                break;
-            case avx::simd_level::avx2:
-                process_func = &converter::process_avx2;
-                samples_per_vector = 16;
-                break;
-            case avx::simd_level::scalar:
-                process_func = &converter::process_single;
-                samples_per_vector = 1;
-                break;
+    // Kernels handle the byteswapping case only; the straight copy short-circuits above.
+    static auto scalar_range(const int16_t* in, int16_t* out, std::size_t i, std::size_t count) -> void {
+        for (; i < count; ++i) {
+            out[i] = std::byteswap(framer_load_unaligned(in + i));
         }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const int16_t* in, int16_t* out, std::size_t count) -> void {
+        scalar_range(in, out, 0, count);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const int16_t* in, int16_t* out, std::size_t count) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U16));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            v = _mm256_shuffle_epi8(v, mask);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), v);
+        }
+        scalar_range(in, out, i, count);
     }
 
     [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
-    auto process_avx512(const int16_t* data, int16_t* dst) -> void {
-        auto data_m512i = _mm512_loadu_epi16(data);
-        if (byteswap) {
-            data_m512i = _mm512_shuffle_epi8(data_m512i, avx::swap::shuffle_u16_32);
+    static auto run(const int16_t* in, int16_t* out, std::size_t count) -> void {
+        const auto mask = _mm512_loadu_si512(framer_swap_masks::U16);
+        std::size_t i = 0;
+        for (; i + 32 <= count; i += 32) {
+            auto v = _mm512_loadu_si512(in + i);
+            v = _mm512_shuffle_epi8(v, mask);
+            _mm512_storeu_si512(out + i, v);
         }
-        _mm512_storeu_epi16(dst, data_m512i);  // Already uses unaligned store
+        scalar_range(in, out, i, count);
     }
-
-    [[gnu::target("avx2")]]
-    auto process_avx2(const int16_t* data, int16_t* dst) -> void {
-        auto data_m256i = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data));
-        if (byteswap) {
-            data_m256i = _mm256_shuffle_epi8(data_m256i, avx::swap::shuffle_u16_16);
-        }
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst), data_m256i);  // Use unaligned store for safety
-    }
-
-    // Process single sample (for systems without AVX)
-    auto process_single(const int16_t* data, int16_t* dst) -> void {
-        int16_t value = data[0];
-        if (byteswap) value = std::byteswap(value);
-        dst[0] = value;
-    }
-
-    auto (converter::*process_func)(const int16_t*, int16_t*) -> void = &converter::process_single;
-    std::size_t samples_per_vector{1};
+#endif
 };
+
+// ---------------------------------------------------------------------------
+// uint16 (offset binary) -> int16: optional byteswap, then XOR the sign bit
+// ---------------------------------------------------------------------------
+template <>
+struct converter<uint16_t, int16_t> {
+    bool byteswap{false};
+
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
+
+    auto operator()(const uint8_t* input, int16_t* output, std::size_t count) -> void {
+        run(reinterpret_cast<const uint16_t*>(input), output, count, byteswap);
+    }
+
+private:
+    static auto scalar_range(const uint16_t* in, int16_t* out, std::size_t i, std::size_t count, bool swap) -> void {
+        for (; i < count; ++i) {
+            auto v = framer_load_unaligned(in + i);
+            if (swap) v = std::byteswap(v);
+            out[i] = static_cast<int16_t>(v ^ 0x8000u);
+        }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const uint16_t* in, int16_t* out, std::size_t count, bool swap) -> void {
+        scalar_range(in, out, 0, count, swap);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const uint16_t* in, int16_t* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U16));
+        const auto bias = _mm256_set1_epi16(static_cast<short>(0x8000));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            if (swap) v = _mm256_shuffle_epi8(v, mask);
+            v = _mm256_xor_si256(v, bias);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + i), v);
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const uint16_t* in, int16_t* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm512_loadu_si512(framer_swap_masks::U16);
+        const auto bias = _mm512_set1_epi16(static_cast<short>(0x8000));
+        std::size_t i = 0;
+        for (; i + 32 <= count; i += 32) {
+            auto v = _mm512_loadu_si512(in + i);
+            if (swap) v = _mm512_shuffle_epi8(v, mask);
+            v = _mm512_xor_si512(v, bias);
+            _mm512_storeu_si512(out + i, v);
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+#endif
+};
+
+// ============================================================================
+// Real -> complex in-place expansion
+// ============================================================================
+//
+// The framer converts a real input chunk into the BACK half of its complex destination
+// (scalar slots [count, 2*count)), then this kernel rewrites forward as (re, 0) pairs filling
+// [0, 2*count). Forward iteration is aliasing-safe: iteration i reads slot count+i before
+// writing slots 2i and 2i+1, and 2i+1 < count+j for every not-yet-read j > i. The vector
+// versions satisfy the same bound (store end 2i+2w <= count+i+w whenever the loop admits
+// iteration i), and zero-extension IS the interleave: u32->u64 makes (f32, 0.0f) pairs,
+// u16->u32 makes (i16, 0) pairs.
+
+namespace framer_expand_detail {
+
+inline auto scalar_range_f32(float* buf, std::size_t i, std::size_t count) -> void {
+    for (; i < count; ++i) {
+        const auto value = buf[count + i];
+        buf[2 * i] = value;
+        buf[2 * i + 1] = 0.0f;
+    }
+}
+
+COMPS_FMV_DEFAULT
+inline auto expand_f32(float* buf, std::size_t count) -> void {
+    scalar_range_f32(buf, 0, count);
+}
+
+#if COMPS_FMV_ENABLED
+[[gnu::target("avx2")]]
+inline auto expand_f32(float* buf, std::size_t count) -> void {
+    std::size_t i = 0;
+    for (; i + 4 <= count; i += 4) {
+        const auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + count + i));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(buf + 2 * i), _mm256_cvtepu32_epi64(v));
+    }
+    scalar_range_f32(buf, i, count);
+}
+
+[[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+inline auto expand_f32(float* buf, std::size_t count) -> void {
+    std::size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + count + i));
+        _mm512_storeu_si512(buf + 2 * i, _mm512_cvtepu32_epi64(v));
+    }
+    scalar_range_f32(buf, i, count);
+}
+#endif
+
+inline auto scalar_range_i16(int16_t* buf, std::size_t i, std::size_t count) -> void {
+    for (; i < count; ++i) {
+        const auto value = buf[count + i];
+        buf[2 * i] = value;
+        buf[2 * i + 1] = 0;
+    }
+}
+
+COMPS_FMV_DEFAULT
+inline auto expand_i16(int16_t* buf, std::size_t count) -> void {
+    scalar_range_i16(buf, 0, count);
+}
+
+#if COMPS_FMV_ENABLED
+[[gnu::target("avx2")]]
+inline auto expand_i16(int16_t* buf, std::size_t count) -> void {
+    std::size_t i = 0;
+    for (; i + 8 <= count; i += 8) {
+        const auto v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(buf + count + i));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(buf + 2 * i), _mm256_cvtepu16_epi32(v));
+    }
+    scalar_range_i16(buf, i, count);
+}
+
+[[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+inline auto expand_i16(int16_t* buf, std::size_t count) -> void {
+    std::size_t i = 0;
+    for (; i + 16 <= count; i += 16) {
+        const auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(buf + count + i));
+        _mm512_storeu_si512(buf + 2 * i, _mm512_cvtepu16_epi32(v));
+    }
+    scalar_range_i16(buf, i, count);
+}
+#endif
+
+} // namespace framer_expand_detail
+
+/// Expand `count` real scalars staged at buf[count .. 2*count) into (re, 0) complex pairs
+/// filling buf[0 .. 2*count), in place.
+template <typename ScalarT>
+inline auto expand_real_to_complex(ScalarT* buf, std::size_t count) -> void {
+    if constexpr (std::is_same_v<ScalarT, float>) {
+        framer_expand_detail::expand_f32(buf, count);
+    } else {
+        static_assert(std::is_same_v<ScalarT, int16_t>);
+        framer_expand_detail::expand_i16(buf, count);
+    }
+}
 
 // ============================================================================
 // Variant type holding all converters - specialized by output type
@@ -504,22 +730,27 @@ private:
 template <typename OutputT>
 struct converter_variant_traits;
 
-// Float output supports all input types
+// Float output: every supported wire format
 template <>
 struct converter_variant_traits<float> {
     using type = std::variant<
         converter<int8_t, float>,
+        converter<uint8_t, float>,
         converter<int16_t, float>,
+        converter<uint16_t, float>,
+        converter<int32_t, float>,
         converter<uint32_t, float>
     >;
 };
 
-// int16_t output only supports int8_t and int16_t inputs (no cf32->ci16)
+// int16_t output: 8/16-bit integer inputs only (no narrowing paths)
 template <>
 struct converter_variant_traits<int16_t> {
     using type = std::variant<
         converter<int8_t, int16_t>,
-        converter<int16_t, int16_t>
+        converter<uint8_t, int16_t>,
+        converter<int16_t, int16_t>,
+        converter<uint16_t, int16_t>
     >;
 };
 
@@ -570,32 +801,56 @@ struct input_format_support {
 template <typename OutputT>
 inline constexpr std::array<input_format_support<OutputT>, 0> supported_input_formats{};
 
-// Float output: integer inputs are widened numerically (NOT normalized), cf32 passes through.
+// Float output: integer inputs are widened numerically (NOT normalized) with unsigned formats
+// read as offset binary (see the converter block comment); f32 passes through.
 template <>
 inline constexpr auto supported_input_formats<float> = std::to_array<input_format_support<float>>({
     {false, composite::data_type::signed_integer, 8, 1,
      [](bool swap) -> converter_variant<float> { return converter<int8_t, float>(swap); }},
-    {false, composite::data_type::signed_integer, 16, 2,
-     [](bool swap) -> converter_variant<float> { return converter<int16_t, float>(swap); }},
     {true, composite::data_type::signed_integer, 8, 2,
      [](bool swap) -> converter_variant<float> { return converter<int8_t, float>(swap); }},
+    {false, composite::data_type::unsigned_integer, 8, 1,
+     [](bool swap) -> converter_variant<float> { return converter<uint8_t, float>(swap); }},
+    {true, composite::data_type::unsigned_integer, 8, 2,
+     [](bool swap) -> converter_variant<float> { return converter<uint8_t, float>(swap); }},
+    {false, composite::data_type::signed_integer, 16, 2,
+     [](bool swap) -> converter_variant<float> { return converter<int16_t, float>(swap); }},
     {true, composite::data_type::signed_integer, 16, 4,
      [](bool swap) -> converter_variant<float> { return converter<int16_t, float>(swap); }},
+    {false, composite::data_type::unsigned_integer, 16, 2,
+     [](bool swap) -> converter_variant<float> { return converter<uint16_t, float>(swap); }},
+    {true, composite::data_type::unsigned_integer, 16, 4,
+     [](bool swap) -> converter_variant<float> { return converter<uint16_t, float>(swap); }},
+    {false, composite::data_type::signed_integer, 32, 4,
+     [](bool swap) -> converter_variant<float> { return converter<int32_t, float>(swap); }},
+    {true, composite::data_type::signed_integer, 32, 8,
+     [](bool swap) -> converter_variant<float> { return converter<int32_t, float>(swap); }},
+    {false, composite::data_type::floating_point, 32, 4,
+     [](bool swap) -> converter_variant<float> { return converter<uint32_t, float>(swap); }},
     {true, composite::data_type::floating_point, 32, 8,
      [](bool swap) -> converter_variant<float> { return converter<uint32_t, float>(swap); }},
 });
 
-// int16_t output: integer inputs only (no float -> int16 narrowing path).
+// int16_t output: 8/16-bit integer inputs only (no narrowing paths), unsigned read as
+// offset binary.
 template <>
 inline constexpr auto supported_input_formats<int16_t> = std::to_array<input_format_support<int16_t>>({
     {false, composite::data_type::signed_integer, 8, 1,
      [](bool swap) -> converter_variant<int16_t> { return converter<int8_t, int16_t>(swap); }},
-    {false, composite::data_type::signed_integer, 16, 2,
-     [](bool swap) -> converter_variant<int16_t> { return converter<int16_t, int16_t>(swap); }},
     {true, composite::data_type::signed_integer, 8, 2,
      [](bool swap) -> converter_variant<int16_t> { return converter<int8_t, int16_t>(swap); }},
+    {false, composite::data_type::unsigned_integer, 8, 1,
+     [](bool swap) -> converter_variant<int16_t> { return converter<uint8_t, int16_t>(swap); }},
+    {true, composite::data_type::unsigned_integer, 8, 2,
+     [](bool swap) -> converter_variant<int16_t> { return converter<uint8_t, int16_t>(swap); }},
+    {false, composite::data_type::signed_integer, 16, 2,
+     [](bool swap) -> converter_variant<int16_t> { return converter<int16_t, int16_t>(swap); }},
     {true, composite::data_type::signed_integer, 16, 4,
      [](bool swap) -> converter_variant<int16_t> { return converter<int16_t, int16_t>(swap); }},
+    {false, composite::data_type::unsigned_integer, 16, 2,
+     [](bool swap) -> converter_variant<int16_t> { return converter<uint16_t, int16_t>(swap); }},
+    {true, composite::data_type::unsigned_integer, 16, 4,
+     [](bool swap) -> converter_variant<int16_t> { return converter<uint16_t, int16_t>(swap); }},
 });
 
 /// Look up the support entry for @p fmt, or nullptr if the (input format, OutputT)
