@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace struct_props {
 
@@ -52,8 +53,15 @@ struct signal_overrides {
 
     format data_format;
     std::string transport;
+    // Operator-declared metadata annotations, "key=value" per entry, merged into every
+    // published metadata (operator wins over parser-set keys). This is the ingest-boundary
+    // hook for stream facts the wire protocol cannot carry — e.g. a stream that is ALREADY
+    // FFT data from a remote producer: declaring fft_size / fft_window_sum_sq here lets a
+    // downstream psd normalize exactly as it would behind a local fft component.
+    std::vector<std::string> annotations;
     COMPOSITE_FIELDS(signal_overrides,
-                     center_frequency, bandwidth, sample_rate, data_format, transport);
+                     center_frequency, bandwidth, sample_rate, data_format, transport,
+                     annotations);
 };
 
 } // namespace struct_props

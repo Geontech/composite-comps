@@ -19,6 +19,8 @@
 
 #include "vita49.hpp"
 
+#include "simd_fmv.hpp"
+
 #include <bit>
 #include <cstring>
 #include <immintrin.h>
@@ -138,7 +140,10 @@ v49::v49(std::span<const uint8_t> data) : m_data(data) {
             curr_idx += sizeof(uint64_t);
         }
         if (m_cif0->timestamp_adjustment()) {
-            curr_idx += sizeof(uint32_t); // advance past
+            // 64-bit field (VITA 49.2 section 9.7: fractional-time adjustment, two words).
+            // Advancing one word here shifted every later field — including the payload
+            // format — by 4 bytes, corrupting the published stream format.
+            curr_idx += sizeof(uint64_t); // advance past
         }
         if (m_cif0->timestamp_calibration_time()) {
             curr_idx += sizeof(uint32_t); // advance past
@@ -147,7 +152,9 @@ v49::v49(std::span<const uint8_t> data) : m_data(data) {
             curr_idx += sizeof(uint32_t); // advance past
         }
         if (m_cif0->device_id()) {
-            curr_idx += sizeof(uint32_t); // advance past
+            // 64-bit field (VITA 49.2 section 9.10.1: OUI word + device-code word); vrtgen's
+            // DeviceIdentifier packs a uint64. Same 4-byte-shift consequence as above.
+            curr_idx += sizeof(uint64_t); // advance past
         }
         if (m_cif0->state_event_indicators()) {
             curr_idx += sizeof(uint32_t); // advance past
@@ -259,79 +266,70 @@ auto v49::signal_data_format() const -> const std::optional<vrtgen::packing::Pay
     return m_signal_data_format;
 }
 
-// 32-bit word byteswap functions (for PLRV endianness conversion)
+// 32-bit word byteswap (for PLRV endianness conversion). GCC native function
+// multiversioning selects the SIMD tier once at load time (same-name overloads with
+// [[gnu::target]]; see simd_fmv.hpp) — no per-call __builtin_cpu_supports probes.
 
-auto v49::byteswap_u32_words(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
-    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw")) {
-        byteswap_u32_words_avx512(src, dst);
-    } else if (__builtin_cpu_supports("avx2")) {
-        byteswap_u32_words_avx2(src, dst);
-    } else {
-        byteswap_u32_words_scalar(src, dst);
+namespace {
+
+// Scalar tail shared by every tier. memcpy loads/stores: the spans point into packet
+// bytes at arbitrary offsets, and a misaligned uint32_t lvalue access is UB.
+auto byteswap_words_tail(std::span<const uint8_t> src, std::span<uint8_t> dst, std::size_t i) -> void {
+    for (; i + sizeof(uint32_t) <= src.size(); i += sizeof(uint32_t)) {
+        uint32_t w{};
+        std::memcpy(&w, src.data() + i, sizeof(w));
+        w = std::byteswap(w);
+        std::memcpy(dst.data() + i, &w, sizeof(w));
     }
 }
 
-auto v49::byteswap_u32_words_scalar(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
-    auto num_words = src.size() / sizeof(uint32_t);
-    auto src_words = reinterpret_cast<const uint32_t*>(src.data());
-    auto dst_words = reinterpret_cast<uint32_t*>(dst.data());
-
-    for (size_t i = 0; i < num_words; ++i) {
-        dst_words[i] = std::byteswap(src_words[i]);
-    }
+COMPS_FMV_DEFAULT
+auto byteswap_words_impl(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
+    byteswap_words_tail(src, dst, 0);
 }
 
+#if COMPS_FMV_ENABLED
 [[gnu::target("avx2")]]
-auto v49::byteswap_u32_words_avx2(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
-    const size_t stride = 32;
-    // Shuffle mask to reverse bytes within each 32-bit word
-    // For each 4-byte word: [0,1,2,3] -> [3,2,1,0]
-    auto shuffle_mask = _mm256_set_epi8(
+auto byteswap_words_impl(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
+    constexpr std::size_t stride = 32;
+    // Reverse bytes within each 32-bit word: [0,1,2,3] -> [3,2,1,0]
+    const auto shuffle_mask = _mm256_set_epi8(
         12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3,
         12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3
     );
 
-    size_t i = 0;
+    std::size_t i = 0;
     for (; i + stride <= src.size(); i += stride) {
         auto src_256 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src.data() + i));
-        auto dst_256 = _mm256_shuffle_epi8(src_256, shuffle_mask);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst.data() + i), dst_256);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst.data() + i),
+                            _mm256_shuffle_epi8(src_256, shuffle_mask));
     }
-
-    // Handle remaining words with scalar
-    auto remaining_words = (src.size() - i) / sizeof(uint32_t);
-    auto src_words = reinterpret_cast<const uint32_t*>(src.data() + i);
-    auto dst_words = reinterpret_cast<uint32_t*>(dst.data() + i);
-    for (size_t j = 0; j < remaining_words; ++j) {
-        dst_words[j] = std::byteswap(src_words[j]);
-    }
+    byteswap_words_tail(src, dst, i);
 }
 
 [[gnu::target("avx512f,avx512bw")]]
-auto v49::byteswap_u32_words_avx512(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
-    const size_t stride = 64;
-    // Shuffle mask to reverse bytes within each 32-bit word
-    auto shuffle_mask = _mm512_set_epi8(
+auto byteswap_words_impl(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
+    constexpr std::size_t stride = 64;
+    const auto shuffle_mask = _mm512_set_epi8(
         60,61,62,63, 56,57,58,59, 52,53,54,55, 48,49,50,51,
         44,45,46,47, 40,41,42,43, 36,37,38,39, 32,33,34,35,
         28,29,30,31, 24,25,26,27, 20,21,22,23, 16,17,18,19,
         12,13,14,15, 8,9,10,11, 4,5,6,7, 0,1,2,3
     );
 
-    size_t i = 0;
+    std::size_t i = 0;
     for (; i + stride <= src.size(); i += stride) {
         auto src_512 = _mm512_loadu_si512(src.data() + i);
-        auto dst_512 = _mm512_shuffle_epi8(src_512, shuffle_mask);
-        _mm512_storeu_si512(dst.data() + i, dst_512);
+        _mm512_storeu_si512(dst.data() + i, _mm512_shuffle_epi8(src_512, shuffle_mask));
     }
+    byteswap_words_tail(src, dst, i);
+}
+#endif
 
-    // Handle remaining words with scalar
-    auto remaining_words = (src.size() - i) / sizeof(uint32_t);
-    auto src_words = reinterpret_cast<const uint32_t*>(src.data() + i);
-    auto dst_words = reinterpret_cast<uint32_t*>(dst.data() + i);
-    for (size_t j = 0; j < remaining_words; ++j) {
-        dst_words[j] = std::byteswap(src_words[j]);
-    }
+} // anonymous namespace
+
+auto v49::byteswap_u32_words(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void {
+    byteswap_words_impl(src, dst);
 }
 
 } // namespace overlay

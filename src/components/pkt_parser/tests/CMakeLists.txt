@@ -41,3 +41,10 @@ catch_discover_tests(parser_table_tests)
 add_executable(vita49_packet_type_tests vita49_packet_type_tests.cpp)
 target_link_libraries(vita49_packet_type_tests PRIVATE pkt_protocols Catch2::Catch2WithMain)
 catch_discover_tests(vita49_packet_type_tests)
+
+# Correctness/hardening regressions: CIF0 64-bit field widths, empty-payload rejection,
+# one-shot sequence-gap warnings + per-gap flags, SDDS parity handling, and the PLRV
+# pooled-byteswap round-trip (including pool exhaustion).
+add_executable(parser_hardening_tests parser_hardening_tests.cpp)
+target_link_libraries(parser_hardening_tests PRIVATE pkt_protocols Catch2::Catch2WithMain)
+catch_discover_tests(parser_hardening_tests)

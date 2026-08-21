@@ -315,6 +315,64 @@ int main() {
               "annotation still v49.1 after the rebuild");
     }
 
+    // --- 5. SDDS unsigned data modes publish UNSIGNED metadata --------------------
+    // can_parse() accepts DM_8BIT_UNSIGNED/DM_16BIT_UNSIGNED, but the parser used to publish
+    // format.type = signed_integer unconditionally — every downstream sample interpretation
+    // (framer conversion, histogram pivot) off by half full-scale. The type must follow the
+    // packet's data mode, and a mid-stream signed->unsigned flip must republish metadata.
+    {
+        redetect_harness h3;
+        auto make_sdds_unsigned16 = [] {
+            auto v = std::make_shared<std::vector<uint8_t>>(SDDS_PACKET_SIZE, 0);
+            (*v)[0] = 0x06; // data_mode = 6 (DM_16BIT_UNSIGNED)
+            (*v)[1] = 0x10; // bps = 16
+            return composite::immutable_buffer<uint8_t>(v);
+        };
+        check(h3.feed(make_sdds_unsigned16()) == 1, "unsigned-mode SDDS packet is parsed and forwarded");
+        check(h3.last_md != nullptr, "unsigned-mode packet carries metadata");
+        check(h3.last_md && h3.last_md->format.type == composite::data_type::unsigned_integer,
+              "DM_16BIT_UNSIGNED publishes format.type = unsigned_integer");
+
+        // Flip to the signed 16-bit mode: the type change must be detected and republished.
+        auto* unsigned_ptr = h3.last_md.get();
+        check(h3.feed(make_sdds()) == 1, "signed-mode SDDS packet still forwarded after the flip");
+        check(h3.last_md.get() != unsigned_ptr, "signed<->unsigned flip rebuilds the shared metadata");
+        check(h3.last_md && h3.last_md->format.type == composite::data_type::signed_integer,
+              "DM_16BIT_SIGNED publishes format.type = signed_integer");
+    }
+
+    // --- annotation overrides: the ingest-boundary hook for stream facts the wire protocol
+    // cannot carry (e.g. a stream that is already FFT data from a remote producer, where a
+    // downstream psd needs fft_size / fft_window_sum_sq to normalize) ----------------------
+    {
+        redetect_harness h4;
+        h4.uut->set_properties(
+            composite::properties::json{{"signal_overrides",
+                {{"annotations", {"fft_size=1024", "fft_window_sum_sq=7.25", "protocol=remote-fft"}}}}},
+            composite::properties::config_type::INITIALIZE);
+
+        check(h4.feed(make_sdds()) == 1, "packet forwarded with annotation overrides configured");
+        check(h4.last_md != nullptr, "annotated packet carries metadata");
+        if (h4.last_md != nullptr) {
+            const auto& ann = h4.last_md->annotations;
+            const auto size_it = ann.find("fft_size");
+            const auto sq_it = ann.find("fft_window_sum_sq");
+            const auto proto_it = ann.find("protocol");
+            check(size_it != ann.end() && size_it->second.to_string() == "1024",
+                  "declared fft_size annotation rides the published metadata");
+            check(sq_it != ann.end() && sq_it->second.to_string() == "7.25",
+                  "declared fft_window_sum_sq annotation rides the published metadata");
+            check(proto_it != ann.end() && proto_it->second.to_string() == "remote-fft",
+                  "an operator annotation overrides the parser-set key");
+        }
+
+        // Steady state must keep the SAME shared instance (overrides are merged only on
+        // rebuild, not per packet).
+        auto* first = h4.last_md.get();
+        check(h4.feed(make_sdds()) == 1, "second annotated packet forwarded");
+        check(h4.last_md.get() == first, "annotation overrides do not retrigger metadata republish");
+    }
+
     if (failures_seen != 0) {
         std::fprintf(stderr, "pkt_parser re-detect: %d check(s) failed\n", failures_seen);
         return 1;

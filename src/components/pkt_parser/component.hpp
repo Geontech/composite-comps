@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 class pkt_parser : public composite::component {
@@ -57,6 +58,9 @@ private:
 
     // Properties
     struct_props::signal_overrides m_signal_overrides;
+    // "key=value" annotation overrides, resolved once per property change (see config.hpp:
+    // the ingest-boundary hook for stream facts the wire protocol cannot carry).
+    std::vector<std::pair<std::string, std::string>> m_annotation_overrides;
 
     // Members
     std::vector<std::unique_ptr<parsers::protocol_parser>> m_parsers;
@@ -81,6 +85,9 @@ private:
 
     // Observability: malformed/unparseable packets are dropped (not fatal), counted here.
     composite::metrics::counter<uint64_t>* m_packets_dropped{nullptr};
+    // Upstream loss/reorder events (parser sequence tracking); the parsers' log warnings are
+    // one-shot per stream, so this counter carries the ongoing rate.
+    composite::metrics::counter<uint64_t>* m_sequence_gaps{nullptr};
 
     // MUST be last: stops the framework worker before any member above destructs (the base
     // ~component stops too late). See component.hpp auto_stop.

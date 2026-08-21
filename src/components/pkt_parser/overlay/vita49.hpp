@@ -52,11 +52,10 @@ public:
     auto sample_rate() const -> std::optional<double>;
     auto signal_data_format() const -> const std::optional<vrtgen::packing::PayloadFormat>&;
 
-    // Static 32-bit word byteswap utilities (for PLRV endianness conversion)
+    // 32-bit word byteswap (for PLRV endianness conversion). SIMD selection is GCC native
+    // function multiversioning inside the implementation; trailing sub-word bytes (< 4) are
+    // not touched — V49 is word-granular, so they are never part of the decoded packet.
     static auto byteswap_u32_words(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
-    static auto byteswap_u32_words_scalar(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
-    static auto byteswap_u32_words_avx2(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
-    static auto byteswap_u32_words_avx512(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
 
 private:
     std::span<const uint8_t> m_data;

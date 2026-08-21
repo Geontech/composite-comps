@@ -60,7 +60,8 @@ public:
         m_emitted = false;
         m_tsf_warn = false;  // re-arm the sample-count warning for the (likely new) stream
         m_ext_warn = false;  // re-arm the extension-data warning too
-        m_pkt_count = 0;     // sequence restarts; the first packet skips the gap check
+        m_gap_warn = false;  // re-arm the sequence-gap warning
+        m_seq_initialized = false;  // sequence restarts; the first packet skips the gap check
     }
 
 private:
@@ -72,8 +73,10 @@ private:
     std::optional<composite::data_type> m_ov_type;
     std::optional<std::endian> m_ov_endianness;
     uint16_t m_pkt_count{0};
+    bool m_seq_initialized{false};  ///< false until a data packet has seeded m_pkt_count
     bool m_tsf_warn{false};
     bool m_ext_warn{false};  ///< one-shot: an extension-data packet reached parse()
+    bool m_gap_warn{false};  ///< one-shot: a sequence gap was seen (the counter carries the rate)
     bool m_emitted{false};  ///< false until this parser has published metadata since (re)activation
 
 }; // class vita49_parser

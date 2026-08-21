@@ -110,11 +110,25 @@ auto vita49_parser::parse(
     if (packet.is_data()) [[likely]] {
         auto& header = packet.header();
 
-        // Track packet sequence
-        auto expected_count = ((m_pkt_count + 1) % 16);
-        if (header.packet_count() != expected_count && m_pkt_count != 0) {
-            result.warning = std::format("dropped pkt(s) expected={}, got={}", expected_count, header.packet_count());
+        // Track packet sequence. seq_gap feeds the component's counter on EVERY gap; the
+        // human-readable warning is one-shot per (re)activation — sustained upstream loss
+        // otherwise means a std::format + warn line per packet at wire rate. A dedicated
+        // initialized flag (not `m_pkt_count != 0`) keeps the check armed after a packet
+        // whose count is 0 — with the 4-bit counter that is every 16th packet, so the old
+        // sentinel silently suppressed 1 in 16 gap checks.
+        if (m_seq_initialized) [[likely]] {
+            const auto expected_count = ((m_pkt_count + 1) % 16);
+            if (header.packet_count() != expected_count) [[unlikely]] {
+                result.seq_gap = true;
+                if (!m_gap_warn) {
+                    m_gap_warn = true;
+                    result.warning = std::format(
+                        "dropped pkt(s) expected={}, got={} (warning once; see the sequence-gap counter)",
+                        expected_count, header.packet_count());
+                }
+            }
         }
+        m_seq_initialized = true;
         m_pkt_count = header.packet_count();
 
         // Extract timestamps
@@ -126,9 +140,16 @@ auto vita49_parser::parse(
             is_tsf_sc = (header.tsf() == vrtgen::packing::TSF::SAMPLE_COUNT);
         }
 
-        // Extract payload (zero-copy slice)
+        // Extract payload (zero-copy slice). payload_size() returns 0 when the claimed
+        // packet geometry is invalid (word count truncated against the datagram, or covers
+        // no payload at all) — treat that as malformed rather than forwarding an empty
+        // buffer downstream as though it were data. The throw is counted as a drop and
+        // feeds re-detection, so a stream of such packets is visible and self-heals.
         auto payload_start = packet.payload_start();
         auto payload_size = packet.payload_size();
+        if (payload_size == 0) {
+            throw std::out_of_range("vita49_parser: data packet with no payload (invalid or empty geometry)");
+        }
         result.payload = data.slice(payload_start, payload_size);
 
         result.should_send = true;
@@ -197,7 +218,10 @@ auto vita49_parser::parse(
     // rate (result.metadata is only populated when metadata changed on this packet).
     if (is_tsf_sc) {
         const double eff_sample_rate = m_overrides.sample_rate.value_or(current_metadata.sample_rate);
-        if (eff_sample_rate == 0.0) {
+        // !(x > 0) rather than == 0: a negative or NaN rate (a bad override, or garbage
+        // metadata) must not reach the arithmetic below — casting a negative/NaN double to
+        // uint64_t is undefined behavior, not just a wrong timestamp.
+        if (!(eff_sample_rate > 0.0)) {
             if (!m_tsf_warn) {
                 result.warning = "unable to set fractional timestamp: unknown sample rate in SAMPLE_COUNT mode; dropping data until sample rate discovered";
                 m_tsf_warn = true;
@@ -214,6 +238,13 @@ auto vita49_parser::parse(
             result.timestamp.picoseconds = static_cast<uint64_t>(std::min(picoseconds, max_uint64));
         }
     }
+
+    // Enforce composite::timestamp's picoseconds < 1e12 invariant before the timestamp
+    // leaves the parser: the fractional field is untrusted wire data copied raw in
+    // REAL_TIME mode, and the SAMPLE_COUNT conversion above legitimately exceeds one
+    // second whenever the count covers more than a second of samples. Either way the
+    // overflow belongs in `seconds`, not in a value downstream assumes is sub-second.
+    result.timestamp.normalize();
 
     return result;
 }

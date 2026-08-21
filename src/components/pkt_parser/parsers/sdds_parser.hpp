@@ -47,14 +47,19 @@ public:
     auto name() const -> std::string_view override { return "sdds"; }
     auto on_activated() -> void override {
         m_emitted = false;
-        m_pkt_count = 0;  // sequence restarts; the first packet skips the gap check
+        m_seq_initialized = false;  // sequence restarts; the first packet skips the gap check
+        m_gap_warn = false;         // re-arm the one-shot warnings for the (likely new) stream
+        m_anomaly_warn = false;
     }
 
 private:
     struct_props::signal_overrides m_overrides;
     std::optional<std::endian> m_ov_endianness;
     uint16_t m_pkt_count{0};
+    bool m_seq_initialized{false};  ///< false until a packet has seeded m_pkt_count
     bool m_emitted{false};  ///< false until this parser has published metadata since (re)activation
+    bool m_gap_warn{false};      ///< one-shot: a sequence gap was seen (the counter carries the rate)
+    bool m_anomaly_warn{false};  ///< one-shot: inconsistent pp_id/seq parity flags seen
 
 }; // class sdds_parser
 

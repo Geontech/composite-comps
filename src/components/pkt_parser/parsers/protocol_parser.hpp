@@ -49,6 +49,10 @@ public:
                                                         ///< from the previous; the component rebuilds the
                                                         ///< shared instance (and `metadata` is populated)
                                                         ///< ONLY then — steady state leaves it untouched
+        bool seq_gap{false};                            ///< sequence tracking detected upstream loss/reorder
+                                                        ///< at this packet; the component counts these (the
+                                                        ///< human-readable `warning` is one-shot per stream,
+                                                        ///< so the metric carries the rate)
         std::optional<std::string> warning;             ///< Warnings (dropped packets, etc)
     };
 

@@ -22,6 +22,7 @@
 
 #include <composite/core/register.hpp>
 
+#include <cmath>
 #include <source_location>
 
 pkt_parser::pkt_parser(std::string_view id) : composite::component(id) {
@@ -49,6 +50,20 @@ pkt_parser::pkt_parser(std::string_view id) : composite::component(id) {
                 v.transport != "vita49.1") {
                 return false;
             }
+            // A set sample-rate override must be a positive finite number: it feeds
+            // timestamp arithmetic (SAMPLE_COUNT fractional timestamps here, anchor
+            // extrapolation downstream), where a NaN/negative value is UB-adjacent.
+            if (v.sample_rate.has_value() &&
+                !(std::isfinite(*v.sample_rate) && *v.sample_rate > 0.0)) {
+                return false;
+            }
+            // Annotation overrides are "key=value" with a non-empty key.
+            for (const auto& entry : v.annotations) {
+                const auto eq = entry.find('=');
+                if (eq == std::string::npos || eq == 0) {
+                    return false;
+                }
+            }
             return true;
         });
     // Type-prefixed name, matching udp_source./framer. convention: the component_id label
@@ -56,6 +71,9 @@ pkt_parser::pkt_parser(std::string_view id) : composite::component(id) {
     // cross-instance aggregation ("all pkt_parser drops") stays a name match.
     m_packets_dropped = &create_counter(
         "pkt_parser.packets_dropped", "Packets dropped (unknown protocol / malformed / unparseable)");
+    m_sequence_gaps = &create_counter(
+        "pkt_parser.sequence_gaps",
+        "Upstream packet loss/reorder events detected by sequence-number tracking");
 }
 
 auto pkt_parser::property_change_handler(const composite::properties::json& diff) -> void {
@@ -75,6 +93,16 @@ auto pkt_parser::property_change_handler(const composite::properties::json& diff
     for (const auto& entry : parsers::parser_table()) {
         if (m_signal_overrides.transport.empty() || m_signal_overrides.transport == entry.transport) {
             m_parsers.push_back(entry.make(m_signal_overrides));
+        }
+    }
+
+    // Resolve the "key=value" annotation overrides once, off the per-packet path (they are
+    // merged into the published metadata only when it is rebuilt; see process_packet).
+    m_annotation_overrides.clear();
+    for (const auto& entry : m_signal_overrides.annotations) {
+        const auto eq = entry.find('=');
+        if (eq != std::string::npos && eq != 0) {  // validator-enforced; defensive re-check
+            m_annotation_overrides.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
         }
     }
 
@@ -146,7 +174,14 @@ auto pkt_parser::process_packet(input_port_t::queue_type packet) -> void {
         result = m_active_parser->parse(data, m_metadata);
         m_consecutive_parse_failures = 0;  // this packet matches the locked-in protocol
     } catch (const std::exception& e) {
-        drop(std::string{"parse error: "} + e.what());
+        // Counted always; the message is FORMATTED only when it will actually be logged —
+        // a malformed-packet flood otherwise pays a string allocation per packet for a
+        // warning that the one-shot latch already muted.
+        if (m_packets_dropped != nullptr) { m_packets_dropped->inc(); }
+        if (!m_drop_warned) {
+            m_drop_warned = true;
+            logger()->warn("pkt_parser: dropping packet ({} bytes): parse error: {}", data.size(), e.what());
+        }
         // A sustained run of failures means the stream's framing likely changed (e.g. a
         // warm-pool re-steer). Un-lock so the next packet re-runs detection and we self-heal.
         // A single good packet above resets the counter, so isolated corruption never trips it.
@@ -160,7 +195,13 @@ auto pkt_parser::process_packet(input_port_t::queue_type packet) -> void {
         return;
     }
 
-    // Log any warnings from parser
+    // Upstream loss/reorder: the parsers detect it per packet (seq_gap) but warn one-shot;
+    // this counter carries the ongoing rate for operators.
+    if (result.seq_gap) [[unlikely]] {
+        m_sequence_gaps->inc();
+    }
+
+    // Log any warnings from parser (each is one-shot on the parser side; see seq_gap above)
     if (result.warning.has_value()) {
         logger()->warn("{}", result.warning.value());
     }
@@ -171,6 +212,12 @@ auto pkt_parser::process_packet(input_port_t::queue_type packet) -> void {
     // and downstream consumers detect "unchanged" by pointer identity.
     if (result.metadata_changed) {
         m_metadata = std::move(result.metadata);
+        // Operator-declared annotations win over parser-set keys. Applied only on rebuild,
+        // and m_metadata (the parsers' change-detection baseline) keeps them, so they do not
+        // retrigger a republish per packet.
+        for (const auto& [key, value] : m_annotation_overrides) {
+            m_metadata.annotations[key] = value;
+        }
         m_metadata_shared = composite::make_metadata(m_metadata);
         logger()->trace("Updated metadata:\n{}", m_metadata.to_string());
         m_init_metadata = true;
