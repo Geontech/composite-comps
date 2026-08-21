@@ -116,6 +116,15 @@ struct config {
      */
     udp::metrics metrics;
 
+    /**
+     * @brief Optional externally-owned abort eventfd (-1 = none). A receiver whose start_recv()
+     * can wait (packet-size autodiscovery) polls this alongside its own stop machinery, so an
+     * owner that cannot reach stop_recv() while start_recv() is still running — udp_source holds
+     * its receiver mutex across the whole call — can still abort the wait. The receiver never
+     * closes or drains this fd; the owner does both.
+     */
+    int abort_fd{-1};
+
 }; // struct config
 
 /**

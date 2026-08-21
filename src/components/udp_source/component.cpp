@@ -33,8 +33,30 @@
 #include <netinet/in.h>
 #include <net/if.h>
 #include <source_location>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+
+udp_source::abort_event::abort_event() : m_fd(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK)) {
+    if (m_fd < 0) {
+        throw std::runtime_error(std::format("udp_source: failed to create abort event: {}",
+                                             std::string{strerror(errno)}));
+    }
+}
+
+udp_source::abort_event::~abort_event() {
+    ::close(m_fd);
+}
+
+auto udp_source::abort_event::signal() const noexcept -> void {
+    // EAGAIN (counter saturated) still leaves the fd readable, which is all a waiter needs.
+    (void)::eventfd_write(m_fd, 1);
+}
+
+auto udp_source::abort_event::drain() const noexcept -> void {
+    eventfd_t value{};
+    while (::eventfd_read(m_fd, &value) == 0) {}
+}
 
 udp_source::udp_source(std::string_view id) : composite::component(id) {
     add_port(&m_out_port);
@@ -116,7 +138,8 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
         .receive_batch_wait_us = m_recvmmsg.receive_batch_wait_us,
         .output_batch_size = m_recvmmsg.output_batch_size,
         .max_batch_delay_us = m_recvmmsg.max_batch_delay_us,
-        .metrics = create_metrics()
+        .metrics = create_metrics(),
+        .abort_fd = m_abort.fd()
     };
     if (m_overrides.msg_size.has_value()) {
         config.msg_size = m_overrides.msg_size.value();
@@ -159,6 +182,8 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
 }
 
 auto udp_source::on_worker_start() -> void {
+    // Stale abort signals are drained inside start_receiver_locked(), at the last moment
+    // before start_recv() — the one drain point every start path shares.
     {
         std::scoped_lock lock(m_receiver_mtx);
         m_component_running = true;
@@ -197,7 +222,28 @@ auto udp_source::on_worker_start() -> void {
     }
 }
 
+auto udp_source::on_park_requested() -> void {
+    // The framework calls this when a stop or a property writer needs the worker to yield
+    // promptly. Packet-size autodiscovery can be running ON the worker (a reactivation inside
+    // property_change_handler), and it is the one long wait in this component the park cannot
+    // interrupt by itself — so signal it here, exactly what this hook exists for.
+    // NOTE this fires for every park, writes included, so the fd accumulates counts that mean
+    // "yield", not "stop" — which is why start_receiver_locked() drains immediately before
+    // starting a receiver: the write that triggers a reactivation parks THIS hook first, and
+    // its own signal must not abort the discovery it is about to start.
+    m_abort.signal();
+}
+
 auto udp_source::on_worker_stop() -> void {
+    // Signal BEFORE taking m_receiver_mtx, and without touching m_receiver (the fd is
+    // component-owned, so this races nothing). In the current framework this is mostly
+    // belt-and-braces — on_worker_start/on_worker_stop are serialized by the lifecycle lock,
+    // so a stop cannot get here while an on_worker_start discovery holds m_receiver_mtx (that
+    // case is bounded by the discovery deadline; on_park_requested() covers the worker-thread
+    // reactivation case). It is kept unconditional so any future caller of on_worker_stop that
+    // is NOT lifecycle-serialized still cuts the wait short rather than deadlocking on the
+    // mutex below.
+    m_abort.signal();
     {
         std::scoped_lock lock(m_receiver_mtx);
         stop_receiver_locked();
@@ -226,6 +272,16 @@ auto udp_source::start_receiver_locked() -> void {
     if (!m_active || !m_receiver || m_receiver_running) {
         return;
     }
+    // Drain the abort event at the LAST moment before starting: any count that predates a
+    // deliberate start is stale by definition. This matters because on_park_requested() fires
+    // for EVERY park — property writes included — and a reactivation runs inside the very park
+    // whose poke signalled the fd, so without this drain the write's own signal aborted the
+    // discovery it was starting: any runtime write (active, ip_addr, overrides, ...) left the
+    // source with no running receiver behind a single warning. A stop signalled AFTER this
+    // drain still aborts discovery; one signalled before is swallowed, serialized behind
+    // m_receiver_mtx, and bounded by the discovery deadline — the same limitation already
+    // documented for the on_worker_start path.
+    m_abort.drain();
     m_receiver->start_recv(&m_out_port);
     m_receiver_running = true;
 }

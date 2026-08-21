@@ -78,6 +78,8 @@ private:
     std::atomic<uint64_t> m_socket_rmem_peak_bytes{0}; // max since last stats report
     std::atomic<uint64_t> m_kernel_drops{0};
     std::atomic<uint32_t> m_accounted_kernel_drops{0};
+    std::atomic<uint64_t> m_pkts_truncated{0}; ///< datagrams larger than the frame, dropped (MSG_TRUNC)
+    int m_abort_fd{-1}; ///< owner's abort eventfd (config.abort_fd); polled during discovery, never closed/drained here
 
     std::atomic<uint64_t> m_congest_pool_stall{0};
     std::atomic<uint64_t> m_pool_stall_backoff_us{0};

@@ -80,6 +80,7 @@ protected:
     // start()/stop() overrides were bypassed by (a REST disable left the receiver running).
     auto on_worker_start() -> void override;
     auto on_worker_stop() -> void override;
+    auto on_park_requested() -> void override;
 
 private:
     // Ports
@@ -100,6 +101,29 @@ private:
     struct_props::dpdk_config m_dpdk;
 
     // Members
+    // Component-owned abort eventfd, handed to each receiver as config.abort_fd so a long wait
+    // inside start_recv() (packet-size autodiscovery) can be interrupted from OUTSIDE
+    // m_receiver_mtx and without touching m_receiver — a plain fd write races nothing. Signalled
+    // from on_park_requested() (a stop or property writer needing the worker to yield while a
+    // worker-thread reactivation is mid-discovery — the case the park cannot interrupt itself)
+    // and from on_worker_stop() (belt-and-braces; see there). Not reachable in time when the
+    // discovery runs inside on_worker_start(), because stop is serialized behind the lifecycle
+    // lock — that path's bound is the discovery deadline itself.
+    // Declared BEFORE m_auto_stop: members destruct in reverse order, so the fd outlives the
+    // auto_stop-triggered stop() that may still write it.
+    class abort_event {
+    public:
+        abort_event();
+        ~abort_event();
+        abort_event(const abort_event&) = delete;
+        abort_event& operator=(const abort_event&) = delete;
+        [[nodiscard]] auto fd() const noexcept -> int { return m_fd; }
+        auto signal() const noexcept -> void;
+        auto drain() const noexcept -> void;
+    private:
+        int m_fd{-1};
+    };
+    abort_event m_abort;
     std::unique_ptr<udp::interface> m_receiver;
     std::jthread m_stat_thread;
     std::mutex m_receiver_mtx;

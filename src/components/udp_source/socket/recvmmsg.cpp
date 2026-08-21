@@ -20,6 +20,7 @@
 #include <composite/buffers/external_buffer.hpp>
 
 #include "net/utils.hpp"
+#include "discovery_filter.hpp"
 #include "receive_batch_policy.hpp"
 #include "recvmmsg.hpp"
 
@@ -52,7 +53,8 @@ recvmmsg::recvmmsg(const config& config) :
   m_receive_batch_wait(std::chrono::microseconds(config.receive_batch_wait_us)),
   m_output_batch_size(config.output_batch_size),
   m_max_batch_delay(std::chrono::microseconds(config.max_batch_delay_us)),
-  m_recv_buf_explicit(config.recv_buf_size > 0) {
+  m_recv_buf_explicit(config.recv_buf_size > 0),
+  m_abort_fd(config.abort_fd) {
     // Create socket
     m_logger->trace("opening udp socket");
     m_socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -154,49 +156,71 @@ recvmmsg::~recvmmsg() {
 }
 
 auto recvmmsg::start_recv(output_port_t* port) -> void {
+    // Drain any stale stop signal BEFORE anything that polls m_stop_fd — the discovery loop
+    // below watches it, so a leftover count from a previous stop_recv() (or an aborted earlier
+    // start) would abort this start on its first poll. Draining at entry also still covers the
+    // receive thread spawned at the end; a signal arriving in between is a REAL stop racing
+    // this start, and both waiters are supposed to see it.
+    clear_stop_signal();
     // User has not overriden properties (or requesting auto-discovery)
     if (m_frame_size == 0) {
-        // Minimum data packet size in an attempt to exclude context packets. Deliberately signed
-        // to match recvfrom's ssize_t return: as std::size_t it would make the comparison below
-        // unsigned, promoting a -1 error return to SIZE_MAX and passing the size check.
-        static constexpr ssize_t MIN_DATA_PACKET_SIZE = 512;
-
-        // VITA 49 packet type identifiers
-        static constexpr uint8_t V49_CONTEXT_PACKET = 0x40;
-        static constexpr uint8_t V49_EXT_CONTEXT_PACKET = 0x50;
-
         // Discover the size of the incoming packets from the wire
         std::array<uint8_t, 9000> buffer{}; // Use a jumbo frame buffer
-        auto attempts = 0;
-        const auto max_attempts = static_cast<int>(m_autodiscovery_timeout);
-
-        while (attempts < max_attempts) {
-            struct pollfd pfd{
-                .fd = m_socket,
-                .events = POLLIN,
-                .revents = 0
-            };
-            if (auto poll_res = ::poll(&pfd, 1, 1000/*ms*/); poll_res <= 0) {
-                ++attempts;
-                m_logger->debug(
-                    "waiting for data to know how to size internal buffers... (attempt {}/{})",
-                    attempts, max_attempts
-                );
-                continue;
-            }
-            // MSG_DONTWAIT: poll() provides the wait; a poll-ready datagram discarded at receive
-            // time (deferred UDP checksum validation) must EAGAIN back to poll, not block stop()
-            // for the whole discovery window.
-            if (auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), MSG_DONTWAIT, nullptr, nullptr); recvd > MIN_DATA_PACKET_SIZE) {
-                // Skip V49 context packets, wait for data packet
-                auto pkt_type = buffer[0] & 0xF0;
-                if (pkt_type == V49_CONTEXT_PACKET || pkt_type == V49_EXT_CONTEXT_PACKET) {
-                    continue;
-                }
-                m_logger->trace("using discovered msg_size of: {} bytes", recvd);
-                m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
-                m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
+        // The timeout bounds the WHOLE discovery window by wall-clock. It used to count only
+        // poll() timeouts (idle seconds), so steady NON-candidate traffic — VITA context
+        // packets, sub-minimum datagrams, an unrelated chatty protocol on the port — kept
+        // discovery alive forever. This runs inside on_worker_start() holding m_receiver_mtx,
+        // so an unbounded loop here wedged on_worker_stop() (and the whole process's stop)
+        // indefinitely, driven entirely by remote traffic.
+        using disc_clock = std::chrono::steady_clock;
+        const auto deadline = disc_clock::now() + std::chrono::seconds(m_autodiscovery_timeout);
+        auto next_report = disc_clock::now() + std::chrono::seconds(1);
+        while (m_frame_size == 0) {
+            const auto now = disc_clock::now();
+            if (now >= deadline) {
                 break;
+            }
+            // Watch two abort channels alongside the socket. m_stop_fd covers a DIRECT user of
+            // this class calling stop_recv() from another thread — udp_source cannot reach that
+            // during discovery (it holds m_receiver_mtx across this whole call and its stop path
+            // needs the mutex). m_abort_fd is the component's lock-free channel: its
+            // on_park_requested()/on_worker_stop() hooks signal it, which cuts short a discovery
+            // running on the worker thread (a reactivation). When the discovery runs inside
+            // on_worker_start() a component stop is serialized behind the lifecycle lock and no
+            // signal can arrive in time — that path, and a missing abort_fd, are bounded by the
+            // deadline above.
+            std::array<struct pollfd, 3> pfds{{
+                {.fd = m_socket, .events = POLLIN, .revents = 0},
+                {.fd = m_stop_fd, .events = POLLIN, .revents = 0},
+                {.fd = m_abort_fd, .events = POLLIN, .revents = 0}, // fd -1: kernel ignores the entry
+            }};
+            const auto remaining_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            const int wait_ms = static_cast<int>(std::clamp<long long>(remaining_ms, 1, 1000));
+            const auto poll_res = ::poll(pfds.data(), pfds.size(), wait_ms);
+            if (poll_res > 0 && ((pfds[1].revents | pfds[2].revents) & POLLIN) != 0) {
+                // An abort is not a discovery failure; do not misreport it as "no valid data".
+                throw std::runtime_error("packet-size autodiscovery aborted: stop or reconfiguration requested");
+            }
+            if (poll_res > 0 && (pfds[0].revents & POLLIN) != 0) {
+                // MSG_DONTWAIT: poll() provides the wait; a poll-ready datagram discarded at
+                // receive time (deferred UDP checksum validation) must EAGAIN back to poll, not
+                // block stop() for the whole discovery window.
+                auto recvd = ::recvfrom(m_socket, buffer.data(), buffer.size(), MSG_DONTWAIT, nullptr, nullptr);
+                // Signalling and undersized datagrams are not pool-sizing evidence; see
+                // discovery_filter for why SDDS is exempt from the V49 packet-type test.
+                if (discovery_filter::is_sizing_candidate(recvd, buffer[0])) {
+                    m_logger->trace("using discovered msg_size of: {} bytes", recvd);
+                    m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
+                    m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
+                    break;
+                }
+            }
+            if (disc_clock::now() >= next_report) {
+                m_logger->debug("waiting for a sizeable data packet to size internal buffers... ({}s left)",
+                                std::chrono::duration_cast<std::chrono::seconds>(deadline - disc_clock::now()).count());
+                // Anchor to now, not += 1s: an overrunning iteration must not emit catch-up lines.
+                next_report = disc_clock::now() + std::chrono::seconds(1);
             }
         }
 
@@ -239,7 +263,8 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
                     "max_delay_us={}", m_receive_batch_wait.count(), m_output_batch_size,
                     m_max_batch_delay.count());
     m_out_port = port;
-    clear_stop_signal();
+    // Stale signals were drained at the TOP of this function (they must not abort discovery
+    // either); draining again here would eat a genuine stop_recv() that raced this start.
     m_recv_thread = std::jthread(&recvmmsg::receive, this);
     if (auto ret = pthread_setname_np(m_recv_thread.native_handle(), "recvmmsg"); ret != 0) {
         m_logger->warn("failed to set thread name: {}", std::string{strerror(ret)});
@@ -292,6 +317,7 @@ auto recvmmsg::get_stats() -> std::map<std::string, std::string> {
     stats["total_receive_syscalls"] = std::to_string(
         m_recv_syscalls.load() + m_wait_syscalls.load());
     stats["full_receive_vectors"] = std::to_string(m_full_receive_vectors.load());
+    stats["packets_truncated"] = std::to_string(m_pkts_truncated.load());
     stats["receive_batch_wait_us"] = std::to_string(m_receive_batch_wait.count());
     stats["output_batch_size"] = std::to_string(m_output_batch_size);
     stats["max_batch_delay_us"] = std::to_string(m_max_batch_delay.count());
@@ -631,6 +657,20 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                 m_logger->critical("recvmmsg buffer invariant violated for received slot {}", i);
                 flush_output(true);
                 return;
+            }
+            // A datagram larger than the frame is TRUNCATED by the kernel to the iovec;
+            // msg_len is then the truncated length, and forwarding it would hand downstream a
+            // silently corrupted packet (typical cause: autodiscovery sized the pool from a
+            // smaller packet, or overrides.msg_size is too small). Reject and count it instead.
+            if ((msgs[i].msg_hdr.msg_flags & MSG_TRUNC) != 0) {
+                if (m_pkts_truncated.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    m_logger->warn("received a datagram larger than the {}-byte receive frame; it was truncated "
+                                   "by the kernel and DROPPED (counted in packets_truncated). Set overrides.msg_size "
+                                   "to the real maximum datagram size.",
+                                   m_frame_size);
+                }
+                m_metrics.packets_dropped.inc();
+                continue; // buffers[i] is released by the reset loop below
             }
             const auto len = msgs[i].msg_len;
             batch_bytes += len;

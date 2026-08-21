@@ -34,8 +34,41 @@ target_compile_features(receive_batch_policy_tests PRIVATE cxx_std_23)
 
 catch_discover_tests(receive_batch_policy_tests TEST_PREFIX "receive_batch_policy: ")
 
+# Deterministic unit tests for the frame-size autodiscovery classifier.
+#
+# Hermetic for the same reason as above: discovery_filter.hpp is a self-contained predicate, so
+# the test needs neither the component nor a socket. comps_baseline compiles it at ship flags.
+add_executable(discovery_filter_tests discovery_filter_tests.cpp)
+target_link_libraries(discovery_filter_tests
+    PRIVATE
+        Catch2::Catch2WithMain
+        comps_baseline
+)
+target_include_directories(discovery_filter_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_compile_features(discovery_filter_tests PRIVATE cxx_std_23)
+
+catch_discover_tests(discovery_filter_tests TEST_PREFIX "discovery_filter: ")
+
+# Loopback integration test for the runtime-reactivation path: an `active=true` RUNTIME write
+# must leave the source RECEIVING when autodiscovery is in play. Links the real component (and
+# so the socket backends): the regression it pins lives in the interplay of the park hook, the
+# abort eventfd, and start_receiver_locked(), which no hermetic unit can exercise.
+add_executable(udp_source_reactivation_tests reactivation_test.cpp)
+target_link_libraries(udp_source_reactivation_tests
+    PRIVATE
+        udp_source_objs
+        Catch2::Catch2WithMain
+        Threads::Threads
+)
+target_include_directories(udp_source_reactivation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_compile_features(udp_source_reactivation_tests PRIVATE cxx_std_23)
+
+catch_discover_tests(udp_source_reactivation_tests TEST_PREFIX "udp_source: ")
+
 install(TARGETS
     receive_batch_policy_tests
+    discovery_filter_tests
+    udp_source_reactivation_tests
     RUNTIME DESTINATION bin/tests
     COMPONENT Tests
     OPTIONAL
