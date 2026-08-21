@@ -12,7 +12,7 @@
 # interface is compiled against.
 #
 # Built and cached by the ci:toolchain job; not a release artifact and never pushed to Docker Hub.
-ARG COMPOSITE_DEVEL_IMAGE=geontech/composite:0.5.0-rc.2-devel
+ARG COMPOSITE_DEVEL_IMAGE=geontech/composite:0.5.0-devel
 FROM ${COMPOSITE_DEVEL_IMAGE}
 
 # The SDK image runs as 10001; a CI job needs to write to its build directory and install nothing

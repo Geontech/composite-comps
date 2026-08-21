@@ -24,20 +24,27 @@ stages:
 variables:
   # The framework release the fleet is qualified against, and the images it is built ON and runs ON.
   #
-  # rc.2 changed what those images contain: OpenTelemetry and OpenSSL are now compiled IN
-  # (`composite-cli --features` reports "opentelemetry, openssl"), and there is a second family with
-  # DPDK. rc.1 shipped none of that. The four published tags are:
+  # 0.5.0 GA. OpenTelemetry and OpenSSL are compiled IN (`composite-cli --features` reports
+  # "opentelemetry, openssl"; the DPDK family adds "dpdk"). The four published tags are:
   #
-  #   0.5.0-rc.2              runtime, otel + openssl              68 MB
-  #   0.5.0-rc.2-devel        SDK, same features                  230 MB
-  #   0.5.0-rc.2-dpdk         runtime + dpdk                       75 MB
-  #   0.5.0-rc.2-dpdk-devel   SDK + dpdk                          251 MB
+  #   0.5.0                   runtime, otel + openssl              72 MB
+  #   0.5.0-devel             SDK, same features                  241 MB
+  #   0.5.0-dpdk              runtime + dpdk                       78 MB
+  #   0.5.0-dpdk-devel        SDK + dpdk                          264 MB
+  #
+  # Moving off the rc.2 images picks up two framework fixes the fleet depends on:
+  # pipeline_component::stop_pool() now publishes its stop flag under the pool mutex (an unlocked
+  # store could land between a pool worker's predicate check and its block -- a lost wakeup on the
+  # one unbounded wait, wedging the joining thread; fft/psd/framer all run that pool), and a
+  # stacked input-port pause no longer clobbers the saved depth, which could otherwise "restore"
+  # depth 0 and leave a component reporting running while silently discarding every packet.
   #
   # Keep COMPOSITE_REF and COMPOSITE_IMAGE_TAG in step: the git tag v$COMPOSITE_REF is the commit
-  # those images were built from (v0.5.0-rc.2 == ecb31ea9 == the sha-ecb31ea9 image family).
+  # those images were built from (v0.5.0 == b91fad56, per the images'
+  # org.opencontainers.image.revision label).
   COMPOSITE_VERSION: "0.5.0"
-  COMPOSITE_REF: "v0.5.0-rc.2"
-  COMPOSITE_IMAGE_TAG: "0.5.0-rc.2"
+  COMPOSITE_REF: "v0.5.0"
+  COMPOSITE_IMAGE_TAG: "0.5.0"
   COMPOSITE_REPO: "https://github.com/geontech/composite.git"
   COMPOSITE_DEVEL_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}-devel"
   COMPOSITE_RUNTIME_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}"
@@ -49,7 +56,7 @@ variables:
   # image it derives from and a hash of docker/Dockerfile.ci-toolchain, so a change to either is a
   # different tag -- ci:toolchain fails loudly rather than leaving the pipeline on a stale toolchain
   # while the images move on.
-  TOOLCHAIN_TAG: "composite-${COMPOSITE_IMAGE_TAG}-cfa1c3b44f41"
+  TOOLCHAIN_TAG: "composite-${COMPOSITE_IMAGE_TAG}-b885d61a4e98"
   CI_TOOLCHAIN_IMAGE: "$CI_REGISTRY_IMAGE/ci-toolchain:$TOOLCHAIN_TAG"
   CI_TOOLCHAIN_DPDK_IMAGE: "$CI_REGISTRY_IMAGE/ci-toolchain:$TOOLCHAIN_TAG-dpdk"
   # Where build:container stages the images publish:dockerhub promotes.
