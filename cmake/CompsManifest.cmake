@@ -12,6 +12,14 @@
 # that failed to build, and it cannot drift from what shipped.
 #
 # Must be included AFTER add_subdirectory(src).
+#
+# On `project` vs `composite_comps`. In THIS project's own manifest the two carry the same
+# version and the pair looks redundant. It is not: `project` is whoever ran the build, and
+# `composite_comps` is the composite-comps release the build was made against. They diverge in
+# an OVERLAY build, where `project` is the overlay (program-comps 1.0.0, say) while
+# `composite_comps` still reports 0.1.0 -- which is what lets a consumer tell that an overlay's
+# replaced module was built against the same fleet as the modules it ships beside. The inner
+# `name` was dropped when this was renamed from `fleet`: the key already states it.
 
 # Deferred into a function on purpose.
 #

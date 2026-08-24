@@ -85,7 +85,7 @@ set(COMPS_COMPOSITE_VERSION "0.5.0" CACHE STRING "composite framework version to
 # use it -- they would hand the consumer its own include/ and lose simd_fmv.hpp / windows.hpp.
 set(COMPS_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}" CACHE INTERNAL "composite-comps source root")
 set(COMPS_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}" CACHE INTERNAL "composite-comps binary root")
-set(COMPS_FLEET_VERSION "${PROJECT_VERSION}" CACHE INTERNAL "composite-comps version")
+set(COMPS_VERSION "${PROJECT_VERSION}" CACHE INTERNAL "composite-comps version")
 
 list(APPEND CMAKE_MODULE_PATH ${COMPS_SOURCE_DIR}/cmake)
 include(CompsFlags)          # the single authority for compile/link policy

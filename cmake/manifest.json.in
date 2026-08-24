@@ -4,9 +4,8 @@
     "version": "@PROJECT_VERSION@",
     "revision": "@COMPS_GIT_SHA@"
   },
-  "fleet": {
-    "name": "composite-comps",
-    "version": "@COMPS_FLEET_VERSION@"
+  "composite_comps": {
+    "version": "@COMPS_VERSION@"
   },
   "framework": {
     "name": "composite",
