@@ -53,13 +53,25 @@ class counting_sink : public composite::component {
 public:
     explicit counting_sink(std::string_view id) : composite::component(id) { add_port(&m_in); }
     auto process() -> composite::retval override {
-        while (m_in.try_get()) {
+        while (auto pkt = m_in.try_get()) {
+            {
+                std::scoped_lock lk{m_md_mtx};
+                m_last_md = std::get<2>(*pkt);
+            }
             m_packets.fetch_add(1, std::memory_order_acq_rel);
         }
         return composite::retval::NOOP;
     }
+    auto last_session() -> std::string {
+        std::scoped_lock lk{m_md_mtx};
+        if (m_last_md == nullptr) { return {}; }
+        const auto it = m_last_md->annotations.find("stream_session");
+        return it == m_last_md->annotations.end() ? std::string{} : it->second.to_string();
+    }
     composite::input_port<composite::immutable_buffer<uint8_t>> m_in{"in", 1024};
     std::atomic<int> m_packets{0};
+    std::mutex m_md_mtx;
+    composite::metadata_ptr m_last_md;
     composite::component::auto_stop m_auto_stop{*this};
 };
 
@@ -155,13 +167,147 @@ TEST_CASE("runtime reactivation with autodiscovery still receives", "[udp_source
     src->set_properties(json{{"active", true}}, config_type::RUNTIME);
 
     CHECK(wait_for_packets(*sink, 10, 5000ms));
+    // Every packet carries the IN-BAND stream-session annotation...
+    const auto first_session = sink->last_session();
+    CHECK(!first_session.empty());
 
     // And the reactivation is repeatable: deactivate (drops the receiver), reactivate again.
     src->set_properties(json{{"active", false}}, config_type::RUNTIME);
     sink->m_packets.store(0);
     src->set_properties(json{{"active", true}}, config_type::RUNTIME);
     CHECK(wait_for_packets(*sink, 10, 5000ms));
+    // ...and the rebuilt receiver is a NEW session (downstream resets its stream state).
+    CHECK(sink->last_session() != first_session);
+    CHECK(!sink->last_session().empty());
 
     src->stop();
     sink->stop();
+}
+
+TEST_CASE("frame pool grows after a protocol flip to larger datagrams", "[udp_source]") {
+    using composite::properties::config_type;
+    using json = composite::properties::json;
+
+    // Port probing as above.
+    std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> dist(20000, 59999);
+    uint16_t port = 0;
+    for (int attempt = 0; attempt < 16 && port == 0; ++attempt) {
+        const auto candidate = static_cast<uint16_t>(dist(rng));
+        const int probe = ::socket(AF_INET, SOCK_DGRAM, 0);
+        REQUIRE(probe >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(candidate);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(probe, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) {
+            port = candidate;
+        }
+        ::close(probe);
+    }
+    REQUIRE(port != 0);
+
+    auto src = std::make_shared<udp_source>("udp_growth_uut");
+    auto sink = std::make_shared<counting_sink>("udp_growth_sink");
+    REQUIRE(src->connect("data_out", sink, "in"));
+    src->set_properties(json{{"ip_addr", "127.0.0.1"},
+                             {"port", port},
+                             {"autodiscovery_timeout", 3},
+                             {"active", true}},
+                        config_type::INITIALIZE);
+    sink->start();
+
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    REQUIRE(fd >= 0);
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(port);
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    auto blast = [&](std::size_t bytes, int count) {
+        std::vector<uint8_t> payload(bytes, 0);  // first byte 0x00: passes the sizing filter
+        for (int i = 0; i < count; ++i) {
+            (void)::sendto(fd, payload.data(), payload.size(), 0,
+                           reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            std::this_thread::sleep_for(2ms);
+        }
+    };
+
+    // Phase 1: SDDS-sized traffic, flowing BEFORE the source starts so autodiscovery (which
+    // runs during activation) has packets to size from: 1080-byte datagrams -> 2048-byte
+    // frames after bit_ceil.
+    std::jthread phase1([&](std::stop_token token) {
+        while (!token.stop_requested()) { blast(1080, 1); }
+    });
+    src->start();
+    REQUIRE(wait_for_packets(*sink, 10, 5000ms));
+    phase1.request_stop();
+    phase1 = {};
+
+    // Phase 2: the pipeline is re-steered to a protocol with LARGER datagrams (a multi-KB
+    // V49 stream). Pre-fix, every one of these arrived MSG_TRUNC and was dropped forever —
+    // the pipeline died at the socket. Post-fix, truncation triggers pool growth (doubling,
+    // 2048 -> 4096 -> 8192) and reception resumes.
+    sink->m_packets.store(0);
+    std::jthread phase2([&](std::stop_token token) {
+        while (!token.stop_requested()) { blast(6000, 1); }
+    });
+    CHECK(wait_for_packets(*sink, 10, 5000ms));
+    phase2.request_stop();
+    phase2 = {};
+
+    ::close(fd);
+    src->stop();
+    sink->stop();
+}
+
+TEST_CASE("a recreated source under the same id starts a new stream session", "[udp_source]") {
+    using composite::properties::config_type;
+    using json = composite::properties::json;
+
+    std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<int> dist(20000, 59999);
+    uint16_t port = 0;
+    for (int attempt = 0; attempt < 16 && port == 0; ++attempt) {
+        const auto candidate = static_cast<uint16_t>(dist(rng));
+        const int probe = ::socket(AF_INET, SOCK_DGRAM, 0);
+        REQUIRE(probe >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(candidate);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(probe, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) == 0) {
+            port = candidate;
+        }
+        ::close(probe);
+    }
+    REQUIRE(port != 0);
+
+    // Component ids are unique among LIVE components only: a destroyed-and-recreated source
+    // with the SAME id must still mint a fresh session (process-wide counter), or a parser
+    // that outlived the swap would never reset.
+    auto run_once = [&](std::string* session_out) {
+        auto src = std::make_shared<udp_source>("udp_recreate_uut");
+        auto sink = std::make_shared<counting_sink>("udp_recreate_sink_" + std::to_string(rand()));
+        REQUIRE(src->connect("data_out", sink, "in"));
+        src->set_properties(json{{"ip_addr", "127.0.0.1"},
+                                 {"port", port},
+                                 {"autodiscovery_timeout", 3},
+                                 {"active", true}},
+                            config_type::INITIALIZE);
+        sink->start();
+        loopback_sender sender{port};
+        src->start();
+        REQUIRE(wait_for_packets(*sink, 5, 5000ms));
+        *session_out = sink->last_session();
+        src->stop();
+        sink->stop();
+    };
+
+    std::string first;
+    std::string second;
+    run_once(&first);
+    run_once(&second);   // same component id, new lifetime
+    CHECK(!first.empty());
+    CHECK(!second.empty());
+    CHECK(first != second);
 }

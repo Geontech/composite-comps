@@ -32,6 +32,11 @@ namespace struct_props {
 
 struct overrides {
     std::optional<uint32_t> msg_size;
+    // PACKET_MMAP only: Unix-socket path to receive a pre-opened AF_PACKET fd over
+    // SCM_RIGHTS from a privileged helper, so THIS process needs no CAP_NET_RAW (the
+    // socket() call is the backend's only privileged operation). Empty = open the socket
+    // directly (requires CAP_NET_RAW here).
+    std::string packet_fd_path;
 }; // struct overrides
 
 struct dpdk_config {
@@ -55,7 +60,7 @@ struct recvmmsg_config {
 
 } // namespace struct_props
 
-COMPOSITE_STRUCT(struct_props::overrides, msg_size);
+COMPOSITE_STRUCT(struct_props::overrides, msg_size, packet_fd_path);
 COMPOSITE_STRUCT(struct_props::dpdk_config,
     port_id, queue_id, mempool_name, burst_size, igmp_respond_to_queries, src_ip);
 COMPOSITE_STRUCT(struct_props::recvmmsg_config,

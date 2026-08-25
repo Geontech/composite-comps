@@ -73,3 +73,28 @@ install(TARGETS
     COMPONENT Tests
     OPTIONAL
 )
+
+# Hermetic tests for the PACKET_MMAP pure helpers (ring geometry, untrusted-frame
+# classification incl. fragments, kernel filter program) and the SCM_RIGHTS fd handoff —
+# everything the AF_PACKET privilege requirement would otherwise leave untested in CI.
+add_executable(packet_mmap_frame_tests packet_mmap_frame_tests.cpp ../net/utils.cpp)
+target_link_libraries(packet_mmap_frame_tests
+    PRIVATE
+        Catch2::Catch2WithMain
+        comps_baseline
+        composite::composite
+)
+catch_discover_tests(packet_mmap_frame_tests)
+
+# Hermetic tests for the Ethernet/VLAN walk (ether_frame.hpp) and its composition with
+# classify_frame — the complete untrusted-bytes parse of the DPDK data path, testable (and
+# tested) even though the DPDK backend itself cannot be compiled or run in CI.
+add_executable(ether_frame_tests ether_frame_tests.cpp)
+target_link_libraries(ether_frame_tests
+    PRIVATE
+        Catch2::Catch2WithMain
+        comps_baseline
+)
+target_include_directories(ether_frame_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_compile_features(ether_frame_tests PRIVATE cxx_std_23)
+catch_discover_tests(ether_frame_tests)

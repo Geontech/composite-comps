@@ -108,8 +108,15 @@ bool manager::leave_group(std::string_view group_ip) {
 
 // Call from RX loop. Returns true if packet was IGMP and is consumed (freed).
 bool manager::handle_rx(rte_mbuf* m) {
+    // The header walk below reads up to pkt_len bytes from the FIRST segment's data pointer,
+    // which only holds them when the mbuf is unchained. Real IGMP control packets are tens of
+    // bytes and never chain; a chained packet is data-path traffic — decline it here and let
+    // the receive loop's own chained-mbuf handling drop it.
+    if (m->nb_segs > 1) {
+        return false;
+    }
     uint8_t* data = rte_pktmbuf_mtod(m, uint8_t*);
-    size_t len = rte_pktmbuf_pkt_len(m); // assume small IGMP is contiguous
+    size_t len = rte_pktmbuf_pkt_len(m);
 
     if (len < sizeof(rte_ether_hdr)) {
         return false;

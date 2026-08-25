@@ -47,7 +47,7 @@
 namespace udp {
 
 recvmmsg::recvmmsg(const config& config) :
-  interface(config.logger, config.metrics),
+  interface(config.logger, config.metrics, config.session_metadata),
   m_frame_count(config.frame_count),
   m_autodiscovery_timeout(config.autodiscovery_timeout),
   m_receive_batch_wait(std::chrono::microseconds(config.receive_batch_wait_us)),
@@ -212,6 +212,7 @@ auto recvmmsg::start_recv(output_port_t* port) -> void {
                 if (discovery_filter::is_sizing_candidate(recvd, buffer[0])) {
                     m_logger->trace("using discovered msg_size of: {} bytes", recvd);
                     m_frame_size = std::bit_ceil(static_cast<std::size_t>(recvd));
+                    m_frame_size_discovered = true;  // eligible for truncation-driven growth
                     m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
                     break;
                 }
@@ -395,7 +396,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
             && output_buffers.size() < m_output_batch_size) {
             m_partial_batch_flushes.fetch_add(1, std::memory_order_relaxed);
         }
-        m_out_port->send_batch(output_buffers, {});
+        m_out_port->send_batch(output_buffers, {}, m_session_metadata);
         output_buffers.clear();
         policy.note_batch_flushed();
         m_pending_output_packets.store(0, std::memory_order_relaxed);
@@ -448,6 +449,8 @@ auto recvmmsg::receive(std::stop_token token) -> void {
     };
 
     if (!acquire_buffers(0, m_batch_size)) { return; }
+    constexpr std::size_t MAX_UDP_DATAGRAM = 65535;
+    bool grow_pool = false;
     uint64_t recv_syscalls = 0;
     uint64_t wait_syscalls = 0;
     std::optional<clock::time_point> last_receive_error_log;
@@ -670,6 +673,7 @@ auto recvmmsg::receive(std::stop_token token) -> void {
                                    m_frame_size);
                 }
                 m_metrics.packets_dropped.inc();
+                grow_pool = true;  // an AUTODISCOVERED size is stale evidence; regrow below
                 continue; // buffers[i] is released by the reset loop below
             }
             const auto len = msgs[i].msg_len;
@@ -696,6 +700,32 @@ auto recvmmsg::receive(std::stop_token token) -> void {
         for (std::size_t i = 0; i < msgs_recvd; ++i) {
             buffers[i].reset();
         }
+        // Truncation-driven pool growth, for AUTODISCOVERED sizes only (an explicit
+        // overrides.msg_size is the operator's stated maximum and is respected). The pool was
+        // sized from the FIRST stream on the wire; when the pipeline is re-steered to a
+        // protocol with larger datagrams (e.g. 1080-byte SDDS -> multi-KB VITA 49), every new
+        // packet arrived MSG_TRUNC and was dropped forever — the pipeline died at the socket.
+        // Double the frame (capped at the 65535-byte UDP maximum; MSG_TRUNC does not report
+        // the true size, so growth converges in at most ~6 steps) and rebuild the pool;
+        // buffers already forwarded downstream keep the old pool alive via shared ownership.
+        // Every slot must be re-acquired: unconsumed slots still point at old, undersized slabs.
+        if (grow_pool && m_frame_size_discovered && m_frame_size < MAX_UDP_DATAGRAM) {
+            grow_pool = false;
+            for (std::size_t i = 0; i < m_batch_size; ++i) {
+                buffers[i].reset();
+            }
+            m_frame_size = std::min<std::size_t>(m_frame_size * 2, MAX_UDP_DATAGRAM);
+            m_logger->warn("growing the receive frame to {} bytes after kernel truncation "
+                           "(autodiscovered size was too small for the current stream)",
+                           m_frame_size);
+            m_pool = composite::slab_pool<uint8_t>::create(m_frame_size, m_frame_count);
+            if (!acquire_buffers(0, m_batch_size)) {
+                flush_output(true);
+                return;
+            }
+            continue;
+        }
+        grow_pool = false;
         if (!acquire_buffers(0, msgs_recvd)) {
             flush_output(true);
             return;

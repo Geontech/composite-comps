@@ -36,4 +36,11 @@ auto get_socket_recv_buffer(int fd) -> std::size_t;
 auto set_socket_reuse_addr(int fd, bool enable=true) -> void;
 auto get_interface_index(std::string_view interface) -> std::size_t;
 
+/**
+ * Receive one file descriptor over a Unix domain socket at @p path (SCM_RIGHTS), with a
+ * bounded wait. Used to adopt a pre-opened AF_PACKET socket from a privileged helper so the
+ * receiving process needs no capabilities of its own. Throws on timeout or protocol error.
+ */
+auto receive_fd(const std::string& path, int timeout_ms) -> int;
+
 } // namespace net

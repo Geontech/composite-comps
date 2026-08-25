@@ -18,6 +18,9 @@
  */
 
 #include "component.hpp"
+#include "net/utils.hpp"
+
+#include <random>
 #include "socket/packet_mmap.hpp"
 #include "socket/recvmmsg.hpp"
 #include "socket/dpdk.hpp"
@@ -126,8 +129,27 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
         return;
     }
 
+    // IN-BAND stream-boundary signal: every receiver (re)construction is a new stream
+    // session (ip/port/config change, reactivation). The annotation rides every emitted
+    // packet as one latched metadata instance (a refcount bump per batch), so a downstream
+    // pkt_parser resets protocol detection causally ordered with the FIRST packet of the new
+    // stream — no orchestration race, no failure-counting loss window.
+    // Session tokens must be unique across component lifetimes AND module reloads: component
+    // ids are unique among concurrently-live components only, and the control plane
+    // dlclose()s this module when its last instance is removed — so ANY counter held in this
+    // library (instance member or process-wide static) restarts on reload and can repeat a
+    // token ("udp0:1" twice), leaving a parser that outlived the swap locked on the old
+    // protocol. A per-session random nonce needs no surviving state at all: collision odds
+    // are 2^-64 per pair. The id prefix stays for operators reading logs; receiver
+    // construction is control-plane, so the random_device cost is irrelevant.
+    std::random_device rd;
+    const auto nonce = (static_cast<uint64_t>(rd()) << 32) | static_cast<uint64_t>(rd());
+    composite::metadata session_md;
+    session_md.annotations["stream_session"] = std::format("{}:{:016x}", id(), nonce);
+
     auto config = udp::config{
         .logger = logger(),
+        .session_metadata = composite::make_metadata(std::move(session_md)),
         .interface = m_interface,
         .ip_addr = m_ip_addr,
         .port = m_port,
@@ -146,11 +168,18 @@ auto udp_source::property_change_handler(const composite::properties::json& diff
     }
     std::unique_ptr<udp::interface> receiver;
     if (m_socket_type == PACKET_MMAP) {
+        if (!m_overrides.packet_fd_path.empty()) {
+            // Unprivileged mode: adopt an AF_PACKET fd from a privileged helper (see
+            // overrides.packet_fd_path). Bounded wait so a missing helper fails loudly.
+            config.packet_fd = net::receive_fd(m_overrides.packet_fd_path, 5000);
+            logger()->info("adopted AF_PACKET fd from '{}'", m_overrides.packet_fd_path);
+        }
         receiver = std::make_unique<udp::packet_mmap>(config);
     } else if (m_socket_type == DPDK) {
 #ifdef COMPOSITE_HAS_DPDK
         udp::dpdk::config dpdk_cfg{
             .logger = logger(),
+            .session_metadata = config.session_metadata,
             .interface = m_interface,
             .ip_addr = m_ip_addr,
             .port = m_port,

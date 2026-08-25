@@ -70,8 +70,17 @@ private:
     // Destination filter (mirrors the DPDK path): only forward UDP datagrams to the configured
     // dst IP/port. m_dst_ip_be is nullopt (accept any dst IP) unless a specific IPv4 was
     // configured (the multicast group, or a unicast host IP); m_dst_port == 0 accepts any port.
+    // The same predicate is installed as a kernel BPF filter at construction; the userspace
+    // classifier (packet_mmap_frame.hpp) remains the authoritative backstop.
     std::optional<uint32_t> m_dst_ip_be{};  // network byte order
     uint16_t m_dst_port{};                  // host byte order
+
+    // Kernel PACKET_STATISTICS counters clear on read: accumulated here so get_stats()
+    // reports totals. Datagrams truncated at capture (larger than the ring frame) are
+    // counted separately — the fixed ring cannot grow, so this flags a msg_size misfit.
+    uint64_t m_kernel_pkts{0};
+    uint64_t m_kernel_drops{0};
+    std::atomic<uint64_t> m_pkts_truncated{0};
 
 }; // class packet_mmap
 

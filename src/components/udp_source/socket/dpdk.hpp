@@ -49,6 +49,10 @@ public:
     struct config {
         std::shared_ptr<composite::logger> logger;
 
+        /// Session metadata attached to every emitted batch (the in-band stream-boundary
+        /// signal); see udp::config::session_metadata for the contract.
+        composite::metadata_ptr session_metadata{};
+
         // High-level user configuration (matches other socket types)
         std::string interface;            // Interface name (e.g., "eth0", "mlx5_0")
         std::string ip_addr;              // Expected destination IP (enables filtering + IGMP for multicast)
@@ -83,6 +87,14 @@ public:
 
 
 private:
+    /// Constructor stage that runs once the queue is allocated; split out so a throw can be
+    /// caught and the queue (manager singleton state the destructor would otherwise never
+    /// release — a ctor throw skips ~dpdk) handed back before rethrowing.
+    auto init_after_queue_allocation() -> void;
+    /// Release manager/NIC state (queue allocation, multicast MAC filter). Idempotent;
+    /// shared by ~dpdk and the constructor failure path.
+    auto release_nic_resources() -> void;
+
     auto receive(std::stop_token token) -> void;
 
     // Packet parsing helper
