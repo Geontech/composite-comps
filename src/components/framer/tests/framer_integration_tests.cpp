@@ -1144,6 +1144,49 @@ struct FramerTestFixture {
             REQUIRE(out.data()[i].imag() == -static_cast<float>((i + 1) * 100'000));
         }
     }
+
+    void run_runtime_geometry_change_test() {
+        reset();
+        configure(8, 0, 4);
+        auto meta = create_metadata(false, 8, composite::data_type::signed_integer, 1e6);
+
+        auto partial = std::make_shared<std::vector<uint8_t>>(3);
+        std::iota(partial->begin(), partial->end(), 1);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(partial), {10, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 0);
+
+        // A geometry update deliberately discards both an unfinished frame and queued packets,
+        // because neither can be assigned safely to one side of the control-plane transition.
+        auto queued = std::make_shared<std::vector<uint8_t>>(8, 9);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(queued), {11, 0}, meta);
+        REQUIRE(uut->m_in_port.pending() == 1);
+        uut->set_properties(composite::properties::json{{"frame_size", 4}, {"overlap", 1}},
+                            composite::properties::config_type::RUNTIME);
+        REQUIRE(uut->m_in_port.pending() == 0);
+
+        auto fresh = std::make_shared<std::vector<uint8_t>>(7);
+        std::iota(fresh->begin(), fresh->end(), 40);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(fresh), {20, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 2);
+        for (size_t frame_idx = 0; frame_idx < 2; ++frame_idx) {
+            auto [out, ts, md] = sink_port->get_data();
+            REQUIRE(out.size() == 4);
+            const auto first = 40 + frame_idx * 3;
+            for (size_t i = 0; i < out.size(); ++i) {
+                REQUIRE(out.data()[i].real() == static_cast<float>(first + i));
+                REQUIRE(out.data()[i].imag() == 0.0f);
+            }
+        }
+
+        auto& registry = composite::metrics::registry::instance();
+        const auto component_id = std::string{uut->id()};
+        REQUIRE(registry.get_or_create_counter("framer.packets_dropped_reconfiguration", "", "1",
+                                               {{"component_id", component_id}}).value() == 1);
+        REQUIRE(registry.get_or_create_counter("framer.samples_dropped_reconfiguration", "", "1",
+                                               {{"component_id", component_id}}).value() == 3);
+    }
 };
 
 
@@ -1243,4 +1286,9 @@ TEST_CASE_METHOD(FramerTestFixture, "Framer never emits a frame that crosses a m
 TEST_CASE_METHOD(FramerTestFixture, "Framer re-anchors at a same-rate, frame-aligned metadata boundary",
                  "[framer][integration][metadata][timestamps]") {
     run_same_rate_clean_boundary_reanchor_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer applies runtime geometry changes at a lossy stream boundary",
+                 "[framer][integration][runtime][metrics]") {
+    run_runtime_geometry_change_test();
 }

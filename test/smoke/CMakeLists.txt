@@ -20,6 +20,18 @@ target_link_libraries(psd_smoke PRIVATE psd_objs)
 add_test(NAME psd_smoke COMMAND psd_smoke)
 set_tests_properties(psd_smoke PROPERTIES LABELS smoke)
 
+# Module-loaded chain coverage for intentionally lossy runtime FFT-size transitions. Loading the
+# DSOs is necessary because each module exports the same create()/ABI entry points and their object
+# libraries therefore cannot be linked into one executable.
+add_executable(fft_size_runtime_chain fft_size_runtime_chain.cpp)
+target_link_libraries(fft_size_runtime_chain
+    PRIVATE composite::composite comps_baseline comps_warnings ${CMAKE_DL_LIBS})
+target_compile_features(fft_size_runtime_chain PRIVATE cxx_std_${COMPS_CXX_STANDARD})
+add_dependencies(fft_size_runtime_chain framer fft psd)
+add_test(NAME fft_size_runtime_chain
+    COMMAND fft_size_runtime_chain $<TARGET_FILE:framer> $<TARGET_FILE:fft> $<TARGET_FILE:psd>)
+set_tests_properties(fft_size_runtime_chain PROPERTIES LABELS smoke)
+
 # Numeric correctness against a naive reference DFT, across every fft work() path (folded
 # fftshift, rotate, unaligned-copy) and through output-pool exhaustion.
 add_executable(fft_numeric fft_numeric.cpp)
@@ -43,7 +55,7 @@ target_link_libraries(exp_smooth_numeric PRIVATE exp_smooth_objs)
 add_test(NAME exp_smooth_numeric COMMAND exp_smooth_numeric)
 set_tests_properties(exp_smooth_numeric PROPERTIES LABELS smoke)
 
-install(TARGETS fft_smoke psd_smoke fft_numeric psd_numeric exp_smooth_numeric
+install(TARGETS fft_smoke psd_smoke fft_size_runtime_chain fft_numeric psd_numeric exp_smooth_numeric
     RUNTIME DESTINATION bin/tests
     COMPONENT Tests
     OPTIONAL

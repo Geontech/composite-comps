@@ -51,10 +51,12 @@ inline constexpr auto PS_PER_SEC = 1'000'000'000'000ULL;
 struct framer_config {
     uint32_t frame_size{};
     uint32_t overlap{};
+    // Capacity tuning stays INITIALIZE-only: unlike frame geometry it does not alter the
+    // stream contract, and changing it live can strand another whole ring behind held frames.
     uint32_t frame_count{64};
     COMPOSITE_FIELDS(framer_config,
-        (frame_size, unit("samples")),
-        (overlap, unit("samples")),
+        (frame_size, runtime, unit("samples")),
+        (overlap, runtime, unit("samples")),
         frame_count);
 };
 } // namespace framer_detail
@@ -139,6 +141,11 @@ private:
     composite::metrics::counter<uint64_t>* m_bytes_dropped_no_format{nullptr};
     composite::metrics::counter<uint64_t>* m_bytes_dropped_unaligned{nullptr};
     composite::metrics::counter<uint64_t>* m_samples_dropped_boundary{nullptr};
+    // Runtime geometry changes intentionally form a lossy stream boundary. Keep the two
+    // sources of loss separate: queued packets have not entered the ring yet, while buffered
+    // samples are the unfinished next frame (and may include retained overlap).
+    composite::metrics::counter<uint64_t>* m_packets_dropped_reconfiguration{nullptr};
+    composite::metrics::counter<uint64_t>* m_samples_dropped_reconfiguration{nullptr};
 
     // Metadata tracking. Metadata arrives as a shared immutable instance that upstream
     // latches, so handle_metadata() early-outs on pointer identity (the common case) —

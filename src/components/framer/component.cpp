@@ -72,6 +72,12 @@ framer<T>::framer(std::string_view id) : composite::component(id) {
     m_samples_dropped_boundary = &create_counter(
         "framer.samples_dropped_metadata_boundary",
         "Buffered samples skipped at a metadata change so no emitted frame mixes streams");
+    m_packets_dropped_reconfiguration = &create_counter(
+        "framer.packets_dropped_reconfiguration",
+        "Queued input packets discarded when frame geometry changes");
+    m_samples_dropped_reconfiguration = &create_counter(
+        "framer.samples_dropped_reconfiguration",
+        "Buffered samples discarded when frame geometry changes");
 }
 
 template <typename T>
@@ -104,6 +110,17 @@ auto framer<T>::initialize_pool() -> void {
         return;
     }
 
+    // A geometry update is an explicit discontinuity: the old partial frame cannot be
+    // interpreted under the new frame_size/overlap, and packets already queued may belong to
+    // either side of the control-plane update. Drop both sets rather than ever mixing them into
+    // a frame. Count the loss before reset_state() clears the queue and state. The queued-packet
+    // count is a best-effort lower bound: an upstream producer can enqueue between pending() and
+    // clear(), because parking this component's worker does not park its producer.
+    const auto queued_packets = m_in_port.pending();
+    const auto buffered_samples = m_pool != nullptr && m_pool->head() > m_next_frame_start
+        ? m_pool->head() - m_next_frame_start
+        : std::size_t{0};
+
     try {
         auto frames = std::max<uint32_t>(m_cfg->frame_count, 2);
         m_pool = std::make_shared<composite::overlap_ring<T>>(frame_size, overlap, frames);
@@ -117,6 +134,13 @@ auto framer<T>::initialize_pool() -> void {
         return;
     }
 
+    if (queued_packets != 0 || buffered_samples != 0) {
+        m_packets_dropped_reconfiguration->add(queued_packets);
+        m_samples_dropped_reconfiguration->add(buffered_samples);
+        logger()->info("framer: frame geometry changed; discarded {} queued packets and {} "
+                       "buffered samples",
+                       queued_packets, buffered_samples);
+    }
     reset_state();
 }
 
