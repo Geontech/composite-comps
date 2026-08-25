@@ -23,6 +23,7 @@
 
 #include <composite/composite.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -31,6 +32,7 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -77,6 +79,29 @@ struct client_state {
     auto calculate_stream_fps() const -> float;
     auto update_stream_fps_metrics() -> void;
 };
+
+// One step of the backpressure ladder, pure so it is unit-testable: given the client's
+// current queue depth, high-water mark, and flow state, the state to transition to (nullopt
+// = stay). The lower rungs are floored at 1: hwm/2 and hwm/4 in integer math are 0 for
+// small hwm (2 and 3 pass the >=2 property validation), and `queue < 0` is never true — a
+// client that ever hit backpressure then stayed wedged in `recovering` at reduced FPS
+// forever, because the healthy rung could not fire.
+inline auto next_flow_state(size_t queue_size, size_t hwm, client_state::flow_state state)
+    -> std::optional<client_state::flow_state> {
+    using fs = client_state::flow_state;
+    const auto recover_below = std::max<size_t>(1, hwm / 2);
+    const auto healthy_below = std::max<size_t>(1, hwm / 4);
+    if (queue_size >= hwm && state != fs::backpressure) {
+        return fs::backpressure;
+    }
+    if (queue_size < healthy_below && state == fs::recovering) {
+        return fs::healthy;
+    }
+    if (queue_size < recover_below && state == fs::backpressure) {
+        return fs::recovering;
+    }
+    return std::nullopt;
+}
 
 // WebSocket sink: streams spectrum data (binary, FPS-throttled per client) and
 // histogram data (JSON) to any number of websocket clients, with per-client
@@ -137,6 +162,10 @@ private:
     // 1 Hz per-client metrics, off the data path (the worker parks on the doorbell
     // when idle, so it cannot pace wall-clock sends itself).
     std::jthread m_metrics_thread;
+
+    // One-shot latch for client-message parse errors (bytes are client-controlled;
+    // repeated errors log at trace). Written only from the websocket message threads.
+    std::atomic<bool> m_msg_error_logged{false};
 
     // Cached stream header fields (worker thread only). m_last_meta enables the
     // steady-state fast path: same shared metadata instance => nothing to re-parse.

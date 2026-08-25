@@ -489,20 +489,24 @@ auto ws_sink<T>::generate_metrics_message(const client_state& client) -> nlohman
 template <typename T>
 auto ws_sink<T>::check_client_backpressure(client_state& client) -> void {
     const size_t queue_size = client.send_queue_size.load(std::memory_order_relaxed);
-    const size_t hwm = client.send_queue_hwm;
-    const auto state = client.current_flow_state();
-
-    if (queue_size >= hwm && state != client_state::flow_state::backpressure) {
+    const auto transition =
+        next_flow_state(queue_size, client.send_queue_hwm, client.current_flow_state());
+    if (!transition) {
+        return;
+    }
+    switch (*transition) {
+    case client_state::flow_state::backpressure:
         logger()->warn("Client {}: Backpressure detected (queue size: {})", client.client_id,
                        queue_size);
-        client.adjust_stream_fps(client_state::flow_state::backpressure);
-    } else if (queue_size < hwm / 2 && state == client_state::flow_state::backpressure) {
+        break;
+    case client_state::flow_state::recovering:
         logger()->info("Client {}: Recovering from backpressure", client.client_id);
-        client.adjust_stream_fps(client_state::flow_state::recovering);
-    } else if (queue_size < hwm / 4 && state == client_state::flow_state::recovering) {
+        break;
+    case client_state::flow_state::healthy:
         logger()->info("Client {}: Back to healthy state", client.client_id);
-        client.adjust_stream_fps(client_state::flow_state::healthy);
+        break;
     }
+    client.adjust_stream_fps(*transition);
 }
 
 template <typename T>
@@ -615,7 +619,17 @@ auto ws_sink<T>::on_client_message(const std::string& client_id, const std::stri
             }
         }
     } catch (const std::exception& e) {
-        logger()->error("Error parsing client message from {}: {}", client_id, e.what());
+        // One-shot at error, then trace: message bytes are CLIENT-controlled, and any
+        // connected client could otherwise turn a malformed-message loop into a log flood.
+        // exchange() makes the test-and-set atomic — the callbacks run on per-connection
+        // websocket threads, and separate load/store would let a concurrent burst all
+        // observe false and each log at error level.
+        if (!m_msg_error_logged.exchange(true, std::memory_order_relaxed)) {
+            logger()->error("Error parsing client message from {}: {} (further parse errors "
+                            "logged at trace)", client_id, e.what());
+        } else {
+            logger()->trace("Error parsing client message from {}: {}", client_id, e.what());
+        }
     }
 }
 

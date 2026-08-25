@@ -192,6 +192,31 @@ auto eventually(Cond cond, std::chrono::milliseconds timeout = 2000ms) -> bool {
 
 } // namespace
 
+TEST_CASE("backpressure ladder transitions and small-hwm reachability") {
+    using fs = client_state::flow_state;
+
+    SECTION("classic ladder at hwm 8") {
+        CHECK(next_flow_state(8, 8, fs::healthy) == fs::backpressure);      // hit the hwm
+        CHECK(next_flow_state(5, 8, fs::backpressure) == std::nullopt);     // not yet drained
+        CHECK(next_flow_state(3, 8, fs::backpressure) == fs::recovering);   // < hwm/2
+        CHECK(next_flow_state(2, 8, fs::recovering) == std::nullopt);       // not yet < hwm/4
+        CHECK(next_flow_state(1, 8, fs::recovering) == fs::healthy);        // < hwm/4
+        CHECK(next_flow_state(0, 8, fs::healthy) == std::nullopt);          // steady state
+    }
+    SECTION("hwm 2 and 3 must be able to reach healthy again") {
+        // Integer division made the lower rungs `queue < 0` for hwm < 4: a client that
+        // ever hit backpressure stayed wedged in `recovering` (reduced FPS) forever.
+        for (size_t hwm : {size_t{2}, size_t{3}}) {
+            CHECK(next_flow_state(hwm, hwm, fs::healthy) == fs::backpressure);
+            CHECK(next_flow_state(0, hwm, fs::backpressure) == fs::recovering);
+            CHECK(next_flow_state(0, hwm, fs::recovering) == fs::healthy);
+        }
+    }
+    SECTION("a full-drain from backpressure steps through recovering, not straight to healthy") {
+        CHECK(next_flow_state(0, 8, fs::backpressure) == fs::recovering);
+    }
+}
+
 TEST_CASE("ws_sink gates input depth on client presence") {
     sink_fixture fx;
 
