@@ -24,3 +24,7 @@ comps_add_component(file_writer
     SOURCES component.cpp
     NO_ARCH_BASELINE
 )
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
