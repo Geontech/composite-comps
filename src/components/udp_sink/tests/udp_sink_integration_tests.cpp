@@ -211,17 +211,22 @@ TEST_CASE_METHOD(UdpSinkTestFixture, "per-stream destination state is bounded",
                {"default_dest_ip", "127.0.0.1"},
                {"default_dest_port", rx.port}});
 
+    // Drain the receiver as we feed: sendto over loopback lands synchronously, but 300
+    // undrained datagrams overflow a container's default socket buffer (net.core.rmem
+    // clamps SO_RCVBUF) and UDP sheds the excess — which failed this test in CI as if
+    // delivery were broken. One recv per send keeps the buffer near-empty and makes the
+    // losslessness assertion deterministic.
+    std::size_t received = 0;
     for (int i = 0; i < 300; ++i) {
         composite::metadata md;
         md.annotations["stream_id"] = static_cast<std::int64_t>(i);
         feed(make_packet(8, 1), composite::make_metadata(std::move(md)));
+        if (!rx.recv_one().empty()) {
+            ++received;
+        }
     }
     CHECK(stream_states_size() <= 256);
     // Traffic itself is unaffected: every packet still went out.
-    std::size_t received = 0;
-    while (!rx.recv_one().empty()) {
-        ++received;
-    }
     CHECK(received == 300);
 }
 
