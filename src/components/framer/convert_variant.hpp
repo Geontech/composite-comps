@@ -411,6 +411,72 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// uint32 (offset binary) -> float: optional byteswap, XOR the sign bit, widen
+// (values beyond float's 24-bit mantissa round, as with i32).
+//
+// A distinct dispatch tag is required: converter<uint32_t, float> is already the f32
+// BIT-PRESERVING passthrough (its key is the container type of the byteswap, not a numeric
+// format), so unsigned-integer-32 wire data cannot reuse it — reinterpreting offset-binary
+// counts as IEEE bit patterns yields garbage. This was the gap that made VITA metadata
+// declaring (unsigned_integer, 32) parse upstream and then drop in the framer.
+// ---------------------------------------------------------------------------
+struct u32_offset_binary;  // tag only; never instantiated
+
+template <>
+struct converter<u32_offset_binary, float> {
+    bool byteswap{false};
+
+    converter() = default;
+    explicit converter(bool swap) : byteswap(swap) {}
+
+    auto operator()(const uint8_t* input, float* output, std::size_t count) -> void {
+        run(reinterpret_cast<const uint32_t*>(input), output, count, byteswap);
+    }
+
+private:
+    static auto scalar_range(const uint32_t* in, float* out, std::size_t i, std::size_t count, bool swap) -> void {
+        for (; i < count; ++i) {
+            auto v = framer_load_unaligned(in + i);
+            if (swap) v = std::byteswap(v);
+            out[i] = static_cast<float>(static_cast<int32_t>(v ^ 0x80000000U));
+        }
+    }
+
+    COMPS_FMV_DEFAULT
+    static auto run(const uint32_t* in, float* out, std::size_t count, bool swap) -> void {
+        scalar_range(in, out, 0, count, swap);
+    }
+
+#if COMPS_FMV_ENABLED
+    [[gnu::target("avx2")]]
+    static auto run(const uint32_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(framer_swap_masks::U32));
+        const auto pivot = _mm256_set1_epi32(static_cast<int>(0x80000000U));
+        std::size_t i = 0;
+        for (; i + 8 <= count; i += 8) {
+            auto v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(in + i));
+            if (swap) v = _mm256_shuffle_epi8(v, mask);
+            _mm256_storeu_ps(out + i, _mm256_cvtepi32_ps(_mm256_xor_si256(v, pivot)));
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+
+    [[gnu::target("avx512f,avx512bw,avx512vl,avx512dq")]]
+    static auto run(const uint32_t* in, float* out, std::size_t count, bool swap) -> void {
+        const auto mask = _mm512_loadu_si512(framer_swap_masks::U32);
+        const auto pivot = _mm512_set1_epi32(static_cast<int>(0x80000000U));
+        std::size_t i = 0;
+        for (; i + 16 <= count; i += 16) {
+            auto v = _mm512_loadu_si512(in + i);
+            if (swap) v = _mm512_shuffle_epi8(v, mask);
+            _mm512_storeu_ps(out + i, _mm512_cvtepi32_ps(_mm512_xor_si512(v, pivot)));
+        }
+        scalar_range(in, out, i, count, swap);
+    }
+#endif
+};
+
+// ---------------------------------------------------------------------------
 // int8 -> int16 (numeric widening; single-byte, no byte order)
 // ---------------------------------------------------------------------------
 template <>
@@ -739,6 +805,7 @@ struct converter_variant_traits<float> {
         converter<int16_t, float>,
         converter<uint16_t, float>,
         converter<int32_t, float>,
+        converter<u32_offset_binary, float>,
         converter<uint32_t, float>
     >;
 };
@@ -825,6 +892,10 @@ inline constexpr auto supported_input_formats<float> = std::to_array<input_forma
      [](bool swap) -> converter_variant<float> { return converter<int32_t, float>(swap); }},
     {true, composite::data_type::signed_integer, 32, 8,
      [](bool swap) -> converter_variant<float> { return converter<int32_t, float>(swap); }},
+    {false, composite::data_type::unsigned_integer, 32, 4,
+     [](bool swap) -> converter_variant<float> { return converter<u32_offset_binary, float>(swap); }},
+    {true, composite::data_type::unsigned_integer, 32, 8,
+     [](bool swap) -> converter_variant<float> { return converter<u32_offset_binary, float>(swap); }},
     {false, composite::data_type::floating_point, 32, 4,
      [](bool swap) -> converter_variant<float> { return converter<uint32_t, float>(swap); }},
     {true, composite::data_type::floating_point, 32, 8,

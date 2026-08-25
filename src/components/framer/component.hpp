@@ -108,6 +108,9 @@ private:
     auto handle_metadata(const composite::metadata_ptr& meta) -> void;
     auto configure_output_metadata() -> void;
     auto process_buffer(const composite::immutable_buffer<uint8_t>& buffer, composite::timestamp ts) -> void;
+    /// Skip (never emit) the partial frame buffered in the ring, so no frame crosses a
+    /// metadata boundary — a frame mixing two streams' samples would carry ONE label.
+    auto discard_partial_frame() -> void;
     auto try_emit_frames() -> void;
     auto push_anchor(composite::timestamp ts, std::size_t origin_sample) -> void;
     auto compute_frame_timestamp(std::size_t start_sample) const -> composite::timestamp;
@@ -135,6 +138,7 @@ private:
     // format is known, and trailing bytes of non-sample-aligned buffers.
     composite::metrics::counter<uint64_t>* m_bytes_dropped_no_format{nullptr};
     composite::metrics::counter<uint64_t>* m_bytes_dropped_unaligned{nullptr};
+    composite::metrics::counter<uint64_t>* m_samples_dropped_boundary{nullptr};
 
     // Metadata tracking. Metadata arrives as a shared immutable instance that upstream
     // latches, so handle_metadata() early-outs on pointer identity (the common case) —

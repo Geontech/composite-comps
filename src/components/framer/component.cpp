@@ -69,6 +69,9 @@ framer<T>::framer(std::string_view id) : composite::component(id) {
     m_bytes_dropped_unaligned = &create_counter(
         "framer.bytes_dropped_unaligned",
         "Trailing bytes discarded from buffers not aligned to sample boundaries");
+    m_samples_dropped_boundary = &create_counter(
+        "framer.samples_dropped_metadata_boundary",
+        "Buffered samples skipped at a metadata change so no emitted frame mixes streams");
 }
 
 template <typename T>
@@ -144,8 +147,23 @@ auto framer<T>::handle_metadata(const composite::metadata_ptr& meta) -> void {
         m_last_input_meta = meta;
         return;
     }
-    const bool rate_changed =
-        m_last_input_meta == nullptr || meta->sample_rate != m_last_input_meta->sample_rate;
+    // FRAMES MUST NOT CROSS A METADATA BOUNDARY. A value change past the early-outs above
+    // means the samples already buffered in the ring belong to the PREVIOUS stream shape:
+    // letting a later packet complete that partial frame would emit a frame whose samples
+    // straddle two streams but whose label (m_out_metadata, attached at emission) describes
+    // only the new one — and whose timestamp could come from the old anchor. Skip the
+    // partial residue instead (counted); the first frame of the new stream starts exactly
+    // at its first sample.
+    discard_partial_frame();
+
+    // Re-anchor at EVERY value-changing boundary, residue or not: a new stream at the SAME
+    // rate (session change, retune, format change) arrives with its own wall-clock, and
+    // extrapolating the old stream's anchor across the transition would stamp its first
+    // frames with the previous stream's timeline. Set here — after discard_partial_frame()
+    // (whose clean-boundary early-out must not skip this) and before the unsupported-format
+    // return below (a to-unsupported transition is a boundary too).
+    m_reanchor_pending = true;
+
     m_last_input_meta = meta;
 
     // New metadata starts a new warn episode for the one-shot stream-shape warnings.
@@ -182,14 +200,47 @@ auto framer<T>::handle_metadata(const composite::metadata_ptr& meta) -> void {
     const bool needs_swap = (m_input_format.endianness != std::endian::native);
     m_converter = support->make(needs_swap);
 
-    if (rate_changed) {
-        // The sample-index -> wall-time mapping changed; anchor a new segment at the next
-        // successfully written buffer instead of extrapolating the new rate across the old
-        // origin. Frames that start before that point keep the old segment's mapping.
-        m_reanchor_pending = true;
-    }
-
     logger()->trace("framer: updated metadata:\n{}", m_metadata.to_string());
+}
+
+template <typename T>
+auto framer<T>::discard_partial_frame() -> void {
+    if (!m_pool) {
+        return;
+    }
+    const auto head = m_pool->head();
+    if (head <= m_next_frame_start) {
+        return;  // ring sits on a frame boundary: nothing buffered to skip
+    }
+    const auto residue = head - m_next_frame_start;
+    // With overlap enabled, up to `overlap` of these samples were already delivered inside
+    // the previous emitted frame, so this counter slightly over-states unseen-sample loss;
+    // exact accounting would need per-segment emission state for a diagnostic nicety.
+    m_samples_dropped_boundary->add(residue);
+    logger()->debug("framer: skipping {} buffered samples at a metadata boundary so no frame "
+                    "mixes streams (counted in framer.samples_dropped_metadata_boundary)",
+                    residue);
+
+    // try_emit_frame REQUIRES hop-aligned frame starts, so the new stream's first frame
+    // begins at the next hop boundary. Zero-pad the ring up to it: the pad lives entirely
+    // inside the skipped region (never emitted), and the new stream's first sample then
+    // lands exactly on the boundary. If the pad write fails (full backpressure at the exact
+    // moment of a metadata change), the alignment still holds — at most hop-1 of the new
+    // stream's samples fall below the boundary and are skipped with the residue.
+    const auto hop = m_pool->hop_size();
+    const auto aligned = ((head + hop - 1) / hop) * hop;
+    if (const auto pad = aligned - head; pad > 0) {
+        const bool ok = m_pool->write(pad, [](T* dst, std::size_t /*src*/, std::size_t count) {
+            for (std::size_t i = 0; i < count; ++i) { dst[i] = T{}; }
+        });
+        if (!ok) {
+            logger()->debug("framer: could not pad {} samples to the hop boundary at a metadata "
+                            "change; up to that many new-stream samples will be skipped", pad);
+        }
+    }
+    m_next_frame_start = aligned;
+    // (The re-anchor for the boundary — residue or not — is owned by handle_metadata,
+    // immediately after this returns.)
 }
 
 template <typename T>

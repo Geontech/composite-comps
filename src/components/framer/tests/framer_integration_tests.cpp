@@ -1005,6 +1005,120 @@ struct FramerTestFixture {
         }
     }
 
+    // Frames must not cross a metadata boundary. A partial frame buffered from stream A,
+    // completed by stream B's samples, used to emit as ONE frame — A and B samples mixed,
+    // labeled entirely with B's metadata, possibly stamped from A's anchor. The buffered
+    // residue is skipped (counted) instead, so B's first frame starts at B's first sample.
+    // The pre-existing rate-change test transitions exactly on a frame boundary and cannot
+    // see this.
+    void run_metadata_boundary_partial_frame_test() {
+        reset();
+        configure(8, 0, 4);
+        const std::string component_id{uut->id()};
+
+        // Stream A: 5 complex i8 samples (value 1) at 1 MHz, cf 100 MHz — a partial frame.
+        auto meta1 = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
+        meta1.center_frequency = 100e6;
+        auto input1 = std::make_shared<std::vector<uint8_t>>(10, uint8_t{1});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {100, 0}, meta1);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 0);  // 5 < frame_size: nothing emitted, 5 buffered
+
+        // Stream B: 8 samples (value 2) at 2 MHz, cf 200 MHz, t=200s — completes a frame.
+        auto meta2 = create_metadata(true, 8, composite::data_type::signed_integer, 2e6);
+        meta2.center_frequency = 200e6;
+        auto input2 = std::make_shared<std::vector<uint8_t>>(16, uint8_t{2});
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {200, 0}, meta2);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+
+        REQUIRE(sink_port->size() == 1);
+        auto [out, ts, md] = sink_port->get_data();
+        REQUIRE(out.size() == 8);
+        for (size_t i = 0; i < 8; ++i) {
+            INFO("Sample " << i);
+            // Every sample is B's — no A sample may appear in a frame labeled with B's
+            // metadata.
+            REQUIRE(out.data()[i].real() == 2.0f);
+            REQUIRE(out.data()[i].imag() == 2.0f);
+        }
+        REQUIRE(md != nullptr);
+        REQUIRE(md->center_frequency == 200e6);
+        REQUIRE(md->sample_rate == 2e6);
+        // The frame starts at B's first sample, and the rate change re-anchored there: the
+        // stamp is exactly B's packet timestamp, not extrapolated across A's residue.
+        REQUIRE(ts.seconds == 200);
+        REQUIRE(ts.picoseconds == 0);
+
+        // The 5 skipped A samples are visible to operators.
+        auto& registry = composite::metrics::registry::instance();
+        REQUIRE(registry.get_or_create_counter("framer.samples_dropped_metadata_boundary", "", "1",
+                                               {{"component_id", component_id}}).value() == 5);
+    }
+
+    // A clean (frame-aligned, no-residue) metadata boundary at the SAME sample rate must
+    // still re-anchor: the new stream arrives with its own wall-clock, and extrapolating
+    // the old anchor across the transition stamped its first frame from the previous
+    // stream's timeline. The residue path cannot catch this — discard_partial_frame()
+    // early-outs when the ring sits exactly on a frame boundary.
+    void run_same_rate_clean_boundary_reanchor_test() {
+        reset();
+        configure(4, 0, 4);
+
+        // Stream A: 8 samples @ 1 MHz at t=100s — exactly two frames, no residue.
+        auto meta1 = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
+        meta1.center_frequency = 100e6;
+        auto input1 = std::make_shared<std::vector<uint8_t>>(16);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input1), {100, 0}, meta1);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 2);
+        sink_port->get_data();
+        sink_port->get_data();
+
+        // Stream B: SAME rate, different center frequency, discontinuous timestamp t=500s.
+        auto meta2 = create_metadata(true, 8, composite::data_type::signed_integer, 1e6);
+        meta2.center_frequency = 200e6;
+        auto input2 = std::make_shared<std::vector<uint8_t>>(16);
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input2), {500, 0}, meta2);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+        REQUIRE(sink_port->size() == 2);
+
+        // Pre-fix: 100s + 8 us (old anchor extrapolated across the boundary).
+        auto [f1, ts1, m1] = sink_port->get_data();
+        REQUIRE(ts1.seconds == 500);
+        REQUIRE(ts1.picoseconds == 0);
+        auto [f2, ts2, m2] = sink_port->get_data();
+        REQUIRE(ts2.seconds == 500);
+        REQUIRE(ts2.picoseconds == 4'000'000);
+    }
+
+    void run_complex_u32_test() {
+        reset();
+
+        configure(4, 0, 4);
+
+        // Complex u32 is OFFSET BINARY: mid-scale (0x80000000) maps to 0, like u8/u16 —
+        // this path used to be rejected outright (the table went i32 -> f32), while the
+        // f32 passthrough keyed on uint32_t must remain a distinct, bit-preserving path.
+        auto meta = create_metadata(true, 32, composite::data_type::unsigned_integer, 1e6);
+        auto input_vec = std::make_shared<std::vector<uint8_t>>(32);  // 4 complex samples
+        auto* u32_data = reinterpret_cast<uint32_t*>(input_vec->data());
+        for (size_t i = 0; i < 4; ++i) {
+            u32_data[i * 2] = 0x80000000U + (i + 1) * 100'000U;       // I: +values
+            u32_data[i * 2 + 1] = 0x80000000U - (i + 1) * 100'000U;   // Q: -values
+        }
+        source_port->send_data(composite::immutable_buffer<uint8_t>(input_vec), {5, 0}, meta);
+        REQUIRE(uut->process() == composite::retval::NORMAL);
+
+        REQUIRE(sink_port->size() == 1);
+        auto [out, ts, md] = sink_port->get_data();
+        REQUIRE(out.size() == 4);
+        for (size_t i = 0; i < 4; ++i) {
+            INFO("Sample " << i);
+            REQUIRE(out.data()[i].real() == static_cast<float>((i + 1) * 100'000));
+            REQUIRE(out.data()[i].imag() == -static_cast<float>((i + 1) * 100'000));
+        }
+    }
+
     void run_complex_i32_test() {
         reset();
 
@@ -1115,4 +1229,18 @@ TEST_CASE_METHOD(FramerTestFixture, "Framer processes real_f32 input correctly",
 
 TEST_CASE_METHOD(FramerTestFixture, "Framer processes complex_i32 input correctly", "[framer][integration]") {
     run_complex_i32_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer processes complex_u32 input as offset binary", "[framer][integration]") {
+    run_complex_u32_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer never emits a frame that crosses a metadata boundary",
+                 "[framer][integration][metadata]") {
+    run_metadata_boundary_partial_frame_test();
+}
+
+TEST_CASE_METHOD(FramerTestFixture, "Framer re-anchors at a same-rate, frame-aligned metadata boundary",
+                 "[framer][integration][metadata][timestamps]") {
+    run_same_rate_clean_boundary_reanchor_test();
 }

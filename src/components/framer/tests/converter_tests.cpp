@@ -136,6 +136,73 @@ TEST_CASE("converter<uint32_t, float> - with byteswap", "[converter][cf32][bytes
 }
 
 // ============================================================================
+// Test u32_offset_binary -> float converter (distinct from the f32 passthrough
+// keyed on uint32_t: this is a NUMERIC conversion of unsigned offset-binary data)
+// ============================================================================
+
+TEST_CASE("converter<u32_offset_binary, float> - offset binary, no byteswap",
+          "[converter][u32][offset_binary]") {
+    converter<u32_offset_binary, float> conv(false);
+
+    vector<uint32_t> input_u32 = {
+        0x80000000U,          // mid-scale -> 0
+        0x80000001U,          // mid-scale + 1 -> 1
+        0x7FFFFFFFU,          // mid-scale - 1 -> -1
+        0x00000000U,          // minimum -> -2^31
+        0xFFFFFFFFU,          // maximum -> 2^31 - 1 (rounds in float)
+        0x80019000U,          // arbitrary positive
+    };
+    auto* input = reinterpret_cast<uint8_t*>(input_u32.data());
+    vector<float> output(input_u32.size());
+
+    conv(input, output.data(), input_u32.size());
+
+    for (size_t i = 0; i < input_u32.size(); ++i) {
+        INFO("Sample " << i);
+        const auto expected =
+            static_cast<float>(static_cast<int32_t>(input_u32[i] ^ 0x80000000U));
+        REQUIRE(output[i] == expected);
+    }
+}
+
+TEST_CASE("converter<u32_offset_binary, float> - with byteswap",
+          "[converter][u32][offset_binary][byteswap]") {
+    converter<u32_offset_binary, float> conv(true);
+
+    // 0x80000005 (mid-scale + 5) in big-endian byte order.
+    vector<uint8_t> input = {0x80, 0x00, 0x00, 0x05};
+    vector<float> output(1);
+
+    conv(input.data(), output.data(), 1);
+
+    REQUIRE(output[0] == 5.0f);
+}
+
+TEST_CASE("converter<u32_offset_binary, float> - large batch exercises SIMD and scalar tail",
+          "[converter][u32][offset_binary]") {
+    // 69 = 4*16 + 5: covers full 512/256-bit vectors plus a scalar remainder in every
+    // resolved kernel.
+    constexpr size_t COUNT = 69;
+    converter<u32_offset_binary, float> conv(false);
+
+    vector<uint32_t> input_u32(COUNT);
+    for (size_t i = 0; i < COUNT; ++i) {
+        input_u32[i] = 0x80000000U + static_cast<uint32_t>(i * 1'000'003) - 34'000'000U;
+    }
+    auto* input = reinterpret_cast<uint8_t*>(input_u32.data());
+    vector<float> output(COUNT);
+
+    conv(input, output.data(), COUNT);
+
+    for (size_t i = 0; i < COUNT; ++i) {
+        INFO("Sample " << i);
+        const auto expected =
+            static_cast<float>(static_cast<int32_t>(input_u32[i] ^ 0x80000000U));
+        REQUIRE(output[i] == expected);
+    }
+}
+
+// ============================================================================
 // Test int8_t -> int16_t converter
 // ============================================================================
 
