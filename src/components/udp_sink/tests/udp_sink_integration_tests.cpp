@@ -114,6 +114,10 @@ struct UdpSinkTestFixture {
 
     // Run process() on an empty ring: returns NOOP and flushes any batched packets.
     void drain() { REQUIRE(uut->process() == composite::retval::NOOP); }
+
+    // Friendship does not extend to the classes TEST_CASE_METHOD derives from this fixture,
+    // so private state is surfaced through fixture members.
+    auto stream_states_size() const -> std::size_t { return uut->m_stream_states.size(); }
 };
 
 TEST_CASE_METHOD(UdpSinkTestFixture, "udp_sink sends to the configured default destination",
@@ -160,6 +164,65 @@ TEST_CASE_METHOD(UdpSinkTestFixture, "udp_sink routes by metadata annotations an
     feed(make_packet(32, 5));
     REQUIRE(rx_routed.recv_one().size() == 32);
     REQUIRE(rx_default.recv_one().empty()); // nothing ever went to the default
+}
+
+TEST_CASE_METHOD(UdpSinkTestFixture, "an invalid dest_ip annotation is ignored, not latched",
+                 "[udp_sink][integration]") {
+    // An unparsable IP used to be latched verbatim and then failed EVERY send for the
+    // stream with a per-packet error log; now it is rejected at the latch and the
+    // configured default carries the traffic.
+    udp_receiver rx_default;
+    configure({{"socket_type", "send"},
+               {"default_dest_ip", "127.0.0.1"},
+               {"default_dest_port", rx_default.port}});
+
+    composite::metadata md;
+    md.annotations["dest_ip"] = "not-an-ip";
+    feed(make_packet(48, 7), composite::make_metadata(std::move(md)));
+
+    auto p = rx_default.recv_one();
+    REQUIRE(p.size() == 48);
+    REQUIRE(p[0] == 7);
+}
+
+TEST_CASE_METHOD(UdpSinkTestFixture, "a double-typed dest_port annotation routes correctly",
+                 "[udp_sink][integration]") {
+    // JSON-sourced metadata often types numbers as double; an exact-integral double must
+    // parse as a port rather than fail the '5000.000000' string round-trip.
+    udp_receiver rx;
+    configure({{"socket_type", "send"}, {"default_dest_ip", "127.0.0.1"}, {"default_dest_port", 1}});
+
+    composite::metadata md;
+    md.annotations["dest_ip"] = "127.0.0.1";
+    md.annotations["dest_port"] = static_cast<double>(rx.port);
+    feed(make_packet(24, 9), composite::make_metadata(std::move(md)));
+
+    auto p = rx.recv_one();
+    REQUIRE(p.size() == 24);
+    REQUIRE(p[0] == 9);
+}
+
+TEST_CASE_METHOD(UdpSinkTestFixture, "per-stream destination state is bounded",
+                 "[udp_sink][integration]") {
+    // stream_id comes from untrusted metadata: cycling it must not grow the latch map
+    // without bound. Above the cap the least-recently-resolved stream is evicted.
+    udp_receiver rx;
+    configure({{"socket_type", "send"},
+               {"default_dest_ip", "127.0.0.1"},
+               {"default_dest_port", rx.port}});
+
+    for (int i = 0; i < 300; ++i) {
+        composite::metadata md;
+        md.annotations["stream_id"] = static_cast<std::int64_t>(i);
+        feed(make_packet(8, 1), composite::make_metadata(std::move(md)));
+    }
+    CHECK(stream_states_size() <= 256);
+    // Traffic itself is unaffected: every packet still went out.
+    std::size_t received = 0;
+    while (!rx.recv_one().empty()) {
+        ++received;
+    }
+    CHECK(received == 300);
 }
 
 TEST_CASE_METHOD(UdpSinkTestFixture, "udp_sink flushes the sendmmsg batch when the input goes idle",

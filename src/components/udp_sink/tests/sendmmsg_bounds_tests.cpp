@@ -19,6 +19,11 @@
 
 #include <composite/core/logger.hpp>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -104,6 +109,48 @@ TEST_CASE("filling the batch exactly does not overflow", "[udp_sink][bounds]") {
         CHECK(tx.send(DEST_IP, DEST_PORT, data) >= 0);
     }
     tx.flush();
+}
+
+TEST_CASE("a failing message mid-batch does not drop the rest of the batch",
+          "[udp_sink][partial_send]") {
+    // sendmmsg() stops at the first message that fails and returns how many it sent; the
+    // remainder was never attempted. The old flush treated a short return as terminal, so
+    // one bad destination silently dropped every valid datagram queued behind it. The fix
+    // resumes after the failure, skipping only the failing message.
+    //
+    // 255.255.255.255 without SO_BROADCAST fails deterministically with EACCES, giving a
+    // real mid-batch failure on a plain loopback test box.
+
+    // Bound localhost receiver.
+    const int rx = ::socket(AF_INET, SOCK_DGRAM, 0);
+    REQUIRE(rx >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    REQUIRE(::bind(rx, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    socklen_t alen = sizeof(addr);
+    REQUIRE(::getsockname(rx, reinterpret_cast<sockaddr*>(&addr), &alen) == 0);
+    const uint16_t rx_port = ntohs(addr.sin_port);
+    timeval tv{.tv_sec = 0, .tv_usec = 500'000};
+    ::setsockopt(rx, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    {
+        auto tx = udp_tx::sendmmsg_tx{make_config(3, 256)};  // batch of 3 flushes on the 3rd send
+        std::vector<uint8_t> a(16, 0x01), bad(16, 0x02), c(16, 0x03);
+        CHECK(tx.send("127.0.0.1", rx_port, a) >= 0);
+        CHECK(tx.send("255.255.255.255", rx_port, bad) >= 0);  // queues fine; fails at flush
+        CHECK(tx.send("127.0.0.1", rx_port, c) >= 0);          // fills the batch -> flush
+    }
+
+    // BOTH loopback datagrams must arrive; pre-fix only the first did.
+    uint8_t buf[64];
+    auto n1 = ::recv(rx, buf, sizeof(buf), 0);
+    REQUIRE(n1 == 16);
+    CHECK(buf[0] == 0x01);
+    auto n2 = ::recv(rx, buf, sizeof(buf), 0);
+    REQUIRE(n2 == 16);
+    CHECK(buf[0] == 0x03);
+    ::close(rx);
 }
 
 TEST_CASE("mixed sizes across a batch boundary stay in bounds", "[udp_sink][bounds]") {

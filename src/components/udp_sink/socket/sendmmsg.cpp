@@ -60,20 +60,19 @@ sendmmsg_tx::sendmmsg_tx(const config& cfg) : m_config(cfg) {
     const auto buffer_bytes =
         static_cast<std::size_t>(m_config.batch_size) * static_cast<std::size_t>(m_config.max_packet_size);
 
+    // Allocate BEFORE creating the socket: the staging buffer can be up to ~64 MiB, and a
+    // bad_alloc after the socket existed would leak the fd (a ctor throw skips the dtor).
+    m_batch_queue.reserve(m_config.batch_size);
+    m_iovecs.resize(m_config.batch_size);
+    m_msgs.resize(m_config.batch_size);
+    m_max_packet_size = m_config.max_packet_size;
+    m_data_buffer.resize(buffer_bytes);
+    m_data_buffer_pos = 0;
+
     m_socket_fd = create_socket();
     if (m_socket_fd < 0) {
         throw std::runtime_error("Failed to create UDP socket");
     }
-
-    // Pre-allocate batch structures
-    m_batch_queue.reserve(m_config.batch_size);
-    m_iovecs.resize(m_config.batch_size);
-    m_msgs.resize(m_config.batch_size);
-
-    // Pre-allocate data buffer (batch_size * max packet size)
-    m_max_packet_size = m_config.max_packet_size;
-    m_data_buffer.resize(buffer_bytes);
-    m_data_buffer_pos = 0;
 
     m_config.logger->info("sendmmsg_tx initialized: batch_size={}, batch_timeout_us={}",
                           m_config.batch_size, m_config.batch_timeout_us);
@@ -97,15 +96,28 @@ auto sendmmsg_tx::send(const std::string& ip, uint16_t port, std::span<const uin
         m_batch_start_time = std::chrono::steady_clock::now();
     }
 
-    // Create destination address
-    struct sockaddr_in dest_addr{};
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip.c_str(), &dest_addr.sin_addr) != 1) {
-        m_config.logger->error("Invalid IP address: {}", ip);
-        m_total_errors++;
-        return -1;
+    // Resolve the destination address. Steady state sends every packet to the same
+    // endpoint, so memoize the parse: one string compare instead of inet_pton per packet.
+    if (ip != m_memo_ip || port != m_memo_port) {
+        struct sockaddr_in parsed{};
+        parsed.sin_family = AF_INET;
+        parsed.sin_port = htons(port);
+        if (inet_pton(AF_INET, ip.c_str(), &parsed.sin_addr) != 1) {
+            // One-shot: an invalid destination repeats per packet until upstream fixes it,
+            // and the error counter carries the ongoing rate.
+            if (!m_invalid_ip_warned) {
+                m_invalid_ip_warned = true;
+                m_config.logger->error("Invalid IP address: {} (further occurrences counted, not logged)", ip);
+            }
+            m_total_errors++;
+            if (m_config.send_errors != nullptr) { m_config.send_errors->inc(); }
+            return -1;
+        }
+        m_memo_ip = ip;
+        m_memo_port = port;
+        m_memo_addr = parsed;
     }
+    const struct sockaddr_in dest_addr = m_memo_addr;
 
     // Copy packet data into the pre-allocated staging buffer.
     auto data_size = data.size();
@@ -115,9 +127,14 @@ auto sendmmsg_tx::send(const std::string& ip, uint16_t port, std::span<const uin
     // arithmetic. Previously this was unchecked and the memcpy ran off the end of the
     // allocation with an upstream-controlled length.
     if (data_size > m_max_packet_size) {
-        m_config.logger->error("dropping {}-byte datagram: exceeds max_packet_size={}",
-                               data_size, m_max_packet_size);
+        if (!m_oversize_warned) {
+            m_oversize_warned = true;
+            m_config.logger->error(
+                "dropping {}-byte datagram: exceeds max_packet_size={} (further occurrences "
+                "counted, not logged)", data_size, m_max_packet_size);
+        }
         m_total_errors++;
+        if (m_config.send_errors != nullptr) { m_config.send_errors->inc(); }
         return -1;
     }
 
@@ -137,6 +154,7 @@ auto sendmmsg_tx::send(const std::string& ip, uint16_t port, std::span<const uin
             "dropping {}-byte datagram: staging buffer has {} of {} bytes free after flush",
             data_size, m_data_buffer.size() - m_data_buffer_pos, m_data_buffer.size());
         m_total_errors++;
+        if (m_config.send_errors != nullptr) { m_config.send_errors->inc(); }
         return -1;
     }
 
@@ -152,10 +170,14 @@ auto sendmmsg_tx::send(const std::string& ip, uint16_t port, std::span<const uin
     m_data_buffer_pos += data_size;
     auto bytes_queued = static_cast<ssize_t>(data_size);
 
-    // Update destination stats
-    auto dest_key = make_dest_key(ip, port);
-    auto& stats = m_dest_stats[dest_key];
-    stats.last_used = std::chrono::steady_clock::now();
+    // Touch destination stats (numeric key: no string formatting on the send path). New
+    // destinations beyond the cap are delivered but not tracked.
+    const auto dest_key = pack_dest_key(dest_addr);
+    if (auto it = m_dest_stats.find(dest_key); it != m_dest_stats.end()) {
+        it->second.last_used = std::chrono::steady_clock::now();
+    } else if (m_dest_stats.size() < MAX_TRACKED_DESTS) {
+        m_dest_stats[dest_key].last_used = std::chrono::steady_clock::now();
+    }
 
     // Check if we should flush
     bool should_flush = false;
@@ -207,36 +229,60 @@ auto sendmmsg_tx::flush_locked() -> void {
         m_msgs[i].msg_hdr.msg_iovlen = 1;
     }
 
-    // Send all packets in one syscall
-    int sent = ::sendmmsg(m_socket_fd, m_msgs.data(), static_cast<unsigned int>(batch_size), 0);
-
-    if (sent < 0) {
-        m_config.logger->error("sendmmsg failed: {} (batch_size={})", strerror(errno), batch_size);
-        m_total_errors += batch_size;
-    } else {
-        // Update stats for successfully sent packets
+    // Drain the whole batch. sendmmsg() stops at the first message that fails, returning
+    // how many it sent — the remainder was never ATTEMPTED, so treating a short return as
+    // "the rest errored" (as this used to) silently dropped valid queued datagrams on any
+    // transient mid-batch failure. Resume after each short return; when the head message
+    // itself fails (-1), skip that one message and keep going, so one bad destination
+    // cannot take the rest of the batch down with it. Each iteration advances by at least
+    // one message, so the loop is bounded by the batch size.
+    std::size_t offset = 0;
+    std::size_t failed = 0;
+    int last_errno = 0;
+    uint64_t bytes_sent_total = 0;
+    while (offset < batch_size) {
+        const int sent = ::sendmmsg(m_socket_fd, m_msgs.data() + offset,
+                                    static_cast<unsigned int>(batch_size - offset), 0);
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            last_errno = errno;
+            ++failed;
+            ++offset;  // skip the failing head message, keep the rest of the batch
+            continue;
+        }
         for (int i = 0; i < sent; i++) {
-            auto& pkt = m_batch_queue[i];
-            auto bytes = m_msgs[i].msg_len;
-
+            const auto idx = offset + static_cast<std::size_t>(i);
+            const auto bytes = m_msgs[idx].msg_len;
             m_total_packets++;
             m_total_bytes += bytes;
-
-            // Update per-destination stats
-            auto dest_key = make_dest_key(
-                inet_ntoa(pkt.dest_addr.sin_addr),
-                ntohs(pkt.dest_addr.sin_port)
-            );
-            if (auto it = m_dest_stats.find(dest_key); it != m_dest_stats.end()) {
+            bytes_sent_total += bytes;
+            if (auto it = m_dest_stats.find(pack_dest_key(m_batch_queue[idx].dest_addr));
+                it != m_dest_stats.end()) {
                 it->second.packets_sent++;
                 it->second.bytes_sent += bytes;
             }
         }
+        offset += static_cast<std::size_t>(sent);
+    }
 
-        if (sent < static_cast<int>(batch_size)) {
-            m_config.logger->warn("sendmmsg partial send: {}/{} packets", sent, batch_size);
-            m_total_errors += (batch_size - sent);
+    if (failed != 0) {
+        m_total_errors += failed;
+        if (m_config.send_errors != nullptr) { m_config.send_errors->add(failed); }
+        if (!m_send_error_warned) {
+            m_send_error_warned = true;
+            m_config.logger->error(
+                "sendmmsg: {}/{} packets failed, last error: {} (further send errors "
+                "counted, not logged)", failed, batch_size, strerror(last_errno));
         }
+    }
+    const auto delivered = batch_size - failed;
+    if (delivered != 0 && m_config.packets_sent != nullptr) {
+        m_config.packets_sent->add(delivered);
+    }
+    if (bytes_sent_total != 0 && m_config.bytes_sent != nullptr) {
+        m_config.bytes_sent->add(bytes_sent_total);
     }
 
     m_total_flushes++;
@@ -251,20 +297,21 @@ auto sendmmsg_tx::cleanup_idle_sockets() -> void {
     auto now = std::chrono::steady_clock::now();
     auto timeout = std::chrono::seconds(m_config.socket_timeout_s);
 
-    std::vector<std::string> to_remove;
+    std::vector<uint64_t> to_remove;
     for (const auto& [key, stats] : m_dest_stats) {
         if (now - stats.last_used > timeout) {
             to_remove.push_back(key);
         }
     }
 
-    for (const auto& key : to_remove) {
-        m_config.logger->debug("Removing idle destination stats: {}", key);
+    for (const auto key : to_remove) {
+        m_config.logger->debug("Removing idle destination stats: {}", format_dest_key(key));
         m_dest_stats.erase(key);
     }
 }
 
 auto sendmmsg_tx::get_stats() const -> std::map<std::string, std::string> {
+    std::scoped_lock lock(m_mutex);  // m_dest_stats/m_batch_queue are not atomics
     std::map<std::string, std::string> stats;
     stats["total_packets"] = std::to_string(m_total_packets.load());
     stats["total_bytes"] = std::to_string(m_total_bytes.load());
@@ -275,8 +322,16 @@ auto sendmmsg_tx::get_stats() const -> std::map<std::string, std::string> {
     return stats;
 }
 
-auto sendmmsg_tx::make_dest_key(const std::string& ip, uint16_t port) -> std::string {
-    return std::format("{}:{}", ip, port);
+auto sendmmsg_tx::pack_dest_key(const struct sockaddr_in& addr) -> uint64_t {
+    // Both fields kept in network byte order; the key is opaque until formatted.
+    return (static_cast<uint64_t>(addr.sin_addr.s_addr) << 16) | addr.sin_port;
+}
+
+auto sendmmsg_tx::format_dest_key(uint64_t key) -> std::string {
+    struct in_addr ip{.s_addr = static_cast<uint32_t>(key >> 16)};
+    char buf[INET_ADDRSTRLEN]{};
+    inet_ntop(AF_INET, &ip, buf, sizeof(buf));
+    return std::format("{}:{}", buf, ntohs(static_cast<uint16_t>(key & 0xFFFF)));
 }
 
 auto sendmmsg_tx::create_socket() -> int {
@@ -294,12 +349,19 @@ auto sendmmsg_tx::create_socket() -> int {
         }
     }
 
-    // Bind to specific interface if specified
+    // Bind to specific interface if specified. Fail CLOSED: SO_BINDTODEVICE needs
+    // CAP_NET_RAW, and continuing after an EPERM (the usual failure in an unprivileged
+    // container) would silently egress this stream via the default route — onto a network
+    // the operator explicitly steered it away from.
     if (!m_config.bind_interface.empty()) {
         struct ifreq ifr{};
         std::strncpy(ifr.ifr_name, m_config.bind_interface.c_str(), IFNAMSIZ - 1);
         if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0) {
-            m_config.logger->warn("Failed to bind to interface {}: {}", m_config.bind_interface, strerror(errno));
+            const auto msg = std::format("failed to bind to interface {}: {}",
+                                         m_config.bind_interface, strerror(errno));
+            m_config.logger->error(msg);
+            ::close(fd);
+            throw std::runtime_error(msg);
         }
     }
 

@@ -23,6 +23,7 @@
 
 #include <composite/composite.hpp>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -73,14 +74,19 @@ protected:
     auto on_worker_stop() -> void override;
 
 private:
-    // Per-stream state for destination latching
+    // Per-stream state for destination latching. last_used drives LRU eviction at the cap:
+    // stream ids come from untrusted metadata, so the map must be bounded.
     struct stream_state {
         std::string last_dest_ip;
         uint16_t last_dest_port{0};
+        uint64_t last_used{0};
     };
+    static constexpr std::size_t MAX_STREAM_STATES{256};
+    static constexpr std::size_t INPUT_BATCH_SIZE{64};
 
     // Ports
     input_port_t m_in_port{"data_in"};
+    std::array<input_port_t::queue_type, INPUT_BATCH_SIZE> m_input_batch;
 
     // Properties
     std::string m_socket_type{SENDMMSG};      // Socket backend type
@@ -102,15 +108,25 @@ private:
     std::unique_ptr<udp_tx::interface> m_sender;
     std::mutex m_sender_mtx;
 
-    // Per-stream destination state
+    // Per-stream destination state (bounded; see MAX_STREAM_STATES)
     std::unordered_map<uint32_t, stream_state> m_stream_states;
+    uint64_t m_stream_use_tick{0};
 
     // Steady-state fast path: destination resolved for this shared metadata instance.
     // Upstream latches its metadata_ptr, so pointer equality means "same annotations" —
-    // no map lookups, no string parsing per packet.
+    // no map lookups, no string parsing per packet. A FAILED resolution is cached too
+    // (m_resolve_attempted): the same instance resolves the same way every time.
     composite::metadata_ptr m_last_meta;
     std::string m_last_ip;
     uint16_t m_last_port{0};
+    bool m_resolve_attempted{false};
+    bool m_no_dest_warned{false};  ///< one-shot per unresolvable stream; counter carries the rate
+
+    // Observability (fleet-standard counter series; the senders increment the first three)
+    composite::metrics::counter<uint64_t>* m_packets_sent{nullptr};
+    composite::metrics::counter<uint64_t>* m_bytes_sent{nullptr};
+    composite::metrics::counter<uint64_t>* m_send_errors{nullptr};
+    composite::metrics::counter<uint64_t>* m_packets_dropped{nullptr};
 
     // Cleanup thread for idle sockets (runs only while the worker runs)
     std::jthread m_cleanup_thread;
