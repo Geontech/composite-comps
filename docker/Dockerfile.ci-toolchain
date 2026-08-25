@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1.7
+#
+# The fleet's CI build environment.
+#
+# It is the framework's published SDK image plus the one thing the fleet needs that the framework
+# does not: fftw-devel. zlib-devel and openssl-devel are already in the SDK image, so this is a
+# one-package derivative -- and that is the point. The fleet ships MODULE DSOs that composite-cli
+# dlopens, so the compiler and libstdc++ the fleet is BUILT with must be the ones the framework
+# SHIPS. Building the fleet on Debian's toolchain and loading it into a Rocky 9 / GCC Toolset 14
+# runtime puts an untested ABI across the DSO boundary, and the create()/composite_abi_version()
+# handshake cannot detect a libstdc++ mismatch -- it only versions the interface, not the ABI the
+# interface is compiled against.
+#
+# Built and cached by the ci:toolchain job; not a release artifact and never pushed to Docker Hub.
+ARG COMPOSITE_DEVEL_IMAGE=geontech/composite:0.5.0-devel
+FROM ${COMPOSITE_DEVEL_IMAGE}
+
+# The SDK image runs as 10001; a CI job needs to write to its build directory and install nothing
+# further, so this CI-only derivative stays root.
+USER root
+
+RUN microdnf install -y --enablerepo=crb fftw-devel \
+    && microdnf clean all
+
+# Fail early and loudly if the base ever stops carrying what the fleet links against, rather than
+# surfacing as a confusing configure error in every job.
+RUN set -eu; \
+    for p in fftw-devel zlib-devel openssl-devel; do rpm -q "$p" >/dev/null; done; \
+    test -f /usr/local/share/composite/cmake/compositeConfig.cmake
+
+WORKDIR /workspace

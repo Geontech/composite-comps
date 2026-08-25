@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -19,185 +19,124 @@
 
 #pragma once
 
-#include "aligned_mem.hpp"
-#include "windows.hpp"
+#include <composite/buffers/aligned_mem.hpp>
 
-#include <algorithm>
 #include <complex>
 #include <fftw3.h>
+#include <format>
 #include <mutex>
+#include <stdexcept>
 
-template <typename T, bool complex>
-class fft_plan{};
+template <typename T>
+class fft_plan;
+
+// FFTW's planner is NOT thread-safe: per its documentation, fftw_execute (and the new-array
+// variants) is the ONLY routine safe to call concurrently — plan creation AND destruction
+// must be serialized. Each precision (fftwf_/fftw_) has its own independent planner, so the
+// mutex is per specialization, and it must guard ~fft_plan too: pool workers rebuild their
+// thread_local plans concurrently on an fft_size change (make_unique constructs the new plan,
+// then assignment destroys the old one), and destroy racing create corrupts planner state.
 
 template <>
-class fft_plan<float, true> {
+class fft_plan<std::complex<float>> {
 public:
     fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
-        static std::mutex plan_mtx;
-        auto lock = std::scoped_lock{plan_mtx};
+        auto lock = std::scoped_lock{planner_mutex()};
         fftwf_plan_with_nthreads(fftw_threads);
-        auto plan_buf = aligned::make_aligned<std::complex<float>>(64, fft_size);
+        // Create separate buffers for out-of-place planning
+        auto in_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
+        auto out_buf = composite::make_aligned<std::complex<float>>(64, fft_size);
         m_plan = fftwf_plan_dft_1d(
             fft_size,
-            reinterpret_cast<fftwf_complex*>(plan_buf->data()),
-            reinterpret_cast<fftwf_complex*>(plan_buf->data()),
+            reinterpret_cast<fftwf_complex*>(in_buf->data()),
+            reinterpret_cast<fftwf_complex*>(out_buf->data()),
             FFTW_FORWARD,
             FFTW_MEASURE
         );
+        // The planner returns null on failure (resource exhaustion at large sizes); executing
+        // a null plan is a crash. Throw instead — the caller's work() exception path logs and
+        // drops the packet, and retries the plan build on the next one.
+        if (m_plan == nullptr) {
+            throw std::runtime_error(
+                std::format("fftwf_plan_dft_1d failed for size {}", fft_size));
+        }
     }
 
     ~fft_plan() {
+        auto lock = std::scoped_lock{planner_mutex()};
         fftwf_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftwf_plan {
-        return m_plan;
     }
 
     auto size() const noexcept -> std::size_t {
         return m_size;
     }
 
-    auto execute(aligned::aligned_mem<std::complex<float>>* in, aligned::aligned_mem<std::complex<float>>* out) -> void {
+    auto execute(const std::complex<float>* in, std::complex<float>* out) -> void {
         fftwf_execute_dft(
             m_plan,
-            reinterpret_cast<fftwf_complex*>(in->data()),
-            reinterpret_cast<fftwf_complex*>(out->data())
+            const_cast<fftwf_complex*>(reinterpret_cast<const fftwf_complex*>(in)),
+            reinterpret_cast<fftwf_complex*>(out)
         );
     }
 
 private:
+    static auto planner_mutex() -> std::mutex& {
+        static std::mutex mtx;
+        return mtx;
+    }
+
     fftwf_plan m_plan;
     std::size_t m_size;
 
-}; // class fft_plan<float, true>
+}; // class fft_plan<std::complex<float>>
 
 template <>
-class fft_plan<float, false> {
+class fft_plan<std::complex<double>> {
 public:
     fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
-        static std::mutex plan_mtx;
-        auto lock = std::scoped_lock{plan_mtx};
-        fftwf_plan_with_nthreads(fftw_threads);
-        auto in_buf = aligned::make_aligned<float>(64, fft_size);
-        auto out_buf = aligned::make_aligned<std::complex<float>>(64, fft_size);
-        m_plan = fftwf_plan_dft_r2c_1d(
-            fft_size,
-            in_buf->data(),
-            reinterpret_cast<fftwf_complex*>(out_buf->data()),
-            FFTW_MEASURE
-        );
-    }
-
-    ~fft_plan() {
-        fftwf_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftwf_plan {
-        return m_plan;
-    }
-
-    auto size() const noexcept -> std::size_t {
-        return m_size;
-    }
-
-    auto execute(aligned::aligned_mem<float>* in, aligned::aligned_mem<std::complex<float>>* out) -> void {
-        fftwf_execute_dft_r2c(
-            m_plan,
-            in->data(),
-            reinterpret_cast<fftwf_complex*>(out->data())
-        );
-    }
-
-private:
-    fftwf_plan m_plan;
-    std::size_t m_size;
-
-}; // class fft_plan<float, false>
-
-template <>
-class fft_plan<double, true> {
-public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
-        static std::mutex plan_mtx;
-        auto lock = std::scoped_lock{plan_mtx};
+        auto lock = std::scoped_lock{planner_mutex()};
         fftw_plan_with_nthreads(fftw_threads);
-        auto plan_buf = aligned::make_aligned<std::complex<double>>(64, fft_size);
+        // Create separate buffers for out-of-place planning
+        auto in_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
+        auto out_buf = composite::make_aligned<std::complex<double>>(64, fft_size);
         m_plan = fftw_plan_dft_1d(
             fft_size,
-            reinterpret_cast<fftw_complex*>(plan_buf->data()),
-            reinterpret_cast<fftw_complex*>(plan_buf->data()),
+            reinterpret_cast<fftw_complex*>(in_buf->data()),
+            reinterpret_cast<fftw_complex*>(out_buf->data()),
             FFTW_FORWARD,
             FFTW_MEASURE
         );
+        // See the single-precision specialization: a null plan must throw, not execute.
+        if (m_plan == nullptr) {
+            throw std::runtime_error(
+                std::format("fftw_plan_dft_1d failed for size {}", fft_size));
+        }
     }
 
     ~fft_plan() {
+        auto lock = std::scoped_lock{planner_mutex()};
         fftw_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftw_plan {
-        return m_plan;
     }
 
     auto size() const noexcept -> std::size_t {
         return m_size;
     }
 
-    auto execute(aligned::aligned_mem<std::complex<double>>* in, aligned::aligned_mem<std::complex<double>>* out) -> void {
+    auto execute(const std::complex<double>* in, std::complex<double>* out) -> void {
         fftw_execute_dft(
             m_plan,
-            reinterpret_cast<fftw_complex*>(in->data()),
-            reinterpret_cast<fftw_complex*>(out->data())
+            const_cast<fftw_complex*>(reinterpret_cast<const fftw_complex*>(in)),
+            reinterpret_cast<fftw_complex*>(out)
         );
     }
 
 private:
+    static auto planner_mutex() -> std::mutex& {
+        static std::mutex mtx;
+        return mtx;
+    }
+
     fftw_plan m_plan;
     std::size_t m_size;
 
-}; // class fft_plan<double, true>
-
-template <>
-class fft_plan<double, false> {
-public:
-    fft_plan(uint32_t fft_size, uint32_t fftw_threads) : m_size(fft_size) {
-        static std::mutex plan_mtx;
-        auto lock = std::scoped_lock{plan_mtx};
-        fftw_plan_with_nthreads(fftw_threads);
-        auto in_buf = aligned::make_aligned<double>(64, fft_size);
-        auto out_buf = aligned::make_aligned<std::complex<double>>(64, fft_size);
-        m_plan = fftw_plan_dft_r2c_1d(
-            fft_size,
-            in_buf->data(),
-            reinterpret_cast<fftw_complex*>(out_buf->data()),
-            FFTW_MEASURE
-        );
-    }
-
-    ~fft_plan() {
-        fftw_destroy_plan(m_plan);
-    }
-
-    auto plan() -> fftw_plan {
-        return m_plan;
-    }
-
-    auto size() const noexcept -> std::size_t {
-        return m_size;
-    }
-
-    auto execute(aligned::aligned_mem<double>* in, aligned::aligned_mem<std::complex<double>>* out) -> void {
-        fftw_execute_dft_r2c(
-            m_plan,
-            in->data(),
-            reinterpret_cast<fftw_complex*>(out->data())
-        );
-    }
-
-private:
-    fftw_plan m_plan;
-    std::size_t m_size;
-
-}; // class fft_plan<double, false>
+}; // class fft_plan<std::complex<double>>

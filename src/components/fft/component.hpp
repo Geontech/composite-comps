@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -17,266 +17,166 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
-#include "aligned_mem.hpp"
+#pragma once
+
 #include "fft_plan.hpp"
-#include "task_queue.hpp"
-#include "windows.hpp"
 
-#include <bit>
-#include <composite/component.hpp>
+#include <composite/core/pipeline_component.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/buffers/aligned_mem.hpp>
+#include <composite/buffers/slab_pool.hpp>
+#include <composite/metrics/metrics.hpp>
+#include <composite/properties/snapshot.hpp>
+
+#include <atomic>
 #include <complex>
-#include <deque>
-#include <fftw3.h>
-#include <immintrin.h>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
+#include "simd_fmv.hpp"
 
+// T is expected to be std::complex<float> or std::complex<double>.
+//
+// fft is a pipeline_component: the framework's single worker ingests in order and the bounded
+// slot ring re-serialises output to submission order, while the parallel FFT runs on a worker
+// pool (num_workers). This replaces the hand-rolled input-thread + task_queue + ordered-future
+// drain (and integrates with the park coordinator, so config writes / stop quiesce promptly).
 template <typename T>
-class fft : public composite::component {
-    using plan_t = fft_plan<T, true>;
-    using fft_t = aligned::aligned_mem<std::complex<T>>;
-    using window_t = aligned::aligned_mem<T>;
-    using input_t = std::unique_ptr<fft_t>;
-    using input_port_t = composite::input_port<input_t>;
-    using output_port_t = composite::output_port<std::unique_ptr<fft_t>>;
-    using input_tuple_t = std::tuple<input_t, composite::timestamp, std::optional<composite::metadata>>;
-    using enum composite::properties::config_type;
+class fft : public composite::pipeline_component<composite::immutable_buffer<T>, composite::immutable_buffer<T>> {
+    using base = composite::pipeline_component<composite::immutable_buffer<T>, composite::immutable_buffer<T>>;
+    using scalar_t = typename T::value_type;  // float or double
+    using plan_t = fft_plan<T>;
+    using window_t = composite::aligned_mem<scalar_t>;
+
+    static constexpr std::size_t ALIGNMENT = 64;
+
 public:
-    fft() : composite::component("fft") {
-        add_port(&m_in_port);
-        add_port(&m_out_port);
-        add_property("window", &m_window_type).configurability(RUNTIME).change_listener([this]() {
-            return (m_window_type == "BLACKMAN_HARRIS") || (m_window_type == "HAMMING");
-        });
-        add_property("fft_size", &m_fft_size).configurability(RUNTIME).change_listener([this]() {
-            return std::has_single_bit(m_fft_size);
-        });
-        add_property("num_workers", &m_num_workers).configurability(RUNTIME).change_listener([this]() {
-            return m_num_workers <= 8u;
-        });
-        add_property("fftw_threads", &m_fftw_threads);
-        add_property("shift", &m_shift).configurability(RUNTIME);
-        if constexpr (std::is_same_v<T, float>) {
-            fftwf_init_threads();
-        } else {
-            fftw_init_threads();
-        }
-    }
+    explicit fft(std::string_view id);
+    ~fft() override;
 
-    ~fft() override {
-        if constexpr (std::is_same_v<T, float>) {
-            fftwf_cleanup_threads();
-        } else {
-            fftw_cleanup_threads();
-        }
-    }
+    auto property_change_handler(const composite::properties::json& diff) -> void override;
 
-    auto property_change_handler() -> void override {
-        // Flush input port to prevent inconsistent data sizing
-        m_in_port.clear();
-        {
-            auto lock = std::scoped_lock{m_mtx};
-            m_futures.clear();
-        }
-        if (m_window_type == "BLACKMAN_HARRIS") {
-            m_window = windows::blackman_harris<T>(m_fft_size);
-        } else if (m_window_type == "HAMMING") {
-            m_window = windows::hamming<T>(m_fft_size);
-        }
-        if (m_task_queue.thread_name_prefix() != id()) {
-            m_task_queue.thread_name_prefix(id());
-        }
-        m_task_queue.resize(m_num_workers);
+protected:
+    // ARRIVAL order, main thread: stamp the FFT params onto the metadata that travels with the
+    // packet (read from the published config snapshot, so it is consistent with work()).
+    auto prepare(composite::metadata& md) -> void override;
 
-        if (m_metadata.sample_rate > 0.0) {
-            m_metadata.annotations["fft_size"] = std::to_string(m_fft_size);
-            m_metadata.annotations["fft_window"] = m_window_type;
-            logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
-            m_out_port.send_metadata(m_metadata);
-        }
-    }
-
-    auto start() -> void override {
-        m_input_thread = std::jthread([&](std::stop_token stoken) {
-            while (!stoken.stop_requested()) {
-                // Get data buffer
-                auto [data, ts, meta] = m_in_port.get_data();
-                if (data == nullptr) {
-                    std::this_thread::yield();
-                    continue;
-                }
-                // Submit FFT task to pool
-                auto fut = m_task_queue.submit([data = std::move(data), ts, meta = std::move(meta), this]() mutable -> input_tuple_t {
-                    // Validate the input and fft sizes match
-                    if (data->size() != m_fft_size) [[unlikely]] {
-                        if (!m_warned) [[unlikely]] {
-                            logger()->error("Input buffer size {} does not match fft_size {}, dropping data", data->size(), m_fft_size);
-                            m_warned = true;
-                        }
-                        return std::make_tuple(nullptr, ts, std::move(meta));
-                    } else {
-                        m_warned = false;
-                    }
-                    // Create a thread_local plan
-                    static thread_local std::unique_ptr<plan_t> fft_plan;
-                    if (!fft_plan || fft_plan->size() != m_fft_size) {
-                        fft_plan = std::make_unique<plan_t>(m_fft_size, m_fftw_threads);
-                    }
-
-                    // Apply window
-                    if (m_window) {
-                        apply_window(data.get(), m_window.get());
-                    }
-
-                    // Execute the fft
-                    // In-place for complex
-                    fft_plan->execute(data.get(), data.get());
-
-                    // Shift based on property
-                    if (m_shift) {
-                        std::rotate(
-                            data->data(),
-                            data->data() + (data->size() / 2),
-                            data->data() + data->size()
-                        );
-                    }
-
-                    // Return modified data and original ts/meta
-                    return std::make_tuple(std::move(data), ts, std::move(meta));
-                });
-                // Push future onto queue
-                {
-                    auto lock = std::scoped_lock{m_mtx};
-                    m_futures.push_back(std::move(fut));
-                }
-                m_cv.notify_one();
-            }
-        });
-        pthread_setname_np(m_input_thread.native_handle(), std::format("{}-in", id()).c_str());
-        composite::component::start();
-    }
-
-    auto stop() -> void override {
-        m_input_thread.request_stop();
-        m_cv.notify_all();
-        composite::component::stop();
-    }
-
-    auto process() -> composite::retval override {
-        using enum composite::retval;
-        // Pop a future from the queue
-        using namespace std::chrono_literals;
-        auto lock = std::unique_lock{m_mtx};
-        m_cv.wait_for(lock, 1s, [this]{ return !m_futures.empty(); });
-        if (m_futures.empty()) {
-            return NORMAL;
-        }
-        auto fut = std::move(m_futures.front());
-        m_futures.pop_front();
-        lock.unlock();
-
-        // Get result data from future
-        auto [data, ts, meta] = fut.get();
-        if (meta.has_value()) {
-            logger()->trace("received metadata:\n{}", meta->to_string());
-            m_metadata = meta.value();
-            m_metadata.annotations["fft_size"] = std::to_string(m_fft_size);
-            m_metadata.annotations["fft_window"] = m_window_type;
-            logger()->trace("sending updated metadata:\n{}", m_metadata.to_string());
-            m_out_port.send_metadata(m_metadata);
-        }
-
-        if (data != nullptr) [[likely]] {
-            // Send data
-            m_out_port.send_data(std::move(data), ts);
-        }
-
-        return NORMAL;
-    }
+    // The parallel stage (pool worker, concurrent across packets): window + FFT + optional shift.
+    auto work(composite::immutable_buffer<T> in, composite::timestamp ts,
+              const composite::metadata& md) -> composite::immutable_buffer<T> override;
 
 private:
-    [[gnu::target("default")]]
-    auto apply_window(fft_t* data, const window_t* window) -> void {
-        for (auto i=0u; i< data->size(); ++i) {
-            data->at(i) = data->at(i) * window->at(i);
-        }
-    }
-
+    // Fused copy + window with SIMD variants (use only their arguments — thread-safe in work()).
+    COMPS_FMV_DEFAULT
+    auto copy_and_window(const composite::immutable_buffer<T>& input,
+                         composite::mutable_buffer<T>& output, const window_t* window) -> void;
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f")]]
-    auto apply_window(fft_t* data, const window_t* window) -> void {
-        // Logic for both types:
-        // - load payload data
-        // - load window data
-        // - multiply payload by window
-        // - store payload data
-        auto stride = 512u / 8u / sizeof(double) / 2u/*complex*/;
-        if constexpr (std::is_same_v<T, float>) {
-            stride = 512u / 8u / sizeof(float) / 2u/*complex*/;
-        }
-        for (auto i=0u; i < data->size(); i += stride) {
-            if constexpr (std::is_same_v<T, float>) {
-                auto data_ptr = reinterpret_cast<float*>(data->data() + i);
-                auto payload = _mm512_load_ps(data_ptr);
-                auto window_ps = _mm512_load_ps(window->data() + i * 2);
-                payload = _mm512_mul_ps(payload, window_ps);
-                _mm512_store_ps(data_ptr, payload);
-            } else {
-                auto data_ptr = reinterpret_cast<double*>(data->data() + i);
-                auto payload = _mm512_load_pd(data_ptr);
-                auto window_pd = _mm512_load_pd(window->data() + i * 2);
-                payload = _mm512_mul_pd(payload, window_pd);
-                _mm512_store_pd(data_ptr, payload);
-            }
-        }
-    }
-
+    auto copy_and_window(const composite::immutable_buffer<T>& input,
+                         composite::mutable_buffer<T>& output, const window_t* window) -> void;
+#endif
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2")]]
-    auto apply_window(fft_t* data, const window_t* window) -> void {
-        // Logic for both types:
-        // - load payload data
-        // - load window data
-        // - multiply payload by window
-        // - store payload data
-        auto stride = 256u / 8u / sizeof(double) / 2u/*complex*/;
-        if constexpr (std::is_same_v<T, float>) {
-            stride = 256u / 8u / sizeof(float) / 2u/*complex*/;
-        }
-        for (auto i=0u; i < data->size(); i += stride) {
-            if constexpr (std::is_same_v<T, float>) {
-                auto data_ptr = reinterpret_cast<float*>(data->data() + i);
-                auto payload = _mm256_load_ps(data_ptr);
-                auto window_ps = _mm256_load_ps(window->data() + i * 2);
-                payload = _mm256_mul_ps(payload, window_ps);
-                _mm256_store_ps(data_ptr, payload);
-            } else {
-                auto data_ptr = reinterpret_cast<double*>(data->data() + i);
-                auto payload = _mm256_load_pd(data_ptr);
-                auto window_pd = _mm256_load_pd(window->data() + i * 2);
-                payload = _mm256_mul_pd(payload, window_pd);
-                _mm256_store_pd(data_ptr, payload);
-            }
-        }
-    }
+    auto copy_and_window(const composite::immutable_buffer<T>& input,
+                         composite::mutable_buffer<T>& output, const window_t* window) -> void;
+#endif
 
-    // Ports
-    input_port_t m_in_port{"data_in"};
-    output_port_t m_out_port{"data_out"};
+    // Immutable per-task config snapshot. property_change_handler runs under park (the main
+    // ingest/retire worker quiesced), but the POOL workers running work() do NOT park — so they
+    // must not read the live config members (m_window free-while-used is a UAF; the scalar reads
+    // are torn). PCH builds a fresh value and publishes it through composite::snapshot; work()
+    // loads it, getting a consistent {fft_size, window, shift} and a window buffer kept alive by
+    // the returned shared_ptr.
+    struct task_config {
+        std::size_t fft_size{1024};
+        bool shift{true};
+        // True when the fftshift is FOLDED INTO the window (odd-index sign flip): the
+        // transform then comes out pre-shifted and work() skips the post-FFT rotate pass.
+        // Only possible when a window is in use; the unwindowed paths still rotate.
+        bool shift_folded{false};
+        uint32_t fftw_threads{1};
+        std::string window_type;                 // for the output metadata annotation
+        std::string size_annotation;             // std::to_string(fft_size), built once
+        // sum(w^2) over the window taps, stamped as the fft_window_sum_sq annotation so a
+        // downstream psd normalizes from what THIS component actually applied instead of
+        // re-deriving the window from its name (which silently mis-normalizes any window
+        // type the consumer does not recognize). Empty when no window is in use.
+        std::string window_sum_sq_annotation;
+        std::shared_ptr<const window_t> window;  // null => no windowing
+        // Pooled output frames: work() sends one freshly-owned buffer downstream per packet,
+        // which used to be a heap allocation per packet. The pool lives in the snapshot so
+        // pool workers acquire from a consistent, correctly-sized pool with no extra locking.
+        // Carried FORWARD unchanged across config generations while fft_size stays the same
+        // (see make_task_config), so window/shift churn does not strand one pool per
+        // generation behind downstream-held frames. Null when frames are too large to pool.
+        std::shared_ptr<composite::slab_pool<T>> out_pool;
+    };
 
-    // Properties
+    // What work() loads is a HISTORY of recent config generations, newest first. prepare()
+    // stamps each packet's metadata from the newest generation at INGEST; work() runs later
+    // on a pool thread, where "latest" may already be a NEWER generation than the one this
+    // packet was stamped with (a RUNTIME change with packets in flight). work() therefore
+    // binds each packet to the generation matching its OWN annotations (fft_size /
+    // fft_window / fft_shift), so the transform always agrees with the metadata that
+    // travels with the frame — and an old-size frame accepted before an fft_size change is
+    // still transformed rather than spuriously dropped.
+    //
+    // Retention is DEDUPLICATED BY KEY (fft_size, window_type, shift): two generations with
+    // the same key are semantically interchangeable, so property churn between a handful of
+    // values never consumes history slots — flipping A/B forever retains exactly two
+    // entries. Eviction therefore requires more than CFG_HISTORY_DEPTH *distinct*
+    // configurations applied while one packet stays queued, not merely that many property
+    // writes. A packet that still misses (or foreign metadata that never went through
+    // prepare()) falls back to the newest generation — the pre-history behavior — and is
+    // COUNTED (fft.config_binding_misses) plus warned once, so the degraded case is
+    // observable instead of silent. Exact per-packet binding with no fallback at all needs
+    // a framework channel from ingest to work(); see composite-framework-requests.md FR-1.
+    using cfg_history_t = std::vector<std::shared_ptr<const task_config>>;
+    static constexpr std::size_t CFG_HISTORY_DEPTH = 16;
+
+    auto make_task_config(const cfg_history_t* prev) const -> std::shared_ptr<const task_config>;
+    auto publish_config() -> void;
+    static auto config_matches(const task_config& cfg, const composite::metadata& md) -> bool;
+    static auto same_key(const task_config& a, const task_config& b) -> bool;
+
+    // Actual pool size, recorded by on_workers_resized() (main worker, pool idle) and read by
+    // make_task_config() (PCH thread, park-synchronized) to bound num_workers x fftw_threads.
+    auto on_workers_resized(int n) -> void override;
+    std::atomic<int> m_active_workers{1};
+
+    // RAII holder for the process-global FFTW threads refcount (helpers in component.cpp). A
+    // MEMBER rather than acquire/release calls in the ctor/dtor bodies: if the constructor body
+    // throws after acquiring (e.g. a metric registration), the destructor never runs, but
+    // fully-constructed members ARE destroyed — so the count cannot leak. Destroyed after the
+    // dtor body's stop(), so the pool never outlives the threading state it uses.
+    struct fftw_threads_lease {
+        explicit fftw_threads_lease(bool single_precision);
+        ~fftw_threads_lease();
+        fftw_threads_lease(const fftw_threads_lease&) = delete;
+        fftw_threads_lease& operator=(const fftw_threads_lease&) = delete;
+        bool single;
+    };
+    fftw_threads_lease m_fftw_lease{std::is_same_v<scalar_t, float>};
+
+    // Properties (num_workers is owned by pipeline_component). Live config, written by the engine
+    // under park; read only by property_change_handler/make_task_config (park-synchronized).
     std::string m_window_type;
     uint32_t m_fft_size{1024};
     uint32_t m_fftw_threads{1};
-    uint32_t m_num_workers{1};
     bool m_shift{true};
 
-    // Members
-    std::unique_ptr<window_t> m_window{nullptr};
-    std::deque<std::future<input_tuple_t>> m_futures;
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::jthread m_input_thread;
-    task_queue m_task_queue;
-    composite::metadata m_metadata{};
-    bool m_warned{false};
+    composite::snapshot<cfg_history_t> m_task_cfg;
+
+    // Observability (shared metrics registry, labeled by component id; auto-removed by ~component).
+    // frames_dropped: packets rejected in work() for a frame-size/fft_size mismatch (else only
+    // logged per-slot). plan_builds: FFTW plan (re)creations — an FFTW_MEASURE build is expensive,
+    // so a climbing count flags fft_size/fftw_threads thrashing across the pool.
+    composite::metrics::counter<uint64_t>* m_frames_dropped{nullptr};
+    composite::metrics::counter<uint64_t>* m_plan_builds{nullptr};
+    // config_binding_misses: packets whose stamped config generation was no longer retained
+    // (transformed with the newest instead). Nonzero means config churn outran the history.
+    composite::metrics::counter<uint64_t>* m_binding_misses{nullptr};
+    std::atomic<bool> m_binding_miss_warned{false};
 
 }; // class fft

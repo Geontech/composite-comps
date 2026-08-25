@@ -1,0 +1,48 @@
+#
+# Copyright (C) 2024 Geon Technologies, LLC
+#
+# This file is part of composite-comps.
+#
+# composite-comps is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# composite-comps is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program. If not, see http://www.gnu.org/licenses/.
+#
+
+# udp_sink loopback integration tests (real 127.0.0.1 sockets)
+add_executable(udp_sink_integration_tests udp_sink_integration_tests.cpp)
+target_link_libraries(udp_sink_integration_tests
+    PRIVATE
+        udp_sink_objs
+        Catch2::Catch2WithMain
+        Threads::Threads
+)
+
+catch_discover_tests(udp_sink_integration_tests)
+
+# Staging-buffer bounds. Links udp_sink_objs for the sender implementation; meaningful under the
+# asan-ubsan preset, where a regression is a reported heap overflow rather than a silent one.
+add_executable(sendmmsg_bounds_tests sendmmsg_bounds_tests.cpp)
+target_link_libraries(sendmmsg_bounds_tests
+    PRIVATE
+        udp_sink_objs
+        Catch2::Catch2WithMain
+        Threads::Threads
+)
+catch_discover_tests(sendmmsg_bounds_tests)
+
+install(TARGETS
+    udp_sink_integration_tests
+    sendmmsg_bounds_tests
+    RUNTIME DESTINATION bin/tests
+    COMPONENT Tests
+    OPTIONAL
+)

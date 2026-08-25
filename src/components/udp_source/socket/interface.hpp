@@ -17,16 +17,33 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
- #pragma once
+#pragma once
 
+#include <atomic>
 #include <bit>
-#include <composite/output_port.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/metrics/metrics.hpp>
+#include <composite/ports/output_port.hpp>
 #include <map>
 #include <memory>
 #include <memory_resource>
-#include <spdlog/spdlog.h>
+#include <composite/core/logger.hpp>
 
 namespace udp {
+
+/**
+ * @brief Metrics for UDP receiver implementations.
+ *
+ * These are created by the component and passed to the receiver via config.
+ * All metrics are required - receivers always record to these.
+ */
+struct metrics {
+    composite::metrics::counter<uint64_t>& packets_received;
+    composite::metrics::counter<uint64_t>& bytes_received;
+    composite::metrics::counter<uint64_t>& packets_dropped;
+    composite::metrics::counter<uint64_t>& kernel_drops;
+    composite::metrics::histogram& batch_sizes;
+}; // struct metrics
 
 /**
  * @brief Configuration parameters for a UDP receiver interface.
@@ -40,7 +57,17 @@ struct config {
     /**
      * @brief Logger instance
      */
-    std::shared_ptr<spdlog::logger> logger;
+    std::shared_ptr<composite::logger> logger;
+
+    /**
+     * @brief Metadata attached to every packet this receiver session emits (may be null).
+     * The component builds it per receiver (re)construction with a monotonically increasing
+     * `stream_session` annotation — the IN-BAND stream-boundary signal: a downstream
+     * pkt_parser resets protocol detection when the session changes, causally ordered with
+     * the first packet of the new stream (no orchestration race, no failure-count loss
+     * window). Attaching is a refcount bump per send batch.
+     */
+    composite::metadata_ptr session_metadata{};
 
     /**
      * @brief Network interface name (e.g., "eth0").
@@ -56,6 +83,16 @@ struct config {
      * @brief UDP port to listen on.
      */
     uint16_t port{};
+
+    /**
+     * @brief Pre-opened AF_PACKET socket to ADOPT (PACKET_MMAP backend only; -1 = open one).
+     * socket(AF_PACKET, ...) is the receiver's only CAP_NET_RAW-gated call — everything after
+     * creation is unprivileged on the fd — so a deployment that cannot grant NET_RAW to this
+     * process can have a minimal privileged helper open the bare socket and pass it over
+     * SCM_RIGHTS (see overrides.packet_fd_path on the component). The receiver takes
+     * ownership and closes it.
+     */
+    int packet_fd{-1};
 
     /**
      * @brief Size of the socket receive buffer (in bytes).
@@ -77,6 +114,37 @@ struct config {
      */
     std::size_t frame_count{};
 
+    /**
+     * @brief Timeout in seconds for packet size auto-discovery.
+     * Only applies to recvmmsg socket type when msg_size is not set.
+     */
+    std::size_t autodiscovery_timeout{10};
+
+    /**
+     * recvmmsg batching controls. Once the socket is readable, receive_batch_wait_us gives
+     * additional datagrams a fixed window to accumulate in the kernel. Received packets are
+     * then retained across calls until output_batch_size is reached or the oldest packet has
+     * waited max_batch_delay_us. A batch size of zero selects batch_size (num_msgs).
+     */
+    std::size_t receive_batch_wait_us{100};
+    std::size_t output_batch_size{};
+    std::size_t max_batch_delay_us{1000};
+
+    /**
+     * @brief Optional metrics for the receiver.
+     * If provided, the receiver will record metrics to these counters.
+     */
+    udp::metrics metrics;
+
+    /**
+     * @brief Optional externally-owned abort eventfd (-1 = none). A receiver whose start_recv()
+     * can wait (packet-size autodiscovery) polls this alongside its own stop machinery, so an
+     * owner that cannot reach stop_recv() while start_recv() is still running — udp_source holds
+     * its receiver mutex across the whole call — can still abort the wait. The receiver never
+     * closes or drains this fd; the owner does both.
+     */
+    int abort_fd{-1};
+
 }; // struct config
 
 /**
@@ -89,17 +157,9 @@ struct config {
  */
 class interface {
 public:
-    /**
-     * @brief Type alias for a polymorphic vector of bytes.
-     */
     using buffer_t = std::pmr::vector<uint8_t>;
-
-    /**
-     * @brief Type alias for a shared pointer to a receive buffer.
-     */
     using buffer_ptr_t = std::shared_ptr<buffer_t>;
-
-    using output_port_t = composite::output_port<buffer_ptr_t>;
+    using output_port_t = composite::output_port<composite::immutable_buffer<uint8_t>>;
 
     // Non-copyable and non-movable
     interface(const interface&) = delete;
@@ -137,16 +197,29 @@ public:
 
 protected:
     /**
-     * @brief Default constructor.
+     * @brief Constructor.
      *
      * @param logger spdlog logger instance
+     * @param metrics metrics for recording
      */
-    explicit interface(std::shared_ptr<spdlog::logger> logger) : m_logger(logger) {}
+    interface(std::shared_ptr<composite::logger> logger, udp::metrics metrics,
+              composite::metadata_ptr session_metadata = nullptr)
+        : m_logger(logger), m_metrics(metrics), m_session_metadata(std::move(session_metadata)) {}
 
     /**
      * @brief Logger instance
      */
-    std::shared_ptr<spdlog::logger> m_logger;
+    std::shared_ptr<composite::logger> m_logger;
+
+    /**
+     * @brief Metrics for recording
+     */
+    udp::metrics m_metrics;
+
+    /// Session metadata attached to every emitted batch (see config::session_metadata).
+    composite::metadata_ptr m_session_metadata;
+
+    std::atomic<uint64_t> m_pkts_recvd{0};      ///< Total packets received
 
 }; // class interface
 

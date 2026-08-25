@@ -1,2 +1,25 @@
-*build*
+build*/
 .vscode
+CLAUDE.md
+
+# CMake generated files that sometimes end up in source directories
+Makefile
+cmake_install.cmake
+CMakeCache.txt
+CMakeFiles/
+
+# Compiled binaries
+*.o
+*.so
+*.a
+*.exe
+*_test
+*_tests
+*_benchmark
+*_benchmarks
+
+# Exclude test/benchmark executables that might be built in-tree
+src/**/tests/*_test
+src/**/tests/*_tests
+src/**/tests/*_benchmark
+src/**/tests/*_benchmarks

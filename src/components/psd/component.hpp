@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -17,58 +17,79 @@
  * along with this program. If not, see http://www.gnu.org/licenses/.
  */
 
+#pragma once
+
 #include "work.hpp"
 
-#include <aligned_mem.hpp>
-#include <task_queue.hpp>
-#include <windows.hpp>
+#include <composite/core/pipeline_component.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/buffers/aligned_mem.hpp>
+#include <composite/metrics/metrics.hpp>
+#include <composite/properties/snapshot.hpp>
 
-#include <composite/component.hpp>
+#include <atomic>
 #include <complex>
-#include <immintrin.h>
+#include <cstdint>
 #include <memory>
+#include <string>
 
+// psd is a pipeline_component: the framework worker ingests in order and the slot ring re-
+// serialises output to submission order, while the parallel PSD runs on a worker pool. Its window
+// is DATA-DRIVEN (rebuilt from each packet's fft_size/fft_window metadata), so work() builds and
+// caches the window PER POOL WORKER (keyed by size+type, like fft's thread_local plan) and derives
+// the normalization constant locally from the window + the packet's sample_rate + the
+// power_based_normalization config snapshot — no shared mutable window/work state.
 template <typename T>
-class psd : public composite::component {
-    using fft_t = aligned::aligned_mem<std::complex<T>>;
-    using psd_t = aligned::aligned_mem<T>;
-    using window_t = aligned::aligned_mem<T>;
-    using input_t = std::unique_ptr<fft_t>;
-    using input_port_t = composite::input_port<input_t>;
-    using output_t = std::unique_ptr<psd_t>;
-    using output_port_t = composite::output_port<output_t>;
-    using output_tuple_t = std::tuple<output_t, composite::timestamp, std::optional<composite::metadata>>;
+class psd : public composite::pipeline_component<composite::immutable_buffer<std::complex<T>>, composite::mutable_buffer<T>> {
+    using base = composite::pipeline_component<composite::immutable_buffer<std::complex<T>>, composite::mutable_buffer<T>>;
+    using window_t = composite::aligned_mem<T>;
+
 public:
-    psd();
+    explicit psd(std::string_view id);
     ~psd() override = default;
 
-    auto property_change_handler() -> void override;
-    auto initialize() -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
-    auto process() -> composite::retval override;
+    auto property_change_handler(const composite::properties::json& diff) -> void override;
+
+protected:
+    // ARRIVAL order, main thread: record the (snapshot) normalization mode onto the metadata.
+    auto prepare(composite::metadata& md) -> void override;
+
+    // The parallel stage (pool worker): build/lookup the window for this packet's fft params,
+    // compute its norm const, and run the PSD. Per-worker state lives in work() (thread_local).
+    // Input is immutable (psd only reads it, producing a fresh real output) so it connects
+    // zero-copy to fft's immutable_buffer output.
+    auto work(composite::immutable_buffer<std::complex<T>> in, composite::timestamp ts,
+              const composite::metadata& md) -> composite::mutable_buffer<T> override;
 
 private:
-    auto calculate_norm_const() const -> T;
-    auto create_worker(T norm_const) -> void;
+    /// Normalization constant for a given window + sample rate + mode. Pure (no member state) so
+    /// it is safe to call from any pool worker. norm = 1 / (sample_rate * sum(window^2)[/size]).
+    /// With no window, energy mode uses the implicit rectangular window's sum(w^2) = N
+    /// (@p spectrum_size); power mode's factor is exactly 1 either way.
+    static auto compute_norm_const(const window_t* window, T sample_rate, bool power_based,
+                                   std::size_t spectrum_size) -> T;
 
-    // Ports
-    input_port_t m_in_port{"data_in"};
-    output_port_t m_out_port{"data_out"};
+    /// Actual pool size, recorded by the framework's resize hook (main worker, pool idle) and
+    /// read in work() to divide the component-wide output-pool budget across workers.
+    auto on_workers_resized(int n) -> void override;
+    std::atomic<int> m_active_workers{1};
 
-    // Properties
-    uint32_t m_num_workers{1};
+    // Properties (num_workers is owned by pipeline_component). power_based_normalization is written
+    // by the engine under park; work() (pool threads, not parked) reads the published snapshot.
     bool m_power_based_normalization{true};
+    composite::snapshot<bool> m_pbn{true};
 
-    // Members
-    composite::metadata m_metadata;
-    std::unique_ptr<window_t> m_window;
-    work<T> m_work;
-    T m_sample_rate{};
-    std::deque<std::future<output_tuple_t>> m_futures;
-    std::mutex m_mtx;
-    std::condition_variable m_cv;
-    std::jthread m_input_thread;
-    task_queue m_task_queue;
+    // Observability: packets whose fft_size annotation was present but unparseable (a malformed
+    // upstream metadata that would otherwise silently fall back to a no-window PSD). In the shared
+    // registry, labeled by component id; auto-removed by ~component.
+    composite::metrics::counter<uint64_t>* m_bad_metadata{nullptr};
+
+    // MUST be last: stops the pipeline (main worker + pool) before any member above destructs, so
+    // a pool worker in work() (reading m_pbn) can't touch freed state. See component.hpp auto_stop.
+    composite::component::auto_stop m_auto_stop{*this};
 
 }; // class psd
+
+// Explicit template instantiations (defined in component.cpp)
+extern template class psd<float>;
+extern template class psd<double>;

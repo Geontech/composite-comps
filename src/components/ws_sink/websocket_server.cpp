@@ -20,12 +20,12 @@
 #include "websocket_server.hpp"
 
 #include <ixwebsocket/IXWebSocketServer.h>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <pthread.h>
 #include <queue>
 #include <shared_mutex>
-#include <spdlog/spdlog.h>
 #include <thread>
 #include <unordered_map>
 
@@ -38,29 +38,29 @@ struct queued_message {
 // WebSocket session implementation using IXWebSocket
 class websocket_session_impl : public websocket_session {
   public:
-    websocket_session_impl(std::shared_ptr<ix::WebSocket> socket, const std::string& id)
-        : m_socket(std::move(socket)), m_id(id) {
-        // Start worker thread (jthread auto-joins on destruction)
+    websocket_session_impl(std::shared_ptr<ix::WebSocket> socket, const std::string& id,
+                           std::shared_ptr<composite::logger> logger)
+        : m_id(id), m_socket(std::move(socket)), m_logger(std::move(logger)) {
+        // Start worker thread (declared as the LAST member so it is destroyed —
+        // stopped and joined — before the members it uses)
         m_worker_thread = std::jthread([this](std::stop_token stoken) { worker_loop(stoken); });
     }
 
-    ~websocket_session_impl() = default;
+    ~websocket_session_impl() override = default;
 
     auto get_id() const -> std::string override {
         return m_id;
     }
 
     auto send(message_data_t data, bool is_binary) -> void override {
-        size_t queue_size;
-        {
-            std::lock_guard lock(m_queue_mutex);
-            m_send_queue.push({std::move(data), is_binary});
-            queue_size = m_send_queue.size();
-            m_queue_cv.notify_one();
+        std::lock_guard lock(m_queue_mutex);
+        m_send_queue.push({std::move(data), is_binary});
+        // Publish the size while still holding the lock: published out of order, a
+        // stale (smaller) size would overwrite a fresher one and mask backpressure.
+        if (m_queue_size_callback) {
+            m_queue_size_callback(m_id, m_send_queue.size());
         }
-
-        // Update queue size for backpressure detection
-        m_queue_size_callback(m_id, queue_size);
+        m_queue_cv.notify_one();
     }
 
     auto close() -> void override {
@@ -69,8 +69,23 @@ class websocket_session_impl : public websocket_session {
         }
     }
 
-    auto set_queue_size_callback(std::function<void(const std::string&, size_t)> callback) -> void {
+    auto set_queue_size_callback(queue_size_callback_t callback) -> void override {
         m_queue_size_callback = std::move(callback);
+    }
+
+    // Stop and join the send worker. MUST be called before the underlying
+    // ix::WebSocket is destroyed (IXWebSocket owns it and frees it when the
+    // connection thread returns): the worker sends through a non-owning pointer,
+    // so an unjoined worker would use-after-free. Closing the socket first
+    // unblocks a worker stuck mid-send to a wedged peer.
+    auto shutdown() -> void {
+        m_worker_thread.request_stop();
+        if (m_socket) {
+            m_socket->close();
+        }
+        if (m_worker_thread.joinable()) {
+            m_worker_thread.join();
+        }
     }
 
   private:
@@ -82,7 +97,6 @@ class websocket_session_impl : public websocket_session {
 
         while (!stoken.stop_requested()) {
             queued_message msg;
-            size_t queue_size;
 
             // Wait for message or shutdown signal
             {
@@ -99,7 +113,11 @@ class websocket_session_impl : public websocket_session {
 
                 msg = std::move(m_send_queue.front());
                 m_send_queue.pop();
-                queue_size = m_send_queue.size();
+                // Publish the post-pop size under the lock (see send()); the message
+                // still in flight below is accounted as already dequeued.
+                if (m_queue_size_callback) {
+                    m_queue_size_callback(m_id, m_send_queue.size());
+                }
             }
 
             // Send without holding lock (this may block)
@@ -112,16 +130,13 @@ class websocket_session_impl : public websocket_session {
                         m_socket->sendText(str);
                     }
                 } else {
+                    // Zero-copy wrap; the shared_ptr keeps the bytes alive for the call.
                     auto& vec = std::get<std::shared_ptr<const std::vector<uint8_t>>>(msg.data);
-                    std::string binary_str(reinterpret_cast<const char*>(vec->data()), vec->size());
-                    m_socket->sendBinary(binary_str);
+                    m_socket->sendBinary(ix::IXWebSocketSendData(*vec));
                 }
             } catch (const std::exception& e) {
-                spdlog::error("WebSocket send error for client {}: {}", m_id, e.what());
+                m_logger->error("WebSocket send error for client {}: {}", m_id, e.what());
             }
-
-            // Update queue size for backpressure (outside lock)
-            m_queue_size_callback(m_id, queue_size);
         }
     }
 
@@ -130,23 +145,30 @@ class websocket_session_impl : public websocket_session {
     std::queue<queued_message> m_send_queue;
     std::mutex m_queue_mutex;
     std::condition_variable_any m_queue_cv;
+    queue_size_callback_t m_queue_size_callback;
+    std::shared_ptr<composite::logger> m_logger;
+    // MUST be last: the jthread joins in ~websocket_session_impl before the members
+    // the worker loop reads (queue, callback, logger) are destroyed.
     std::jthread m_worker_thread;
-    std::function<void(const std::string&, size_t)> m_queue_size_callback;
 };
 
 // Server implementation using IXWebSocket
 class websocket_server_impl {
   public:
-    websocket_server_impl() {
-        m_server = std::make_unique<ix::WebSocketServer>(8080, "0.0.0.0");
-    }
+    websocket_server_impl() = default;
 
     ~websocket_server_impl() {
         stop();
     }
 
-    auto start(uint16_t port, const std::string& bind_address, bool enable_compression) -> void {
-        m_server = std::make_unique<ix::WebSocketServer>(port, bind_address);
+    auto start(uint16_t port, const std::string& bind_address, bool enable_compression,
+               size_t max_connections) -> void {
+        m_stopping.store(false, std::memory_order_release);
+        // Cap connections at the accept layer too (IXWebSocket's own default is 128,
+        // which would otherwise silently override a larger configured limit).
+        m_server = std::make_unique<ix::WebSocketServer>(port, bind_address,
+                                                         ix::SocketServer::kDefaultTcpBacklog,
+                                                         max_connections);
 
         // Configure per-message deflate compression
         if (!enable_compression) {
@@ -163,13 +185,13 @@ class websocket_server_impl {
                 } else if (msg->type == ix::WebSocketMessageType::Message) {
                     on_message(connectionState, msg->str);
                 } else if (msg->type == ix::WebSocketMessageType::Error) {
-                    spdlog::error("WebSocket error: {}", msg->errorInfo.reason);
+                    m_logger->error("WebSocket error: {}", msg->errorInfo.reason);
                 } else if (msg->type == ix::WebSocketMessageType::Ping) {
                     // Ping frames are auto-handled by IXWebSocket
-                    spdlog::trace("Received ping from client");
+                    m_logger->trace("Received ping from client");
                 } else if (msg->type == ix::WebSocketMessageType::Pong) {
                     // Pong frames are auto-handled by IXWebSocket
-                    spdlog::trace("Received pong from client");
+                    m_logger->trace("Received pong from client");
                 }
             });
 
@@ -179,12 +201,31 @@ class websocket_server_impl {
         }
 
         m_server->start();
-        spdlog::info("WebSocket server listening on {}:{}", bind_address, port);
+        m_logger->info("WebSocket server listening on {}:{}", bind_address, port);
     }
 
     auto stop() -> void {
+        m_stopping.store(true, std::memory_order_release);
+        // Join every session send-worker BEFORE stopping the ix server: server stop
+        // destroys the per-connection sockets, and a worker mid-send through its
+        // non-owning pointer would use-after-free.
+        std::unordered_map<std::string, std::shared_ptr<websocket_session_impl>> sessions;
+        {
+            std::unique_lock lock(m_sessions_mutex);
+            sessions.swap(m_sessions);
+        }
+        for (auto& [id, session] : sessions) {
+            session->shutdown();
+        }
         if (m_server) {
             m_server->stop();
+            m_server.reset();
+        }
+    }
+
+    auto set_logger(std::shared_ptr<composite::logger> logger) -> void {
+        if (logger) {
+            m_logger = std::move(logger);
         }
     }
 
@@ -215,11 +256,19 @@ class websocket_server_impl {
   private:
     auto on_open(std::shared_ptr<ix::ConnectionState> connectionState, ix::WebSocket& webSocket)
         -> void {
-        std::string client_id = std::to_string(reinterpret_cast<uintptr_t>(connectionState.get()));
+        if (m_stopping.load(std::memory_order_acquire)) {
+            webSocket.close();
+            return;
+        }
+        // IXWebSocket's connection id: a process-wide monotonic counter, so ids are
+        // never reused (an address-derived id could alias a recycled allocation and
+        // cross-wire two clients' state).
+        std::string client_id = connectionState->getId();
 
-        // Create wrapped socket
+        // Create wrapped socket (non-owning: the server owns the ix::WebSocket; the
+        // session's shutdown() runs before it is destroyed — see on_close/stop)
         auto socket_ptr = std::shared_ptr<ix::WebSocket>(&webSocket, [](ix::WebSocket*) {});
-        auto session = std::make_shared<websocket_session_impl>(socket_ptr, client_id);
+        auto session = std::make_shared<websocket_session_impl>(socket_ptr, client_id, m_logger);
 
         // Set queue size callback
         session->set_queue_size_callback(m_queue_size_callback);
@@ -233,36 +282,48 @@ class websocket_server_impl {
         // Notify connect handler
         m_connect_handler(session);
 
-        spdlog::debug("Client {} connected", client_id);
+        m_logger->debug("Client {} connected", client_id);
     }
 
     auto on_close(std::shared_ptr<ix::ConnectionState> connectionState) -> void {
-        std::string client_id = std::to_string(reinterpret_cast<uintptr_t>(connectionState.get()));
+        std::string client_id = connectionState->getId();
 
+        std::shared_ptr<websocket_session_impl> session;
         {
             std::unique_lock lock(m_sessions_mutex);
-            m_sessions.erase(client_id);
+            if (auto it = m_sessions.find(client_id); it != m_sessions.end()) {
+                session = std::move(it->second);
+                m_sessions.erase(it);
+            }
+        }
+        if (session) {
+            // Join the session's send worker NOW, outside the sessions lock but before
+            // this connection thread returns and IXWebSocket destroys the socket.
+            session->shutdown();
         }
 
         m_disconnect_handler(client_id);
 
-        spdlog::debug("Client {} disconnected", client_id);
+        m_logger->debug("Client {} disconnected", client_id);
     }
 
     auto on_message(std::shared_ptr<ix::ConnectionState> connectionState,
                     const std::string& message) -> void {
-        std::string client_id = std::to_string(reinterpret_cast<uintptr_t>(connectionState.get()));
-        m_message_handler(client_id, message);
+        m_message_handler(connectionState->getId(), message);
     }
 
     std::unique_ptr<ix::WebSocketServer> m_server;
     std::unordered_map<std::string, std::shared_ptr<websocket_session_impl>> m_sessions;
     std::shared_mutex m_sessions_mutex;
+    std::atomic<bool> m_stopping{false}; // reject connections racing a stop()
 
     websocket_server::connect_handler_t m_connect_handler;
     websocket_server::disconnect_handler_t m_disconnect_handler;
     websocket_server::message_handler_t m_message_handler;
     websocket_server::queue_size_callback_t m_queue_size_callback;
+
+    // No-op by default so an unconfigured server never dereferences null.
+    std::shared_ptr<composite::logger> m_logger = std::make_shared<composite::logger>();
 };
 
 // ========== websocket_server public API ==========
@@ -272,9 +333,13 @@ websocket_server::websocket_server() : m_impl(std::make_unique<websocket_server_
 
 websocket_server::~websocket_server() = default;
 
+auto websocket_server::set_logger(std::shared_ptr<composite::logger> logger) -> void {
+    m_impl->set_logger(std::move(logger));
+}
+
 auto websocket_server::start(uint16_t port, const std::string& bind_address,
-                             bool enable_compression) -> void {
-    m_impl->start(port, bind_address, enable_compression);
+                             bool enable_compression, size_t max_connections) -> void {
+    m_impl->start(port, bind_address, enable_compression, max_connections);
 }
 
 auto websocket_server::stop() -> void {

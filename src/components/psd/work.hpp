@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2024 Geon Technologies, LLC
+ * Copyright (C) 2024-2025 Geon Technologies, LLC
  *
  * This file is part of composite-comps.
  *
@@ -19,13 +19,15 @@
 
 #pragma once
 
-#include <aligned_mem.hpp>
+#include <composite/buffers/buffer.hpp>
+#include <composite/buffers/aligned_mem.hpp>
 
 #include <atomic>
 #include <complex>
 #include <immintrin.h>
 #include <limits>
 #include <numeric>
+#include "simd_fmv.hpp"
 
 /*
  * =====================================================================================
@@ -93,8 +95,9 @@ class work {};
 
 template <>
 class work<float> {
-    using cplx_data_type = aligned::aligned_mem<std::complex<float>>;
-    using real_data_type = aligned::aligned_mem<float>;
+    using cplx_data_type = composite::immutable_buffer<std::complex<float>>;
+    using real_data_type = composite::mutable_buffer<float>;
+    static constexpr std::size_t ALIGNMENT = 64;
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(float)};
     static constexpr auto STRIDE_512 = std::size_t{512u / 8u / sizeof(float)};
     static constexpr auto log_const = 3.010299956639812f; // 10.f / std::log2f(10.f);
@@ -112,28 +115,27 @@ public:
     explicit work(float normalization_const) : m_norm_const(normalization_const) {}
 
     auto norm_const() const noexcept -> float {
-        return m_norm_const.load();
+        return m_norm_const;
     }
 
     auto norm_const(float val) -> void {
-        m_norm_const.store(val);
+        m_norm_const = val;
     }
 
-    [[gnu::target("default")]]
-    auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
-        // Make output data
-        auto psd = aligned::make_aligned<float>(data->alignment(), data->size());
-        // Process data
-        for (auto i=0u; i<data->size(); ++i) {
-            const auto& val = data->at(i);
+    // The caller owns the output buffer (pooled or heap; see psd::work): every version
+    // writes exactly data.size() values into @p psd.
+    COMPS_FMV_DEFAULT
+    auto process(const cplx_data_type& data, float* psd) -> void {
+        for (auto i = 0u; i < data.size(); ++i) {
+            const auto& val = data[i];
             const auto power = val.real() * val.real() + val.imag() * val.imag();
-            psd->at(i) = log_const * std::log2f(m_norm_const * power);
+            psd[i] = log_const * std::log2f(m_norm_const * power);
         }
-        return psd;
     }
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f")]]
-    auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
+    auto process(const cplx_data_type& data, float* psd) -> void {
         // Constant registers
         static const auto unscramble_idx = _mm512_set_epi32(15,14,11,10,7,6,3,2,13,12,9,8,5,4,1,0);
         static const auto v_log_const = _mm512_set1_ps(log_const);
@@ -150,15 +152,15 @@ public:
         static const auto v_neg_inf = _mm512_set1_ps(-std::numeric_limits<float>::infinity());
         static const auto v_nan = _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN());
         const auto v_norm_const = _mm512_set1_ps(m_norm_const);
+        const auto norm_const_scalar = m_norm_const;
 
-        // Make output data
-        auto psd = aligned::make_aligned<float>(data->alignment(), data->size());
-
-        // Process data
-        for (auto i=0u; i < data->size(); i += STRIDE_512) {
+        // Process data in SIMD chunks
+        const auto simd_end = data.size() - (data.size() % STRIDE_512);
+        std::size_t i = 0;
+        for (; i < simd_end; i += STRIDE_512) {
             // Load 16 complex numbers = 32 floats from data, starting at index i
-            auto a = _mm512_loadu_ps(data->data() + i);                   // [r0, i0, r1, i1, r2, i2, r3, i3, r4, i4, r5, i5, r6, i6, r7, i7]
-            auto b = _mm512_loadu_ps(data->data() + i + STRIDE_512 / 2u); // [r8, i8, r9, i9, r10, i10, r11, i11, r12, i12, r13, i13, r14, i14, r15, i15]
+            auto a = _mm512_loadu_ps(reinterpret_cast<const float*>(data.data() + i));                   // [r0, i0, r1, i1, r2, i2, r3, i3, r4, i4, r5, i5, r6, i6, r7, i7]
+            auto b = _mm512_loadu_ps(reinterpret_cast<const float*>(data.data() + i + STRIDE_512 / 2u)); // [r8, i8, r9, i9, r10, i10, r11, i11, r12, i12, r13, i13, r14, i14, r15, i15]
             // Shuffle to split real/imag
             auto real = _mm512_shuffle_ps(a, b, 0x88); // real: [r0, r1, r8, r9, r2, r3, r10, r11, r4, r5, r12, r13, r6, r7, r14, r15]
             auto imag = _mm512_shuffle_ps(a, b, 0xDD); // imag: [i0, i1, i8, i9, i2, i3, i10, i11, i4, i5, i12, i13, i6, i7, i14, i15]
@@ -218,14 +220,21 @@ public:
             v_res = _mm512_mul_ps(v_res, v_log_const);
 
             // Store result into psd
-            _mm512_store_ps(psd->data() + i, v_res);
+            _mm512_storeu_ps(psd + i, v_res);
         }
 
-        return psd;
+        // Handle remainder with scalar code
+        for (; i < data.size(); ++i) {
+            const auto& val = data[i];
+            const auto power = val.real() * val.real() + val.imag() * val.imag();
+            psd[i] = log_const * std::log2f(norm_const_scalar * power);
+        }
     }
+#endif
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx2,fma")]]
-    auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
+    auto process(const cplx_data_type& data, float* psd) -> void {
         // Constant registers
         static const auto unscramble_idx_256 = _mm256_set_epi32(7,6,3,2,5,4,1,0);
         static const auto v_log_const_256 = _mm256_set1_ps(log_const);
@@ -242,15 +251,15 @@ public:
         static const auto v_neg_inf_256 = _mm256_set1_ps(-std::numeric_limits<float>::infinity());
         static const auto v_nan_256 = _mm256_set1_ps(std::numeric_limits<float>::quiet_NaN());
         const auto v_norm_const_256 = _mm256_set1_ps(m_norm_const);
+        const auto norm_const_scalar = m_norm_const;
 
-        // Make output data
-        auto psd = aligned::make_aligned<float>(data->alignment(), data->size());
-
-        // Process data
-        for (auto i=0u; i < data->size(); i += STRIDE_256) {
-            // Load 16 complex numbers = 32 floats from data, starting at index i
-            auto a = _mm256_loadu_ps(reinterpret_cast<const float*>(data->data() + i));                   // [r0, i0, r1, i1, r2, i2, r3, i3]
-            auto b = _mm256_loadu_ps(reinterpret_cast<const float*>(data->data() + i + STRIDE_256 / 2u)); // [r4, i4, r5, i5, r6, i6, r7, i7]
+        // Process data in SIMD chunks
+        const auto simd_end = data.size() - (data.size() % STRIDE_256);
+        std::size_t i = 0;
+        for (; i < simd_end; i += STRIDE_256) {
+            // Load 8 complex numbers = 16 floats from data, starting at index i
+            auto a = _mm256_loadu_ps(reinterpret_cast<const float*>(data.data() + i));                   // [r0, i0, r1, i1, r2, i2, r3, i3]
+            auto b = _mm256_loadu_ps(reinterpret_cast<const float*>(data.data() + i + STRIDE_256 / 2u)); // [r4, i4, r5, i5, r6, i6, r7, i7]
             // Shuffle to split real/imag
             auto real = _mm256_shuffle_ps(a, b, 0x88); // real: [r0, r1, r4, r5, r2, r3, r6, r7]
             auto imag = _mm256_shuffle_ps(a, b, 0xDD); // imag: [i0, i1, i4, i5, i2, i3, i6, i7]
@@ -294,25 +303,33 @@ public:
             v_res = _mm256_mul_ps(v_res, v_log_const_256);
 
             // Store result into psd
-            _mm256_store_ps(psd->data() + i, v_res);
+            _mm256_storeu_ps(psd + i, v_res);
         }
-        return psd;
+
+        // Handle remainder with scalar code
+        for (; i < data.size(); ++i) {
+            const auto& val = data[i];
+            const auto power = val.real() * val.real() + val.imag() * val.imag();
+            psd[i] = log_const * std::log2f(norm_const_scalar * power);
+        }
     }
+#endif
 
 private:
-    std::atomic<float> m_norm_const{1};
+    float m_norm_const{1};
 
-}; // class psd_work<float>
+}; // class work<float>
 
 template <>
 class work<double> {
-    using cplx_data_type = aligned::aligned_mem<std::complex<double>>;
-    using real_data_type = aligned::aligned_mem<double>;
+    using cplx_data_type = composite::immutable_buffer<std::complex<double>>;
+    using real_data_type = composite::mutable_buffer<double>;
+    static constexpr std::size_t ALIGNMENT = 64;
     static constexpr auto STRIDE_256 = std::size_t{256u / 8u / sizeof(double)};
     static constexpr auto STRIDE_512 = std::size_t{512u / 8u / sizeof(double)};
-    static constexpr auto log_const = 3.010299956639812; // 10. / std::log2f(10.);
+    static constexpr auto log_const = 3.010299956639812; // 10. / std::log2(10.);
     // Pre-calculated coefficients for the polynomial P(w)
-    // C_k = 2.0f / (log(2.0f) * (2*k + 1))
+    // C_k = 2.0 / (log(2.0) * (2*k + 1))
     static constexpr auto C0 = 2.88539008178;
     static constexpr auto C1 = 0.96179669392;
     static constexpr auto C2 = 0.57707801635;
@@ -325,28 +342,27 @@ public:
     explicit work(double normalization_const) : m_norm_const(normalization_const) {}
 
     auto norm_const() const noexcept -> double {
-        return m_norm_const.load();
+        return m_norm_const;
     }
 
     auto norm_const(double val) -> void {
-        m_norm_const.store(val);
+        m_norm_const = val;
     }
 
-    [[gnu::target("default")]]
-    auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
-        // Make output data
-        auto psd = aligned::make_aligned<double>(data->alignment(), data->size());
-        // Process data
-        for (auto i=0u; i<data->size(); ++i) {
-            const auto& val = data->at(i);
+    // The caller owns the output buffer (pooled or heap; see psd::work): every version
+    // writes exactly data.size() values into @p psd.
+    COMPS_FMV_DEFAULT
+    auto process(const cplx_data_type& data, double* psd) -> void {
+        for (auto i = 0u; i < data.size(); ++i) {
+            const auto& val = data[i];
             const auto power = val.real() * val.real() + val.imag() * val.imag();
-            psd->at(i) = log_const * std::log2(m_norm_const * power);
+            psd[i] = log_const * std::log2(m_norm_const * power);
         }
-        return psd;
     }
 
+#if COMPS_FMV_ENABLED
     [[gnu::target("avx512f,avx512dq")]]
-    auto process(cplx_data_type* data) -> std::unique_ptr<real_data_type> {
+    auto process(const cplx_data_type& data, double* psd) -> void {
         // Constant registers
         static const auto unscramble_idx = _mm512_set_epi64(7,5,3,1,6,4,2,0);
         static const auto v_log_const = _mm512_set1_pd(log_const);
@@ -363,15 +379,15 @@ public:
         static const auto v_neg_inf = _mm512_set1_pd(-std::numeric_limits<double>::infinity());
         static const auto v_nan = _mm512_set1_pd(std::numeric_limits<double>::quiet_NaN());
         const auto v_norm_const = _mm512_set1_pd(m_norm_const);
+        const auto norm_const_scalar = m_norm_const;
 
-        // Make output data
-        auto psd = aligned::make_aligned<double>(data->alignment(), data->size());
-
-        // Process data
-        for (auto i=0u; i < data->size(); i += STRIDE_512) {
-            // Load 8 complex numbers = 16 floats from data, starting at index i
-            auto a = _mm512_loadu_pd(data->data() + i);                   // [r0, i0, r1, i1, r2, i2, r3, i3]
-            auto b = _mm512_loadu_pd(data->data() + i + STRIDE_512 / 2u); // [r4, i4, r5, i5, r6, i6, r7, i7]
+        // Process data in SIMD chunks
+        const auto simd_end = data.size() - (data.size() % STRIDE_512);
+        std::size_t i = 0;
+        for (; i < simd_end; i += STRIDE_512) {
+            // Load 8 complex numbers = 16 doubles from data, starting at index i
+            auto a = _mm512_loadu_pd(reinterpret_cast<const double*>(data.data() + i));                   // [r0, i0, r1, i1, r2, i2, r3, i3]
+            auto b = _mm512_loadu_pd(reinterpret_cast<const double*>(data.data() + i + STRIDE_512 / 2u)); // [r4, i4, r5, i5, r6, i6, r7, i7]
             // Shuffle to split real/imag
             auto real = _mm512_shuffle_pd(a, b, 0x00); // real: [r0, r4, r1, r5, r2, r6, r3, r7]
             auto imag = _mm512_shuffle_pd(a, b, 0xFF); // imag: [i0, i4, i1, i5, i2, i6, i3, i7]
@@ -414,13 +430,19 @@ public:
             v_res = _mm512_mul_pd(v_res, v_log_const);
 
             // Store result into psd
-            _mm512_store_pd(psd->data() + i, v_res);
+            _mm512_storeu_pd(psd + i, v_res);
         }
 
-        return psd;
+        // Handle remainder with scalar code
+        for (; i < data.size(); ++i) {
+            const auto& val = data[i];
+            const auto power = val.real() * val.real() + val.imag() * val.imag();
+            psd[i] = log_const * std::log2(norm_const_scalar * power);
+        }
     }
+#endif
 
 private:
-    std::atomic<double> m_norm_const{1};
+    double m_norm_const{1};
 
-}; // class psd_work<double>
+}; // class work<double>

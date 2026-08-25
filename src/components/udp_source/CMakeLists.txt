@@ -17,44 +17,50 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.20)
-project(udp_source VERSION 0.1.0 LANGUAGES CXX)
-include(GNUInstallDirs)
-
-# Set the C++ version required
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Set compile flags
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-add_compile_options(-march=x86-64-v2 -mtune=generic)
-
-# Library
-add_library(udp_source MODULE
+set(UDP_SOURCE_SRCS
     component.cpp
     socket/packet_mmap.cpp
     socket/recvmmsg.cpp
-    helpers.cpp
-    pmr/ring_resource.cpp
+    net/utils.cpp
 )
-# Includes
-target_include_directories(udp_source
-    PRIVATE
-    ${vrtgen_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}
+
+# The DPDK backend is gated on the framework having been built with DPDK; the
+# probe (and the libdpdk pkg-config lookup) lives in cmake/CompsDependencies.cmake.
+if(COMPS_HAS_DPDK)
+    list(APPEND UDP_SOURCE_SRCS
+        socket/dpdk.cpp
+        socket/igmp.cpp
+    )
+endif()
+
+# NOTE: udp_source carried ${vrtgen_SOURCE_DIR}/include for no reason -- there is
+# not a single vrtgen reference anywhere under this component. It links no vrtgen.
+comps_add_component(udp_source
+    SOURCES  ${UDP_SOURCE_SRCS}
+    SYSTEM_INCLUDES $<$<BOOL:${COMPS_HAS_DPDK}>:${DPDK_INCLUDE_DIRS}>
+    LINK     $<$<BOOL:${COMPS_HAS_DPDK}>:${DPDK_LIBRARIES}>
+    DEFINES  $<$<BOOL:${COMPS_HAS_DPDK}>:COMPOSITE_HAS_DPDK=1>
+    LTO_RELEASE
 )
-# Link
-target_link_libraries(udp_source
-    PRIVATE
-    composite::composite
-    spdlog::spdlog_header_only
-)
-# Install
-install(TARGETS udp_source
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
+
+if(COMPS_HAS_DPDK)
+    target_link_directories(udp_source_objs PUBLIC ${DPDK_LIBRARY_DIRS})
+
+    # DPDK's headers cannot satisfy a pedantic C++ build: flexible array members, compound
+    # literals, anonymous structs, a zero-size array member not at the end of a struct, and
+    # volatile increments in rte_spinlock.h.
+    #
+    # Relaxing these two flags on exactly the two translation units that include DPDK is the fix,
+    # NOT marking the include directory SYSTEM. SYSTEM_INCLUDES is still right in principle, but it
+    # cannot be relied on here: measured in the Rocky 9 / GCC 14 toolchain the images actually ship,
+    # DPDK's include dir arrives as a plain -I and CMake emits no -isystem for it at all. And even
+    # where -isystem does apply, GCC still reports -Wpedantic diagnostics from system headers.
+    # -Wall and -Wextra still apply to this code; the other 22 component TUs keep -Wpedantic.
+    set_source_files_properties(socket/dpdk.cpp socket/igmp.cpp
+        TARGET_DIRECTORY udp_source_objs
+        PROPERTIES COMPILE_OPTIONS "-Wno-pedantic;-Wno-volatile")
+endif()
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

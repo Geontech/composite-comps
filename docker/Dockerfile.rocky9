@@ -1,56 +1,88 @@
-FROM rockylinux:9-minimal AS base
+# syntax=docker/dockerfile:1.7
+#
+# The official component fleet image.
+#
+# It is built ON the published framework images and does NOT compile the framework itself: the
+# fleet must be compiled against the exact published SDK and run on the exact published runtime,
+# so the framework ABI in the image is provably the reviewed one. Pass digests for a release build
+# (`composite:0.5.0-devel@sha256:...`); tags are fine for local work.
+ARG COMPOSITE_DEVEL_IMAGE=geontech/composite:0.5.0-devel
+ARG COMPOSITE_RUNTIME_IMAGE=geontech/composite:0.5.0
 
-LABEL maintainer="Geon Technologies" \
-      description="composite-based components"
+FROM ${COMPOSITE_DEVEL_IMAGE} AS builder
 
-RUN microdnf -y update && microdnf -y upgrade
+# The SDK image runs as a non-root user; installing the fleet's own build dependencies needs root.
+USER root
+RUN microdnf install -y --enablerepo=crb fftw-devel openssl-devel zlib-devel \
+    && microdnf clean all
 
-RUN adduser -s /bin/bash composite-dev
+WORKDIR /src
+COPY . .
 
-FROM base AS build
+# The `install` preset is the same configuration CI qualifies: Release, tests off, warnings as
+# errors, and COMPS_REQUIRE_EXACT_COMPOSITE=ON so the image cannot be built against a framework
+# nobody chose. Only CMAKE_INSTALL_PREFIX is overridden.
+RUN cmake --preset install -G Ninja -DCMAKE_INSTALL_PREFIX=/usr/local \
+    && cmake --build build/install --parallel \
+    && cmake --install build/install --prefix /opt/comps/runtime --component Runtime
 
-RUN set -ex; \
-    microdnf install -y gcc-toolset-13-gcc-c++; \
-    microdnf install -y cmake; \
-    microdnf install -y git; \
-    microdnf install -y vim; \
-    microdnf install -y gdb; \
-    microdnf install -y fftw-devel; \
-    microdnf install -y openssl-devel;
+# Hard paths on purpose: the images redistribute compiled code from these dependencies, so if one
+# stops being vendored the build fails here rather than publishing an image with a missing notice.
+RUN install -D -m0644 /src/build/install/_deps/ixwebsocket-src/LICENSE.txt \
+        /opt/comps/licenses/ixwebsocket/LICENSE.txt \
+    && install -D -m0644 /src/build/install/_deps/vrtgen-src/LICENSE \
+        /opt/comps/licenses/vrtgen/LICENSE
 
-FROM build AS project
+FROM ${COMPOSITE_RUNTIME_IMAGE} AS runtime
 
-COPY cmake /opt/composite-comps/cmake
-COPY include /opt/composite-comps/include
-COPY src /opt/composite-comps/src
-COPY CMakeLists.txt /opt/composite-comps
-WORKDIR /opt/composite-comps
+ARG IMAGE_CREATED
+ARG IMAGE_REVISION
+ARG IMAGE_VERSION=0.1.0
+ARG IMAGE_SOURCE=https://github.com/geontech/composite-comps
+ARG COMPOSITE_VERSION=0.5.0
 
-RUN set -ex; \
-    . /opt/rh/gcc-toolset-13/enable; \
-    cmake -B docker-build \
-        -DCOMPOSITE_MODULE_RPATH_VALUE=/usr/local/lib64 \
-        -DCOMPOSITE_USE_NATS=OFF \
-        -DCOMPOSITE_INSTALL=ON \
-        -DCMAKE_INSTALL_PREFIX=/opt/usr/local \
-        -DCMAKE_BUILD_TYPE=Release; \
-    cmake --build docker-build --target install --parallel 4
+# The framework base sets its own name/version/description labels, and a label can be overwritten
+# but never removed -- left alone they would identify this image as the framework. Restate them,
+# and record the framework pairing so it is readable from a pulled image without running it: the
+# fleet versions independently of the framework, so the tag cannot imply it.
+LABEL org.opencontainers.image.title="Composite component fleet" \
+      org.opencontainers.image.description="Official Composite signal-processing components" \
+      org.opencontainers.image.created="${IMAGE_CREATED}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}" \
+      org.opencontainers.image.url="${IMAGE_SOURCE}" \
+      org.opencontainers.image.vendor="Geon Technologies, LLC" \
+      org.opencontainers.image.licenses="LGPL-3.0-or-later" \
+      org.opencontainers.image.authors="Geon Technologies, LLC" \
+      com.geontech.composite.version="${COMPOSITE_VERSION}" \
+      name="composite-comps" \
+      version="${IMAGE_VERSION}" \
+      summary="Official Composite signal-processing components" \
+      vendor="Geon Technologies, LLC" \
+      license="LGPL-3.0-or-later"
 
-FROM base
+USER root
+# Component runtime dependencies only. openssl-libs and zlib are required by ws_sink, which links
+# TLS-enabled IXWebSocket -- the previous image omitted them, so ws_sink could not have loaded.
+RUN microdnf install -y fftw openssl-libs zlib \
+    && microdnf clean all
 
-RUN microdnf install -y libstdc++ fftw openssl-libs tar vim
+COPY --from=builder /opt/comps/runtime/ /usr/local/
+COPY LICENSE /usr/share/licenses/composite-comps/LICENSE
+COPY --from=builder /opt/comps/licenses/ /usr/share/licenses/composite-comps/third-party/
+COPY examples/ /usr/share/composite-comps/examples/
 
-COPY --link --from=project /opt/usr/local /usr/local
-COPY --link --from=project /opt/usr/local/bin/composite-cli /usr/local/bin/composite-cli-priv
-RUN setcap cap_net_raw+ep /usr/local/bin/composite-cli-priv
+RUN ldconfig
 
-COPY examples /usr/local/share/composite/examples
-RUN chmod a+r /usr/local/share/composite/examples/*.json
+# No setcap. packet_mmap and DPDK are deployment choices (`--cap-add NET_RAW`, a future -dpdk
+# flavor), not a privileged binary baked into a public image.
+USER 10001:10001
+WORKDIR /workspace
+EXPOSE 5000
+# ENTRYPOINT ["/usr/local/bin/composite-cli"] is inherited from the framework runtime image.
 
-ENV LD_LIBRARY_PATH=/usr/local/lib64
-ENV BIN_ARGS=""
-
-USER composite-dev
-WORKDIR /home/composite-dev
-
-CMD /usr/local/bin/composite-cli ${BIN_ARGS}
+# CI-only: a minimal graph that instantiates the fleet, for startup / signal / module-load checks.
+FROM runtime AS runtime-smoke
+COPY docker/smoke/ /config/
+CMD ["--server", "0.0.0.0", "/config/smoke.json"]

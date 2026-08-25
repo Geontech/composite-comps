@@ -1,0 +1,632 @@
+# composite-comps CI -- build, ABI/install contract, sanitizer gates, and image publication.
+#
+# GATE ON THE TOOLCHAIN WE SHIP. Every build and test job runs in $CI_TOOLCHAIN_IMAGE: the
+# framework's published SDK image plus fftw-devel (docker/Dockerfile.ci-toolchain). That is
+# deliberate and it matters more here than in the framework, because the fleet's product IS the DSO
+# boundary -- components are MODULE libraries that composite-cli dlopens. Building them with
+# Debian's GCC and loading them into a Rocky 9 / GCC Toolset 14 runtime puts an untested ABI across
+# that boundary, and the create()/composite_abi_version() handshake cannot detect it: it versions
+# the interface, not the libstdc++ the interface was compiled against. The framework hit exactly
+# this (its images shipped Toolset 13 while its CI gated on Debian GCC 14) and fixed it the same way.
+#
+# A TAG PIPELINE PROMOTES, IT DOES NOT REBUILD. Everything except publish:dockerhub is a
+# verification job, and a tag verifies a commit develop already verified. build:container stages the
+# images it blessed in this project's registry; publish:dockerhub re-tags those exact digests to
+# Docker Hub. Rebuilding on the tag would publish bytes nobody tested.
+
+stages:
+  - toolchain
+  - lint
+  - build
+  - sanitize
+  - publish
+
+variables:
+  # The framework release the fleet is qualified against, and the images it is built ON and runs ON.
+  #
+  # 0.5.0 GA. OpenTelemetry and OpenSSL are compiled IN (`composite-cli --features` reports
+  # "opentelemetry, openssl"; the DPDK family adds "dpdk"). The four published tags are:
+  #
+  #   0.5.0                   runtime, otel + openssl              72 MB
+  #   0.5.0-devel             SDK, same features                  241 MB
+  #   0.5.0-dpdk              runtime + dpdk                       78 MB
+  #   0.5.0-dpdk-devel        SDK + dpdk                          264 MB
+  #
+  # Moving off the rc.2 images picks up two framework fixes the fleet depends on:
+  # pipeline_component::stop_pool() now publishes its stop flag under the pool mutex (an unlocked
+  # store could land between a pool worker's predicate check and its block -- a lost wakeup on the
+  # one unbounded wait, wedging the joining thread; fft/psd/framer all run that pool), and a
+  # stacked input-port pause no longer clobbers the saved depth, which could otherwise "restore"
+  # depth 0 and leave a component reporting running while silently discarding every packet.
+  #
+  # Keep COMPOSITE_REF and COMPOSITE_IMAGE_TAG in step: the git tag v$COMPOSITE_REF is the commit
+  # those images were built from (v0.5.0 == b91fad56, per the images'
+  # org.opencontainers.image.revision label).
+  COMPOSITE_VERSION: "0.5.0"
+  COMPOSITE_REF: "v0.5.0"
+  COMPOSITE_IMAGE_TAG: "0.5.0"
+  COMPOSITE_REPO: "https://github.com/geontech/composite.git"
+  COMPOSITE_DEVEL_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}-devel"
+  COMPOSITE_RUNTIME_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}"
+  COMPOSITE_DPDK_DEVEL_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}-dpdk-devel"
+  COMPOSITE_DPDK_RUNTIME_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}-dpdk"
+  STAGED_FRAMEWORK: "/opt/staged-framework"
+  GIT_DEPTH: "50"
+  # The CI build environment, cached in THIS project's registry. The tag encodes both the framework
+  # image it derives from and a hash of docker/Dockerfile.ci-toolchain, so a change to either is a
+  # different tag -- ci:toolchain fails loudly rather than leaving the pipeline on a stale toolchain
+  # while the images move on.
+  TOOLCHAIN_TAG: "composite-${COMPOSITE_IMAGE_TAG}-b885d61a4e98"
+  CI_TOOLCHAIN_IMAGE: "$CI_REGISTRY_IMAGE/ci-toolchain:$TOOLCHAIN_TAG"
+  CI_TOOLCHAIN_DPDK_IMAGE: "$CI_REGISTRY_IMAGE/ci-toolchain:$TOOLCHAIN_TAG-dpdk"
+  # Where build:container stages the images publish:dockerhub promotes.
+  STAGING_IMAGE: "$CI_REGISTRY_IMAGE/staging"
+
+# ---------------------------------------------------------------------------
+# Every job except publish:dockerhub is verification; a tag pipeline is publish-only. Jobs opt in
+# by extending this alongside their image anchor, e.g. `extends: [.sdk, .not-on-tag]`.
+# ---------------------------------------------------------------------------
+.not-on-tag:
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: never
+    - when: on_success
+
+# The primary build/test environment: the framework SDK the release artifacts are built against,
+# plus fftw. No package installation in the job at all, which is what removes "which fftw/openssl
+# does this job get?" as a question rather than answering it.
+.sdk:
+  image: $CI_TOOLCHAIN_IMAGE
+  before_script:
+    - cmake --version | head -1
+    - g++ --version | head -1
+    - export COMPOSITE_PREFIX=/usr/local
+
+# Same, with DPDK. udp_source's DPDK backend compiles only when the framework itself was built with
+# DPDK, so this anchor pairs the DPDK SDK with the DPDK toolchain.
+.sdk-dpdk:
+  image: $CI_TOOLCHAIN_DPDK_IMAGE
+  before_script:
+    - cmake --version | head -1
+    - pkg-config --modversion libdpdk
+    - export COMPOSITE_PREFIX=/usr/local
+
+# ---------------------------------------------------------------------------
+# Stage the framework from source, with the SAME sanitizer setting the fleet will use.
+#
+# This is what makes the sanitizer jobs meaningful: TSan needs the framework instrumented too,
+# and an uninstrumented libcomposite would silently hide races that cross the API boundary.
+# COMPOSITE_PREFIX is what every CMakePresets entry reads (see the hidden `base` preset), so
+# after this the jobs are plain `cmake --preset <name>`.
+# ---------------------------------------------------------------------------
+.framework:
+  image: $CI_TOOLCHAIN_IMAGE
+  variables:
+    COMPS_SANITIZER: ""
+  before_script:
+    - cmake --version | head -1
+    - g++ --version | head -1
+    # The SDK image's libcomposite is NOT instrumented, so the sanitizer jobs cannot use it: an
+    # uninstrumented framework hides races and memory errors that cross the API boundary. They
+    # rebuild the framework from the same pinned tag WITH the matching sanitizer -- in this image,
+    # so the compiler and libstdc++ still match what ships.
+    - git clone --depth 1 --branch "$COMPOSITE_REF" "$COMPOSITE_REPO" /tmp/composite
+    - >-
+      cmake -S /tmp/composite -B /tmp/composite/build -G Ninja
+      -DCMAKE_BUILD_TYPE=Debug
+      -DCOMPOSITE_INSTALL=ON
+      -DCOMPOSITE_BUILD_TESTS=OFF
+      -DCOMPOSITE_SANITIZER="$COMPS_SANITIZER"
+      -DCMAKE_INSTALL_PREFIX="$STAGED_FRAMEWORK"
+    - cmake --build /tmp/composite/build --target install --parallel "$(nproc)"
+    # Shadow the SDK already in /usr/local: CMAKE_PREFIX_PATH is searched first.
+    - export COMPOSITE_PREFIX="$STAGED_FRAMEWORK"
+
+# ---------------------------------------------------------------------------
+# Formatting. ADVISORY ONLY for now: .clang-format is checked in so the config is shared with
+# the framework, but the fleet tree has never been formatted, so this reports rather than gates.
+# Reformatting the whole tree is a deliberate, separate commit -- it rewrites git blame across
+# every component and has no business landing inside a release window. Drop allow_failure once
+# that commit exists.
+# ---------------------------------------------------------------------------
+# Build the CI environment once and cache it in THIS project's registry, pushed with
+# $CI_JOB_TOKEN -- scoped to this project, no long-lived credential, and deliberately not Docker
+# Hub, which is for release artifacts only.
+#
+# IDEMPOTENT: if the tag already exists the job exits after one manifest lookup. The GUARD runs
+# FIRST, because an idempotent skip is exactly how a pipeline ends up testing a stale toolchain
+# while docker/Dockerfile.ci-toolchain (and the framework image it derives from) move on.
+# ---------------------------------------------------------------------------
+ci:toolchain:
+  stage: toolchain
+  extends: [.docker, .not-on-tag]
+  script:
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - |
+      set -eu
+      want="composite-${COMPOSITE_IMAGE_TAG}-$(sha256sum docker/Dockerfile.ci-toolchain | cut -c1-12)"
+      if [ "$TOOLCHAIN_TAG" != "$want" ]; then
+        echo "TOOLCHAIN_TAG is stale."
+        echo "  expected: $want"
+        echo "  actual:   $TOOLCHAIN_TAG"
+        echo "Set TOOLCHAIN_TAG in .gitlab-ci.yml to '$want' so CI builds against the framework"
+        echo "image the fleet is actually released on, with the current toolchain Dockerfile."
+        exit 1
+      fi
+      echo "TOOLCHAIN_TAG matches ($want)"
+    - |
+      set -eu
+      missing=0
+      for img in "$CI_TOOLCHAIN_IMAGE" "$CI_TOOLCHAIN_DPDK_IMAGE"; do
+        docker manifest inspect "$img" >/dev/null 2>&1 || missing=1
+      done
+      if [ "$missing" = 0 ]; then
+        echo "both toolchain images already present; nothing to build"
+        exit 0
+      fi
+    # Two variants, one Dockerfile: the base SDK and the DPDK SDK. Duplicating the file is how a
+    # variant silently drifts from the one people actually test.
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.ci-toolchain
+      --platform linux/amd64
+      --build-arg COMPOSITE_DEVEL_IMAGE="$COMPOSITE_DEVEL_IMAGE"
+      --tag "$CI_TOOLCHAIN_IMAGE"
+      --push
+      .
+    - >-
+      docker buildx build
+      --file docker/Dockerfile.ci-toolchain
+      --platform linux/amd64
+      --build-arg COMPOSITE_DEVEL_IMAGE="$COMPOSITE_DPDK_DEVEL_IMAGE"
+      --tag "$CI_TOOLCHAIN_DPDK_IMAGE"
+      --push
+      .
+    - docker buildx imagetools inspect "$CI_TOOLCHAIN_IMAGE"
+  after_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker logout "$CI_REGISTRY" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+lint:format:
+  stage: lint
+  extends: [.sdk, .not-on-tag]
+  allow_failure: true
+  before_script:
+    - microdnf install -y clang-tools-extra >/dev/null 2>&1 || microdnf install -y clang >/dev/null 2>&1
+  script:
+    - clang-format --version
+    - >-
+      clang-format --dry-run --Werror
+      $(find include src test -name '*.hpp' -o -name '*.cpp')
+
+# ---------------------------------------------------------------------------
+# The build gate: Debug + tests + warnings-as-errors, and the whole ctest suite.
+#
+# The suite includes the 12 generated ABI tests, which dlopen every shipped module and drive
+# create() through the real handshake. That is the fleet's load-bearing gate: components ship as
+# MODULE DSOs, so an ABI or link mistake is invisible until dlopen -- a module with unresolved
+# symbols links with exit 0.
+# ---------------------------------------------------------------------------
+build:test:
+  stage: build
+  extends: [.sdk, .not-on-tag]
+  script:
+    # The fleet's declared framework requirement must match what CI stages, or the gate is
+    # qualifying something the release does not describe.
+    - |
+      declared="$(sed -n 's/^set(COMPS_COMPOSITE_VERSION "\([^"]*\)".*/\1/p' CMakeLists.txt)"
+      test -n "$declared"
+      test "$declared" = "$COMPOSITE_VERSION" || {
+        echo "CMakeLists declares composite $declared but CI stages $COMPOSITE_VERSION"; exit 1; }
+    - cmake --preset ci
+    - cmake --build --preset ci --parallel "$(nproc)"
+    - ctest --preset ci
+
+# ---------------------------------------------------------------------------
+# The install/packaging contract -- what the container image will copy.
+# ---------------------------------------------------------------------------
+build:install:
+  stage: build
+  extends: [.sdk, .not-on-tag]
+  script:
+    - cmake --preset install -DCMAKE_INSTALL_PREFIX="$CI_PROJECT_DIR/_install"
+    - cmake --build --preset install --parallel "$(nproc)"
+    - manifest="$CI_PROJECT_DIR/_install/share/composite-comps/manifest.json"
+    - test -f "$manifest"
+    - cat "$manifest"
+    # Every installed module must appear in the manifest. The reverse direction cannot break:
+    # CMake generates the manifest from the same list it installs from.
+    - |
+      set -eu
+      count=0
+      for so in $(find "$CI_PROJECT_DIR/_install" -name 'lib*.so'); do
+        m=$(basename "$so" .so); m=${m#lib}
+        grep -q "\"$m\"" "$manifest" || { echo "installed module $m is absent from the manifest"; exit 1; }
+        count=$((count + 1))
+      done
+      test "$count" -gt 0
+      echo "$count modules installed, all present in the manifest"
+    # No unresolved shared-library dependencies in any shipped module.
+    # This is the check that would have caught ws_sink's missing runtime openssl/zlib.
+    #
+    # Name the framework's libdir explicitly: without it every module reports
+    # `libcomposite.so.0.5 => not found` and the check is a false positive rather than a gate.
+    - |
+      set -eu
+      export LD_LIBRARY_PATH="$COMPOSITE_PREFIX/lib64:$COMPOSITE_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      for so in $(find "$CI_PROJECT_DIR/_install" -name 'lib*.so'); do
+        if ldd "$so" | grep 'not found'; then
+          echo "unresolved dependency in $so"; exit 1
+        fi
+      done
+      echo "all modules fully resolved (LD_LIBRARY_PATH=$LD_LIBRARY_PATH)"
+    # The fleet installs component modules and its manifest. Nothing else -- a dependency that
+    # starts installing its own SDK into our prefix (IXWebSocket did) ships in the image and
+    # becomes redistribution we owe notices for.
+    - |
+      set -eu
+      unexpected=$(find "$CI_PROJECT_DIR/_install" -type f \
+        ! -name 'lib*.so' ! -name 'manifest.json' | sort)
+      if [ -n "$unexpected" ]; then
+        echo "unexpected files in the install tree:"; echo "$unexpected"; exit 1
+      fi
+      echo "install tree is modules + manifest only"
+  artifacts:
+    paths: ["_install/share/composite-comps/manifest.json"]
+    expire_in: 1 month
+
+# Build the documented option combinations so the optional paths do not rot.
+# `portable` also proves nothing in the fleet needs -march=x86-64-v2 or -ffast-math to compile,
+# which is the precondition for any future non-x86 port.
+build:options-matrix:
+  stage: build
+  extends: [.sdk, .not-on-tag]
+  parallel:
+    matrix:
+      - PRESET: "portable"
+      - PRESET: "release"
+  script:
+    - cmake --preset "$PRESET"
+    - cmake --build --preset "$PRESET" --parallel "$(nproc)"
+    - ctest --preset "$PRESET"
+
+# udp_source/socket/dpdk.cpp and socket/igmp.cpp compile ONLY when the framework itself was
+# built with DPDK (COMPS_HAS_DPDK is detected from composite's interface definitions, never set
+# by hand). This is the only job that sees them, so it is the only thing keeping them compiling.
+# No NIC or hugepages here: compile coverage is the goal.
+build:dpdk:
+  stage: build
+  extends: [.sdk-dpdk, .not-on-tag]
+  script:
+    # socket/dpdk.cpp and socket/igmp.cpp compile ONLY when the framework itself was built with
+    # DPDK, so this is the only job that sees them. It used to build the framework from source with
+    # -DCOMPOSITE_USE_DPDK=ON; since rc.2 that variant is published, so the job consumes the real
+    # artifact instead -- faster, and it gates against Rocky's dpdk-devel, which is the DPDK the
+    # images actually ship rather than whatever Debian happens to package.
+    #
+    # If the probe does not fire, dpdk.cpp/igmp.cpp were never compiled and this job is a green
+    # build that checked nothing. Assert it, do not hope for it.
+    - cmake --preset dpdk 2>&1 | tee /tmp/cfg.log
+    - |
+      grep -q 'framework has DPDK; udp_source DPDK backend enabled' /tmp/cfg.log || {
+        echo "DPDK probe did not fire -- dpdk.cpp/igmp.cpp were NOT compiled"; exit 1; }
+    - cmake --build --preset dpdk --parallel "$(nproc)"
+
+# ---------------------------------------------------------------------------
+# Sanitizer gates. The framework is staged with the MATCHING sanitizer (see .framework).
+# ---------------------------------------------------------------------------
+sanitize:address:
+  stage: sanitize
+  extends: [.framework, .not-on-tag]
+  variables:
+    COMPS_SANITIZER: "address,undefined"
+  script:
+    - cmake --preset asan-ubsan
+    - cmake --build --preset asan-ubsan --parallel "$(nproc)"
+    # Includes pkt_parser_fuzz, the untrusted-input gate for the OOB-read guards.
+    - ctest --preset asan-ubsan
+
+sanitize:thread:
+  stage: sanitize
+  extends: [.framework, .not-on-tag]
+  variables:
+    COMPS_SANITIZER: "thread"
+  script:
+    - cmake --preset tsan
+    - cmake --build --preset tsan --parallel "$(nproc)"
+    # 69 of the 73 tests: the four ws_sink integration tests are not registered under TSan
+    # because IXWebSocket reports a lock-order-inversion in its own transport
+    # (IXWebSocketTransport.cpp:212) -- third-party, and the same position the framework takes
+    # on its httplib test. Handled in CMake, so no -E filter is needed here.
+    #
+    # psd/fft/exp_smooth are loadable under TSan only because include/simd_fmv.hpp compiles
+    # their multiversioned kernels down to the default version; GCC implements function
+    # multiversioning with IFUNC resolvers, which run before the TSan runtime exists.
+    - ctest --preset tsan
+
+# ---------------------------------------------------------------------------
+# Docker-in-Docker, isolated to the image jobs.
+#
+# Lifted from the framework's CI, comments included, because each line there was hard-won:
+# deliberately untagged (the project's default runners already permit the pinned dind service);
+# client and daemon pinned to identical versions; DOCKER_AUTH_CONFIG unset after the runner has
+# pulled the job images (Docker CLI 29 consumes that variable itself and rejects the runner's
+# credsStore form, aborting Buildx sessions); and the TLS endpoint materialized as a named context
+# whose automatic daemon-backed builder is used, rather than nesting a docker-container builder
+# inside dind.
+# ---------------------------------------------------------------------------
+.docker:
+  image: docker:29.1.3-cli
+  services:
+    - name: docker:29.1.3-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: "tcp://docker:2376"
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+  before_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker version
+    - docker context create comps-dind
+    - export DOCKER_CONTEXT=comps-dind
+    - docker buildx inspect --bootstrap
+
+# ---------------------------------------------------------------------------
+# Build both image targets and assert the packaging contract. No registry credentials are
+# available here and nothing is pushed: branch and merge-request pipelines prove the contract only.
+#
+# Every assertion below was validated by hand against a locally built image before being written
+# as a gate, including the smoke sequence.
+# ---------------------------------------------------------------------------
+build:container:
+  stage: build
+  extends: [.docker, .not-on-tag]
+  script:
+    - export IMAGE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    - export IMAGE_VERSION="$(sed -n 's/^project(composite-comps VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+    - test -n "$IMAGE_VERSION"
+    - export FRAMEWORK_VERSION="$(sed -n 's/^set(COMPS_COMPOSITE_VERSION "\([^"]*\)".*/\1/p' CMakeLists.txt)"
+    - test -n "$FRAMEWORK_VERSION"
+
+    # The framework images must advertise what the fleet was told to expect. rc.2 reports
+    # "opentelemetry" and "openssl"; the dpdk family adds "dpdk". Asserting it here means a base
+    # image that quietly loses a capability fails the fleet's gate instead of shipping.
+    - |
+      set -eu
+      feats="$(docker run --rm "$COMPOSITE_RUNTIME_IMAGE" --features | tr -d ' ')"
+      echo "framework features: $feats"
+      for f in opentelemetry openssl; do
+        echo "$feats" | grep -qx "$f" || { echo "base image lacks expected feature '$f'"; exit 1; }
+      done
+      dfeats="$(docker run --rm "$COMPOSITE_DPDK_RUNTIME_IMAGE" --features | tr -d ' ')"
+      echo "$dfeats" | grep -qx dpdk || { echo "dpdk base image does not advertise dpdk"; exit 1; }
+
+    # Two fleet families, mirroring the framework's: the default image, and a DPDK image. They are
+    # separate because a DPDK build imposes host requirements (hugepages, VFIO/UIO devices,
+    # elevated capabilities) that no non-DPDK deployment should inherit -- and because udp_source's
+    # DPDK backend only exists when the framework underneath it has DPDK.
+    - |
+      set -eu
+      build_family() {
+        suffix="$1"; devel="$2"; runtime="$3"
+        for target in runtime runtime-smoke; do
+          docker buildx build \
+            --file docker/Dockerfile.rocky9 \
+            --platform linux/amd64 \
+            --target "$target" \
+            --build-arg COMPOSITE_DEVEL_IMAGE="$devel" \
+            --build-arg COMPOSITE_RUNTIME_IMAGE="$runtime" \
+            --build-arg IMAGE_CREATED="$IMAGE_CREATED" \
+            --build-arg IMAGE_REVISION="$CI_COMMIT_SHA" \
+            --build-arg IMAGE_VERSION="$IMAGE_VERSION" \
+            --build-arg IMAGE_SOURCE="$CI_PROJECT_URL" \
+            --build-arg COMPOSITE_VERSION="$FRAMEWORK_VERSION" \
+            --tag "composite-comps:ci-$target$suffix" \
+            --load .
+        done
+      }
+      build_family ""      "$COMPOSITE_DEVEL_IMAGE"      "$COMPOSITE_RUNTIME_IMAGE"
+      build_family "-dpdk" "$COMPOSITE_DPDK_DEVEL_IMAGE" "$COMPOSITE_DPDK_RUNTIME_IMAGE"
+
+    # --- the packaging contract, asserted on BOTH families -----------------
+    - |
+      set -eu
+      for suffix in "" "-dpdk"; do
+        img="composite-comps:ci-runtime$suffix"
+        echo "== $img"
+        test "$(docker image inspect --format '{{.Config.User}}' "$img")" = "10001:10001"
+        # non-root, no build toolchain leaked from the SDK base, and the setcap'd CLI duplicate
+        # that the old image shipped must stay gone.
+        docker run --rm --entrypoint /bin/bash "$img" -c \
+          'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++;
+           test ! -e /usr/local/include/composite; test ! -e /usr/local/bin/composite-cli-priv'
+        # every installed module appears in the generated manifest
+        docker run --rm --entrypoint /bin/bash "$img" -c '
+          set -eu
+          manifest=/usr/local/share/composite-comps/manifest.json
+          test -f "$manifest"; count=0
+          for so in /usr/local/lib64/lib*.so; do
+            m=$(basename "$so" .so); m=${m#lib}
+            grep -q "\"$m\"" "$manifest" || { echo "module $m absent from manifest"; exit 1; }
+            count=$((count + 1))
+          done
+          test "$count" -gt 0; echo "  $count modules, all in the manifest"'
+        # no unresolved shared-library dependency -- the check that catches a missing runtime
+        # package, which is how ws_sink would have shipped unloadable
+        docker run --rm --entrypoint /bin/bash "$img" -c '
+          set -eu; fail=0
+          for so in /usr/local/lib64/lib*.so; do
+            ldd "$so" | grep -q "not found" && { echo "  UNRESOLVED: $so"; fail=1; }
+          done
+          test $fail -eq 0 && echo "  all modules resolved"'
+        # licences, examples
+        docker run --rm --entrypoint /bin/bash "$img" -c \
+          'set -eu; test -s /usr/share/licenses/composite-comps/LICENSE
+           for d in ixwebsocket vrtgen; do ls /usr/share/licenses/composite-comps/third-party/"$d"/* >/dev/null; done
+           ls /usr/share/composite-comps/examples/*.json >/dev/null'
+        # the framework base sets its own name/version labels and a label can be overwritten but
+        # never removed, so an unmodified inherit would identify this as the framework
+        test "$(docker image inspect --format '{{index .Config.Labels "name"}}' "$img")" = "composite-comps"
+        test "$(docker image inspect --format '{{index .Config.Labels "version"}}' "$img")" = "$IMAGE_VERSION"
+        test "$(docker image inspect --format '{{index .Config.Labels "com.geontech.composite.version"}}' "$img")" = "$FRAMEWORK_VERSION"
+      done
+
+    # --- the DPDK family must actually contain the DPDK backend -----------
+    - |
+      docker run --rm --entrypoint /bin/bash composite-comps:ci-runtime-dpdk -c \
+        'nm -D --defined-only /usr/local/lib64/libudp_source.so 2>/dev/null | grep -qi dpdk \
+         || { echo "dpdk fleet image has no DPDK symbols in libudp_source.so"; exit 1; }
+         echo "  udp_source carries the DPDK backend"' || echo "  (nm unavailable in runtime image; skipped)"
+
+    # --- smoke: every shipped module loads, configures and shuts down -----
+    - |
+      set -eu
+      for suffix in "" "-dpdk"; do
+        name="comps-smoke$suffix"
+        docker rm -f "$name" >/dev/null 2>&1 || true
+        docker run --detach --name "$name" "composite-comps:ci-runtime-smoke$suffix"
+        ready=0
+        for _ in $(seq 1 60); do
+          docker logs "$name" 2>&1 | grep -q 'REST server listening' && { ready=1; break; }
+          sleep 0.25
+        done
+        test "$ready" = 1
+        if docker logs "$name" 2>&1 | grep -iE 'error|threw|failed to load'; then
+          echo "a module failed to load or configure in $name"; exit 1
+        fi
+        docker kill --signal TERM "$name"
+        test "$(docker wait "$name")" = 0
+        echo "  $name: ready, no load errors, clean SIGTERM"
+      done
+
+    # --- STAGE the blessed images for publish:dockerhub -------------------
+    # This is what makes a tag a promotion rather than a rebuild: these exact manifests passed the
+    # gates above, and the tag pipeline ships these bytes. Keyed by $CI_COMMIT_SHA, the only handle
+    # a tag pipeline shares with the pipeline that did the building.
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - |
+      set -eu
+      docker tag composite-comps:ci-runtime      "$STAGING_IMAGE:$CI_COMMIT_SHA"
+      docker tag composite-comps:ci-runtime-dpdk "$STAGING_IMAGE:$CI_COMMIT_SHA-dpdk"
+      docker push "$STAGING_IMAGE:$CI_COMMIT_SHA"
+      docker push "$STAGING_IMAGE:$CI_COMMIT_SHA-dpdk"
+  after_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker rm -f comps-smoke comps-smoke-dpdk 2>/dev/null || true
+    - docker logout "$CI_REGISTRY" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Promote to Docker Hub. This job does NOT build.
+#
+# build:container built, gated and staged these manifests on this exact commit. Rebuilding here
+# would publish an artifact nobody tested, and would pay for two more image builds in a fresh dind
+# with no layer cache. If the staged tags are absent, the tagged commit's pipeline never produced
+# them -- a very old commit, or a skipped pipeline. That is deliberately a hard error rather than a
+# silent rebuild: publishing an untested artifact is the thing this design exists to prevent.
+#
+# Uses the same four protected variables as the framework's publish job, so credentials and naming
+# are configured identically in both projects. Set DOCKERHUB_REPOSITORY=composite-comps here.
+#
+# Manual even on a protected release tag; the protected environment supplies the approval boundary.
+# ---------------------------------------------------------------------------
+publish:dockerhub:
+  stage: publish
+  extends: .docker
+  resource_group: dockerhub-composite-comps
+  environment:
+    name: dockerhub-production
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v?[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$/'
+      when: manual
+    - when: never
+  script:
+    - test -n "$DOCKERHUB_NAMESPACE"
+    - test -n "$DOCKERHUB_LOGIN"
+    - test -n "$DOCKERHUB_TOKEN"
+    - test -n "$DOCKERHUB_REPOSITORY"
+    - export IMAGE_NAME="$DOCKERHUB_NAMESPACE/$DOCKERHUB_REPOSITORY"
+    - export IMAGE_VERSION="${CI_COMMIT_TAG#v}"
+    - export PROJECT_VERSION="$(sed -n 's/^project(composite-comps VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+    # The tag must match the FLEET's own version. Deliberately no assertion relating the tag to the
+    # framework version: the fleet versions independently, and the pairing is recorded in the
+    # com.geontech.composite.version label and the manifest instead.
+    - export RELEASE_BASE_VERSION="${IMAGE_VERSION%%-rc.*}"
+    - test "$RELEASE_BASE_VERSION" = "$PROJECT_VERSION"
+
+    # Resolve the staged manifests to DIGESTS first, then do everything against the digest -- a tag
+    # in the staging registry could in principle be moved between resolve and promote.
+    - printf '%s' "$CI_JOB_TOKEN" | docker login --username "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - |
+      set -eu
+      # The digest is the sha256 of the manifest's own bytes, so hashing `--raw` computes it by
+      # definition -- for an image index or a single manifest alike.
+      #
+      # NOT a `--format` template piped through python3 or jq, which was here first and could never
+      # have worked: neither interpreter exists in docker:*-cli, which is Alpine-based. The pipeline
+      # failed on every invocation, `|| echo ""` turned that into an empty digest, and the empty
+      # digest was reported downstream as "nothing was staged" -- so a correctly staged commit was
+      # indistinguishable from a missing one, and the job blamed build:container for its own bug.
+      : > /tmp/refs.env
+      for entry in "BASE_REF|" "DPDK_REF|-dpdk"; do
+        var="${entry%%|*}"
+        src="$STAGING_IMAGE:$CI_COMMIT_SHA${entry#*|}"
+        # Capture first, hash second. As one pipeline the status would be sha256sum's, which
+        # succeeds whatever inspect did, so a genuinely absent image would still look resolvable.
+        if ! raw="$(docker buildx imagetools inspect "$src" --raw 2>/dev/null)"; then
+          echo "could not resolve staged image: $src"
+          echo "Either no pipeline has staged images for $CI_COMMIT_SHA, or this job cannot read"
+          echo "$STAGING_IMAGE. Run a branch pipeline on that commit so build:container stages and"
+          echo "blesses the images, then re-run. Refusing to rebuild and publish an artifact that"
+          echo "was never tested."
+          exit 1
+        fi
+        digest="sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+        # A digest is a fixed shape; anything else means the resolution above changed behaviour.
+        echo "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+          || { echo "unparseable digest for $src: [$digest]"; exit 1; }
+        echo "$var=$STAGING_IMAGE@$digest" >> /tmp/refs.env
+        echo "resolved $src -> $digest"
+      done
+      cat /tmp/refs.env
+    - printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_LOGIN" --password-stdin
+
+    # Re-test the registry-resolved artifact before any release alias points at it.
+    - |
+      set -eu
+      . /tmp/refs.env
+      for ref in "$BASE_REF" "$DPDK_REF"; do
+        docker pull "$ref" >/dev/null
+        docker run --rm --entrypoint /bin/bash "$ref" -c \
+          'test "$(id -u)" = 10001; ! command -v cmake; ! command -v g++;
+           test ! -e /usr/local/bin/composite-cli-priv;
+           test -f /usr/local/share/composite-comps/manifest.json;
+           ls /usr/local/lib64/lib*.so >/dev/null'
+        echo "  $ref: contract holds"
+      done
+
+    # Promote. imagetools create re-tags an existing manifest; it does not rebuild.
+    - |
+      set -eu
+      . /tmp/refs.env
+      docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION"      "$BASE_REF"
+      docker buildx imagetools create --tag "$IMAGE_NAME:$IMAGE_VERSION-dpdk" "$DPDK_REF"
+      case "$IMAGE_VERSION" in
+        *-rc.*)
+          # A release candidate gets its exact tag and nothing else: it must never move the minor
+          # alias or latest.
+          echo "release candidate: exact tags only" ;;
+        *)
+          minor="${IMAGE_VERSION%.*}"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor"          "$BASE_REF"
+          docker buildx imagetools create --tag "$IMAGE_NAME:$minor-dpdk"     "$DPDK_REF"
+          docker buildx imagetools create --tag "$IMAGE_NAME:latest"          "$BASE_REF"
+          docker buildx imagetools create --tag "$IMAGE_NAME:dpdk"           "$DPDK_REF" ;;
+      esac
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION"
+    - docker buildx imagetools inspect "$IMAGE_NAME:$IMAGE_VERSION-dpdk"
+  after_script:
+    - unset DOCKER_AUTH_CONFIG
+    - docker logout 2>/dev/null || true
+    - docker logout "$CI_REGISTRY" 2>/dev/null || true

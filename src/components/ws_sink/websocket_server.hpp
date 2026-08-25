@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <composite/core/logger.hpp>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -37,11 +39,15 @@ using ws_message_data_t = std::variant<std::string, std::shared_ptr<const std::v
 class websocket_session {
   public:
     using message_data_t = ws_message_data_t;
+    using queue_size_callback_t = std::function<void(const std::string& client_id, size_t queue_size)>;
 
     virtual ~websocket_session() = default;
     virtual auto get_id() const -> std::string = 0;
     virtual auto send(message_data_t data, bool is_binary) -> void = 0;
     virtual auto close() -> void = 0;
+    // Rebind where this session reports its send-queue size. Call before any send()
+    // is issued to the session (there is no synchronization against in-flight sends).
+    virtual auto set_queue_size_callback(queue_size_callback_t callback) -> void = 0;
 };
 
 // WebSocket server abstraction
@@ -57,8 +63,13 @@ class websocket_server {
     websocket_server();
     ~websocket_server();
 
-    // Lifecycle
-    auto start(uint16_t port, const std::string& bind_address, bool enable_compression) -> void;
+    // Logging goes through the framework's logger facade (spdlog is not part of the
+    // composite 0.5 public API). Set before start(); defaults to a no-op logger.
+    auto set_logger(std::shared_ptr<composite::logger> logger) -> void;
+
+    // Lifecycle. max_connections caps concurrent clients at the accept layer.
+    auto start(uint16_t port, const std::string& bind_address, bool enable_compression,
+               size_t max_connections) -> void;
     auto stop() -> void;
 
     // Callbacks

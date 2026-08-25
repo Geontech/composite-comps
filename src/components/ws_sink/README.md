@@ -16,8 +16,8 @@ WebSocket sink component for streaming data and histograms to multiple clients w
 
 | Port Name | Type | Description |
 |-----------|------|-------------|
-| `data_in` | `aligned_mem<complex<T>>` | Spectrum data (PSD/FFT output) |
-| `histogram_in` | `vector<uint64_t>` | Histogram bin counts |
+| `data_in` | `immutable_buffer<T>` | Spectrum data (PSD/FFT output) |
+| `histogram_in` | `immutable_buffer<uint64_t>` | Histogram bin counts |
 
 ## Properties
 
@@ -25,18 +25,35 @@ WebSocket sink component for streaming data and histograms to multiple clients w
 |----------|------|---------|-------------|
 | `port` | uint16 | 8080 | WebSocket server TCP port |
 | `bind_address` | string | "0.0.0.0" | Network interface to bind to |
-| `default_stream_fps` | float | 12.0 | Default FPS for new clients |
-| `max_stream_fps` | float | 60.0 | Maximum allowed FPS |
-| `stream_port_depth` | uint32 | 1 | Input port buffer depth |
-| `send_queue_hwm` | uint32 | 5 | High water mark for backpressure |
-| `max_clients` | uint32 | 100 | Maximum concurrent clients |
+| `default_stream_fps` | float | 12.0 | Default FPS for new clients (min 1.0) |
+| `max_stream_fps` | float | 60.0 | Maximum allowed FPS (min 1.0) |
+| `stream_port_depth` | uint32 | 1 | Input port buffer depth (min 1) |
+| `send_queue_hwm` | uint32 | 5 | High water mark for backpressure (min 2) |
+| `max_clients` | uint32 | 100 | Maximum concurrent clients (min 1) |
 | `compression` | bool | false | Enable per-message deflate compression |
+
+The component sets `finish_at_end=false`: upstream end-of-stream does not finish the
+worker or tear down the WebSocket server — connected clients stay attached and the
+listen port stays open across finite captures. Override via the standard
+`finish_at_end` property if a run-to-completion pipeline should stop the sink.
 
 ## Template Types
 
-Supports real and complex float and double precision:
-- `create_arg: "f32","cf32"` - Single precision (float)
-- `create_arg: "f64","cf64"` - Double precision (double)
+Supports real and complex float and double precision, selected via the create-args
+`type` discriminator in the application config:
+
+```json
+{
+  "id": "ws1",
+  "library": "libws_sink.so",
+  "args": { "type": "cf32" }
+}
+```
+
+- `"f32"` / `"cf32"` - Single precision (real / complex float)
+- `"f64"` / `"cf64"` - Double precision (real / complex double)
+
+(The legacy scalar form `"create_arg": "cf32"` is also accepted by the loader.)
 
 ## Message Protocol
 
@@ -140,17 +157,12 @@ The component automatically adjusts client FPS based on send queue size:
 - Per-client worker threads - slow clients don't block fast clients
 - Non-blocking send operations (~1μs latency)
 
-## Example Configuration
-
-See `examples/websocket-psd.json` for a complete pipeline example.
-
 ## Build Requirements
 
 - C++23 compiler
 - IXWebSocket
 - nlohmann_json
-- composite framework
-- spdlog
+- composite framework (0.5)
 - pthread (for thread naming)
 - zlib
 
@@ -161,8 +173,8 @@ See `examples/websocket-psd.json` for a complete pipeline example.
 cmake -B build
 cmake --build build
 
-# Run example
-composite-cli -f examples/websocket-psd.json
+# Run an application config that includes a ws_sink component
+composite-cli <app-config>.json
 ```
 
 Connect WebSocket client to `ws://localhost:8080`

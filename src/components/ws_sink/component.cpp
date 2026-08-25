@@ -19,28 +19,55 @@
 
 #include "component.hpp"
 
+#include <composite/core/register.hpp>
+
 #include <algorithm>
+#include <charconv>
+#include <complex>
 #include <format>
+#include <optional>
+#include <stdexcept>
 #include <string_view>
+#include <system_error>
+
+namespace {
+
+// Read an annotation as a size: typed integers directly, strings parsed (the fft
+// component stamps "fft_size" as a string annotation).
+auto annotation_as_size(const composite::annotation_value& v) -> std::optional<size_t> {
+    if (v.holds<std::int64_t>()) {
+        const auto i = v.get<std::int64_t>();
+        return i >= 0 ? std::optional<size_t>{static_cast<size_t>(i)} : std::nullopt;
+    }
+    const auto s = v.to_string();
+    size_t out{};
+    const auto* end = s.data() + s.size();
+    if (auto [p, ec] = std::from_chars(s.data(), end, out); ec == std::errc{} && p == end) {
+        return out;
+    }
+    return std::nullopt;
+}
+
+auto interval_for(float fps) -> std::chrono::microseconds {
+    return std::chrono::microseconds(static_cast<int64_t>(1'000'000.0f / fps));
+}
+
+} // namespace
 
 // ========== client_state implementation ==========
 
 auto client_state::should_send_stream_frame() const -> bool {
+    std::lock_guard lock(state_mutex);
     auto now = std::chrono::steady_clock::now();
     return (now - last_stream_frame_sent) >= stream_frame_interval;
-}
-
-auto client_state::should_send_metrics() const -> bool {
-    auto now = std::chrono::steady_clock::now();
-    return (now - last_metrics_sent) >= metrics_interval;
 }
 
 auto client_state::set_stream_fps(float new_fps) -> void {
     std::lock_guard lock(state_mutex);
 
     stream_fps = new_fps;
-    stream_frame_interval =
-        std::chrono::microseconds(static_cast<int64_t>(1'000'000.0f / stream_fps));
+    default_fps = new_fps; // an explicit request also becomes the recovery ceiling
+    stream_frame_interval = interval_for(stream_fps);
 }
 
 auto client_state::adjust_stream_fps(flow_state new_state) -> void {
@@ -53,23 +80,29 @@ auto client_state::adjust_stream_fps(flow_state new_state) -> void {
     case flow_state::backpressure:
         // Reduce by 50%, floor at 1 FPS
         stream_fps = std::max(MIN_FPS, stream_fps * 0.5f);
-        stream_frame_interval =
-            std::chrono::microseconds(static_cast<int64_t>(1'000'000.0f / stream_fps));
+        stream_frame_interval = interval_for(stream_fps);
         break;
 
     case flow_state::recovering:
-        // Slowly increase by 25%
-        if (stream_fps < 12.0f) { // Don't go above default unless client requests
-            stream_fps = std::min(12.0f, stream_fps * 1.25f);
-            stream_frame_interval =
-                std::chrono::microseconds(static_cast<int64_t>(1'000'000.0f / stream_fps));
+        // Slowly increase by 25%, back up to the configured/requested rate
+        if (stream_fps < default_fps) {
+            stream_fps = std::min(default_fps, stream_fps * 1.25f);
+            stream_frame_interval = interval_for(stream_fps);
         }
         break;
 
     case flow_state::healthy:
-        // Already at stable FPS
+        // Queue fully drained: restore the configured/requested rate (without this,
+        // one transient backpressure episode degrades the client permanently)
+        stream_fps = default_fps;
+        stream_frame_interval = interval_for(stream_fps);
         break;
     }
+}
+
+auto client_state::current_flow_state() const -> flow_state {
+    std::lock_guard lock(state_mutex);
+    return state;
 }
 
 auto client_state::calculate_stream_fps() const -> float {
@@ -82,8 +115,9 @@ auto client_state::calculate_stream_fps() const -> float {
     auto duration = recent_stream_frame_times.back() - recent_stream_frame_times.front();
     auto duration_sec = std::chrono::duration<float>(duration).count();
 
-    if (duration_sec <= 0.0f)
+    if (duration_sec <= 0.0f) {
         return 0.0f;
+    }
 
     return (recent_stream_frame_times.size() - 1) / duration_sec;
 }
@@ -104,18 +138,37 @@ auto client_state::update_stream_fps_metrics() -> void {
 // ========== ws_sink implementation ==========
 
 template <typename T>
-ws_sink<T>::ws_sink() : composite::component("ws_sink") {
+ws_sink<T>::ws_sink(std::string_view id) : composite::component(id) {
     add_port(&m_hist_in_port);
     add_port(&m_data_in_port);
 
-    add_property("port", &m_ws_port);
-    add_property("bind_address", &m_bind_address);
-    add_property("default_stream_fps", &m_default_stream_fps).units("Hz");
-    add_property("max_stream_fps", &m_max_stream_fps).units("Hz");
-    add_property("send_queue_hwm", &m_send_queue_hwm);
-    add_property("max_clients", &m_max_clients);
-    add_property("stream_port_depth", &m_stream_port_depth);
-    add_property("compression", &m_compression);
+    add_property("port", m_ws_port);
+    add_property("bind_address", m_bind_address);
+    // FPS bounds >= 1: client requests are clamped to [1, max_stream_fps], and
+    // std::clamp requires lo <= hi.
+    add_property("default_stream_fps", m_default_stream_fps)
+        .validate([](const float& v) { return v >= 1.0f; })
+        .units("Hz");
+    add_property("max_stream_fps", m_max_stream_fps)
+        .validate([](const float& v) { return v >= 1.0f; })
+        .units("Hz");
+    // hwm >= 2: the backpressure ladder recovers at queue < hwm/2 and hwm/4 —
+    // integer-zero thresholds (hwm 0 or 1) could never be satisfied, wedging a
+    // client at the FPS floor (or skipping every frame) forever.
+    add_property("send_queue_hwm", m_send_queue_hwm)
+        .validate([](const size_t& v) { return v >= 2; });
+    add_property("max_clients", m_max_clients)
+        .validate([](const size_t& v) { return v >= 1; });
+    add_property("stream_port_depth", m_stream_port_depth)
+        .validate([](const size_t& v) { return v >= 1; });
+    add_property("compression", m_compression);
+
+    // A UI-facing terminal sink: upstream end-of-stream must NOT finish the worker
+    // (the completion tail would stop the websocket server, dropping every client
+    // and closing the listen socket for good). The stream ending is a state the UI
+    // observes, not the end of this component's life. Deployments can override via
+    // the standard finish_at_end property.
+    set_properties(composite::properties::json{{"finish_at_end", false}});
 }
 
 template <typename T>
@@ -123,6 +176,7 @@ auto ws_sink<T>::initialize() -> void {
     logger()->info("Initializing WebSocket sink");
 
     m_server = std::make_unique<websocket_server>();
+    m_server->set_logger(logger());
     m_clients.store(std::make_shared<std::vector<std::shared_ptr<client_state>>>());
 
     // Setup callbacks
@@ -139,147 +193,192 @@ auto ws_sink<T>::initialize() -> void {
             }
         }
     });
+
+    // Size the rings NOW, while both sides are idle (properties are applied before
+    // initialize, and nothing is started yet). A live ring must never be reallocated
+    // from the websocket threads, so update_port_depths() at runtime only ever moves
+    // the soft limit between 0 and these values — a plain atomic store.
+    m_data_in_port.depth(m_stream_port_depth);
+    m_hist_in_port.depth(HISTOGRAM_PORT_DEPTH);
+    {
+        std::lock_guard lock(m_clients_mutex);
+        update_port_depths(); // no clients yet -> both paused (depth 0)
+    }
 }
 
 template <typename T>
-auto ws_sink<T>::start() -> void {
+auto ws_sink<T>::on_worker_start() -> void {
     logger()->info("Starting WebSocket server on {}:{} (compression: {})", m_bind_address,
                    m_ws_port, m_compression ? "enabled" : "disabled");
 
-    m_server->start(m_ws_port, m_bind_address, m_compression);
-    update_port_depths();
+    m_server->start(m_ws_port, m_bind_address, m_compression, m_max_clients);
+    {
+        std::lock_guard lock(m_clients_mutex);
+        update_port_depths();
+    }
 
-    composite::component::start();
+    // 1 Hz per-client metrics. The worker parks on the doorbell when no data is
+    // flowing, so wall-clock-paced sends have to come from their own thread.
+    m_metrics_thread = std::jthread([this](std::stop_token token) {
+        std::mutex mtx;
+        std::condition_variable_any cv;
+        std::unique_lock lock(mtx);
+        while (!token.stop_requested()) {
+            // Stop-token-aware wait: a plain sleep would stall every stop path
+            // (shutdown, disable, restart) for up to the full second.
+            cv.wait_for(lock, token, std::chrono::seconds(1), [] { return false; });
+            if (token.stop_requested()) {
+                break;
+            }
+            auto clients = m_clients.load(std::memory_order_acquire);
+            if (!clients) {
+                continue;
+            }
+            for (const auto& client : *clients) {
+                // Don't grow a stalled client's queue: metrics are droppable.
+                if (client->send_queue_size.load(std::memory_order_relaxed) >=
+                    client->send_queue_hwm) {
+                    continue;
+                }
+                auto metrics_json = generate_metrics_message(*client);
+                m_server->send_to_client(client->client_id, ws_message_data_t{metrics_json.dump()},
+                                         false);
+            }
+        }
+    });
 }
 
 template <typename T>
-auto ws_sink<T>::stop() -> void {
-    logger()->info("Stopping WebSocket server");
+auto ws_sink<T>::on_worker_stop() -> void {
+    m_metrics_thread.request_stop();
+    if (m_metrics_thread.joinable()) {
+        m_metrics_thread.join();
+    }
 
+    logger()->info("Stopping WebSocket server");
     m_server->stop();
-    composite::component::stop();
+
+    // The server closed every session; drop the roster so a restart begins with a
+    // clean list (stale ids would keep the ports enabled and silently eat sends).
+    {
+        std::lock_guard lock(m_clients_mutex);
+        m_clients.store(std::make_shared<std::vector<std::shared_ptr<client_state>>>(),
+                        std::memory_order_release);
+        update_port_depths();
+    }
 }
 
 template <typename T>
 auto ws_sink<T>::process() -> composite::retval {
     using enum composite::retval;
 
+    auto did_work = false;
+
     // === STREAM DATA ===
-    auto [stream_data, stream_ts, stream_meta] = m_data_in_port.get_data();
-    if (stream_data != nullptr) {
-        m_frame_size = stream_data->size();
+    if (auto pkt = m_data_in_port.try_get()) {
+        did_work = true;
+        auto& [data, ts, meta] = *pkt;
 
-        // Handle metadata changes
-        if (stream_meta.has_value()) {
-            logger()->trace("Received stream metadata:\n{}", stream_meta->to_string());
-
-            // Extract fft_size from annotations
-            size_t meta_fft_size = m_fft_size;
-            if (stream_meta->annotations.contains("fft_size")) {
-                try {
-                    meta_fft_size = std::stoul(stream_meta->annotations.at("fft_size"));
-                } catch (...) {
-                }
-            }
-
-            // Check if metadata changed
-            if (m_fft_size != meta_fft_size || m_bandwidth != stream_meta->bandwidth ||
-                m_center_frequency != stream_meta->center_frequency ||
-                m_sample_rate != stream_meta->sample_rate) {
-
-                logger()->info("Metadata changed: cf={:.0f}->{:.0f}, bw={:.0f}->{:.0f}, "
-                               "sr={:.0f}->{:.0f}, fft_size={}->{}",
-                               m_center_frequency, stream_meta->center_frequency, m_bandwidth,
-                               stream_meta->bandwidth, m_sample_rate, stream_meta->sample_rate,
-                               m_fft_size, meta_fft_size);
-
-                m_center_frequency = stream_meta->center_frequency;
-                m_sample_rate = stream_meta->sample_rate;
-                m_bandwidth = stream_meta->bandwidth;
-                m_fft_size = meta_fft_size;
-            }
-
-            m_stream_metadata = stream_meta.value();
+        // Steady-state fast path: the same shared metadata instance as the previous
+        // packet means nothing to re-parse.
+        if (meta && meta != m_last_meta) {
+            update_cached_metadata(meta);
         }
 
-        if (m_frame_size != m_fft_size) {
-            logger()->warn("Frame size {} does not match FFT size {}", m_frame_size, m_fft_size);
+        if (data.size() != m_frame_size) {
+            m_frame_size = data.size();
+            m_recheck_frame_size = true;
+        }
+        if (m_recheck_frame_size) {
+            m_recheck_frame_size = false;
+            if (m_fft_size != 0 && m_frame_size != m_fft_size) {
+                logger()->warn("Frame size {} does not match FFT size {}", m_frame_size,
+                               m_fft_size);
+            }
         }
 
-        // Create header JSON (once per frame)
-        nlohmann::json header_json{};
-        header_json["event"] = "header";
-        header_json["payload"] = make_stream_header(stream_ts);
-        auto header_msg = header_json.dump();
-
-        // Binary data (zero-copy via shared_ptr)
-        auto binary_data = std::make_shared<const std::vector<uint8_t>>(
-            reinterpret_cast<const uint8_t*>(stream_data->data()),
-            reinterpret_cast<const uint8_t*>(stream_data->data()) +
-                stream_data->size() * sizeof(T));
-
-        // Send to clients
         auto clients = m_clients.load(std::memory_order_acquire);
-        for (auto& client : *clients) {
-            if (!client->should_send_stream_frame()) {
-                continue;
+        if (clients && !clients->empty()) {
+            // Built lazily on the FIRST client that will actually take this frame:
+            // input arrives at the pipeline rate but clients are FPS-throttled, so
+            // most frames must not pay the JSON dump + full payload copy.
+            std::string header_msg;
+            std::shared_ptr<const std::vector<uint8_t>> binary_data;
+
+            for (auto& client : *clients) {
+                if (!client->should_send_stream_frame()) {
+                    continue;
+                }
+
+                // Check backpressure state regardless of whether we send
+                check_client_backpressure(*client);
+
+                if (client->send_queue_size.load(std::memory_order_relaxed) >=
+                    client->send_queue_hwm) {
+                    client->stream_frames_skipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+
+                if (!binary_data) {
+                    // Header JSON + one payload copy per frame, shared across clients
+                    nlohmann::json header_json{};
+                    header_json["event"] = "header";
+                    header_json["payload"] = make_stream_header(ts);
+                    header_msg = header_json.dump();
+                    binary_data = std::make_shared<const std::vector<uint8_t>>(
+                        reinterpret_cast<const uint8_t*>(data.data()),
+                        reinterpret_cast<const uint8_t*>(data.data()) + data.size() * sizeof(T));
+                }
+
+                // Send header (text), then binary data
+                m_server->send_to_client(client->client_id, ws_message_data_t{header_msg}, false);
+                m_server->send_to_client(client->client_id, ws_message_data_t{binary_data}, true);
+
+                client->stream_frames_sent.fetch_add(1, std::memory_order_relaxed);
+                client->update_stream_fps_metrics();
             }
-
-            // Check backpressure state regardless of whether we send
-            check_client_backpressure(*client);
-
-            if (client->send_queue_size.load(std::memory_order_relaxed) >= client->send_queue_hwm) {
-                client->stream_frames_skipped++;
-                continue;
-            }
-
-            // Send header (text), then binary data
-            m_server->send_to_client(client->client_id, ws_message_data_t{header_msg}, false);
-            m_server->send_to_client(client->client_id, ws_message_data_t{binary_data}, true);
-
-            client->stream_frames_sent++;
-            client->update_stream_fps_metrics();
         }
     }
 
     // === HISTOGRAM DATA ===
-    // Only read histogram if data is available to avoid blocking
-    if (m_hist_in_port.size() > 0) {
-        auto [hist_data, hist_ts, hist_meta] = m_hist_in_port.get_data();
-        if (hist_data != nullptr) {
+    if (auto pkt = m_hist_in_port.try_get()) {
+        did_work = true;
+        auto& [hist, ts, meta] = *pkt;
+        (void)ts;
+        (void)meta;
+
+        auto clients = m_clients.load(std::memory_order_acquire);
+        if (clients && !clients->empty()) {
             nlohmann::json histogram_json{};
             histogram_json["event"] = "histogram";
-            histogram_json["payload"] = *hist_data;
+            histogram_json["payload"] = std::vector<uint64_t>(hist.begin(), hist.end());
 
             auto message = histogram_json.dump();
 
-            // Send to all connected clients immediately
-            auto clients = m_clients.load(std::memory_order_acquire);
             for (auto& client : *clients) {
+                // Same queue bound as the stream path: histograms and metrics are
+                // droppable, and the session queue is unbounded — without this, one
+                // stalled client grows its queue (and process memory) without limit.
+                if (client->send_queue_size.load(std::memory_order_relaxed) >=
+                    client->send_queue_hwm) {
+                    continue;
+                }
                 m_server->send_to_client(client->client_id, ws_message_data_t{message}, false);
-                client->histogram_frames_sent++;
+                client->histogram_frames_sent.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
 
-    // === METRICS ===
-    auto now = std::chrono::steady_clock::now();
-    auto clients = m_clients.load(std::memory_order_acquire);
-    for (auto& client : *clients) {
-        if (client->should_send_metrics()) {
-            auto metrics_json = generate_metrics_message(*client);
-            m_server->send_to_client(client->client_id, ws_message_data_t{metrics_json.dump()},
-                                     false);
-            client->last_metrics_sent = now;
-        }
-    }
-
-    return NORMAL;
+    return did_work ? NORMAL : NOOP;
 }
 
+// Call with m_clients_mutex held: the roster load and the depth writes must be
+// atomic against a racing connect/disconnect, or a stale snapshot could pause the
+// ports while a client is connected (or leave them open with none).
 template <typename T>
 auto ws_sink<T>::update_port_depths() -> void {
-    const size_t client_count = m_clients.load()->size();
+    const auto clients = m_clients.load(std::memory_order_acquire);
+    const size_t client_count = clients ? clients->size() : 0;
 
     if (client_count == 0) {
         m_data_in_port.depth(0);
@@ -287,10 +386,44 @@ auto ws_sink<T>::update_port_depths() -> void {
         logger()->info("No clients connected, disabled upstream processing");
     } else {
         m_data_in_port.depth(m_stream_port_depth);
-        m_hist_in_port.depth(5);
-        logger()->info("{} clients connected, stream_depth={}, histogram_depth=5", client_count,
-                       m_stream_port_depth);
+        m_hist_in_port.depth(HISTOGRAM_PORT_DEPTH);
+        logger()->info("{} clients connected, stream_depth={}, histogram_depth={}", client_count,
+                       m_stream_port_depth, HISTOGRAM_PORT_DEPTH);
     }
+}
+
+template <typename T>
+auto ws_sink<T>::update_cached_metadata(const composite::metadata_ptr& meta) -> void {
+    const auto& md = *meta;
+    logger()->trace("Received stream metadata:\n{}", md.to_string());
+
+    // Extract fft_size from annotations
+    auto meta_fft_size = m_fft_size;
+    if (auto it = md.annotations.find("fft_size"); it != md.annotations.end()) {
+        if (auto v = annotation_as_size(it->second)) {
+            meta_fft_size = *v;
+        }
+    }
+
+    // Check if metadata changed
+    if (m_fft_size != meta_fft_size || m_bandwidth != md.bandwidth ||
+        m_center_frequency != md.center_frequency || m_sample_rate != md.sample_rate) {
+
+        logger()->info("Metadata changed: cf={:.0f}->{:.0f}, bw={:.0f}->{:.0f}, "
+                       "sr={:.0f}->{:.0f}, fft_size={}->{}",
+                       m_center_frequency, md.center_frequency, m_bandwidth, md.bandwidth,
+                       m_sample_rate, md.sample_rate, m_fft_size, meta_fft_size);
+
+        m_center_frequency = md.center_frequency;
+        m_sample_rate = md.sample_rate;
+        m_bandwidth = md.bandwidth;
+        if (m_fft_size != meta_fft_size) {
+            m_fft_size = meta_fft_size;
+            m_recheck_frame_size = true; // re-verify the frame/FFT size match
+        }
+    }
+
+    m_last_meta = meta;
 }
 
 template <typename T>
@@ -302,9 +435,9 @@ auto ws_sink<T>::make_stream_header(composite::timestamp ts) -> nlohmann::json {
         header["format"] = "SF";
     } else if constexpr (std::is_same_v<T, double>) {
         header["format"] = "SD";
-    } else if constexpr (std::is_same_v<std::complex<float>, std::complex<T>>) {
+    } else if constexpr (std::is_same_v<T, std::complex<float>>) {
         header["format"] = "CF";
-    } else if constexpr (std::is_same_v<std::complex<double>, std::complex<T>>) {
+    } else if constexpr (std::is_same_v<T, std::complex<double>>) {
         header["format"] = "CD";
     }
 
@@ -329,16 +462,18 @@ auto ws_sink<T>::generate_metrics_message(const client_state& client) -> nlohman
     metrics["payload"] = {};
 
     // Connection status
-    metrics["payload"]["activeConnections"] = m_clients.load()->size();
-    metrics["payload"]["droppingFrames"] = (client.state == client_state::flow_state::backpressure);
+    const auto clients = m_clients.load(std::memory_order_acquire);
+    metrics["payload"]["activeConnections"] = clients ? clients->size() : 0;
+    metrics["payload"]["droppingFrames"] =
+        (client.current_flow_state() == client_state::flow_state::backpressure);
 
     // Frame rate
     auto fps = client.calculate_stream_fps();
     metrics["payload"]["framesPerSecond"] = std::format("{:.1f}", fps);
 
     // Frame counts
-    auto frames_sent = client.stream_frames_sent;
-    auto frames_dropped = client.stream_frames_skipped;
+    auto frames_sent = client.stream_frames_sent.load(std::memory_order_relaxed);
+    auto frames_dropped = client.stream_frames_skipped.load(std::memory_order_relaxed);
     metrics["payload"]["framesSent"] = frames_sent;
     metrics["payload"]["framesDropped"] = frames_dropped;
 
@@ -354,46 +489,63 @@ auto ws_sink<T>::generate_metrics_message(const client_state& client) -> nlohman
 template <typename T>
 auto ws_sink<T>::check_client_backpressure(client_state& client) -> void {
     const size_t queue_size = client.send_queue_size.load(std::memory_order_relaxed);
-    const size_t hwm = client.send_queue_hwm;
-
-    if (queue_size >= hwm && client.state != client_state::flow_state::backpressure) {
+    const auto transition =
+        next_flow_state(queue_size, client.send_queue_hwm, client.current_flow_state());
+    if (!transition) {
+        return;
+    }
+    switch (*transition) {
+    case client_state::flow_state::backpressure:
         logger()->warn("Client {}: Backpressure detected (queue size: {})", client.client_id,
                        queue_size);
-        client.adjust_stream_fps(client_state::flow_state::backpressure);
-    } else if (queue_size < hwm / 2 && client.state == client_state::flow_state::backpressure) {
+        break;
+    case client_state::flow_state::recovering:
         logger()->info("Client {}: Recovering from backpressure", client.client_id);
-        client.adjust_stream_fps(client_state::flow_state::recovering);
-    } else if (queue_size < hwm / 4 && client.state == client_state::flow_state::recovering) {
+        break;
+    case client_state::flow_state::healthy:
         logger()->info("Client {}: Back to healthy state", client.client_id);
-        client.adjust_stream_fps(client_state::flow_state::healthy);
+        break;
     }
+    client.adjust_stream_fps(*transition);
 }
 
 template <typename T>
 auto ws_sink<T>::on_client_connect(std::shared_ptr<websocket_session> session) -> void {
     auto client = std::make_shared<client_state>();
     client->client_id = session->get_id();
-    client->session = session;
+    client->default_fps = m_default_stream_fps;
     client->stream_fps = m_default_stream_fps;
-    client->stream_frame_interval =
-        std::chrono::microseconds(static_cast<int64_t>(1'000'000.0f / client->stream_fps));
+    client->stream_frame_interval = interval_for(client->stream_fps);
     client->send_queue_hwm = m_send_queue_hwm;
 
     auto now = std::chrono::steady_clock::now();
     client->last_stream_frame_sent = now;
-    client->last_metrics_sent = now;
 
-    // RCU-style update: copy-on-write (mutex protects concurrent updates)
+    // Feed this session's queue size straight into the client's atomic — replaces
+    // the roster-scan fallback wired at initialize (O(clients) per message). Safe
+    // to rebind here: nothing can send to the session until it is published below.
+    session->set_queue_size_callback([client](const std::string&, size_t size) {
+        client->send_queue_size.store(size, std::memory_order_relaxed);
+    });
+
+    // RCU-style update: copy-on-write (mutex protects concurrent updates). The port
+    // depths are updated under the SAME lock so they always match the roster a
+    // racing connect/disconnect published last.
     std::shared_ptr<std::vector<std::shared_ptr<client_state>>> new_clients;
     {
         std::lock_guard lock(m_clients_mutex);
         auto old_clients = m_clients.load(std::memory_order_acquire);
+        if (old_clients && old_clients->size() >= m_max_clients) {
+            logger()->warn("Client {} rejected: max_clients ({}) reached", client->client_id,
+                           m_max_clients);
+            session->close();
+            return;
+        }
         new_clients = std::make_shared<std::vector<std::shared_ptr<client_state>>>(*old_clients);
         new_clients->push_back(client);
         m_clients.store(new_clients, std::memory_order_release);
+        update_port_depths();
     }
-
-    update_port_depths();
 
     logger()->info("Client {} connected (total: {}, default FPS: {})", client->client_id,
                    new_clients->size(), client->stream_fps);
@@ -419,16 +571,17 @@ auto ws_sink<T>::on_client_disconnect(const std::string& client_id) -> void {
         auto old_clients = m_clients.load(std::memory_order_acquire);
         new_clients = std::make_shared<std::vector<std::shared_ptr<client_state>>>();
 
-        for (auto& client : *old_clients) {
-            if (client->client_id != client_id) {
-                new_clients->push_back(client);
+        if (old_clients) {
+            for (auto& client : *old_clients) {
+                if (client->client_id != client_id) {
+                    new_clients->push_back(client);
+                }
             }
         }
 
         m_clients.store(new_clients, std::memory_order_release);
+        update_port_depths(); // under the lock: depths always match the roster
     }
-
-    update_port_depths();
 
     logger()->info("Client {} disconnected (remaining: {})", client_id, new_clients->size());
 }
@@ -439,7 +592,7 @@ auto ws_sink<T>::on_client_message(const std::string& client_id, const std::stri
     try {
         auto msg = nlohmann::json::parse(message);
 
-        if (msg["type"] == "set_stream_fps") {
+        if (msg.value("type", std::string{}) == "set_stream_fps") {
             auto clients = m_clients.load(std::memory_order_acquire);
             for (auto& client : *clients) {
                 if (client->client_id == client_id) {
@@ -466,21 +619,32 @@ auto ws_sink<T>::on_client_message(const std::string& client_id, const std::stri
             }
         }
     } catch (const std::exception& e) {
-        logger()->error("Error parsing client message from {}: {}", client_id, e.what());
+        // One-shot at error, then trace: message bytes are CLIENT-controlled, and any
+        // connected client could otherwise turn a malformed-message loop into a log flood.
+        // exchange() makes the test-and-set atomic — the callbacks run on per-connection
+        // websocket threads, and separate load/store would let a concurrent burst all
+        // observe false and each log at error level.
+        if (!m_msg_error_logged.exchange(true, std::memory_order_relaxed)) {
+            logger()->error("Error parsing client message from {}: {} (further parse errors "
+                            "logged at trace)", client_id, e.what());
+        } else {
+            logger()->trace("Error parsing client message from {}: {}", client_id, e.what());
+        }
     }
 }
 
-extern "C" {
-auto create(std::string_view type) -> std::shared_ptr<composite::component> {
+COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
+                                 -> std::shared_ptr<composite::component> {
+    const auto type = args.type();
     if (type == "f32") {
-        return std::make_shared<ws_sink<float>>();
+        return composite::make_component<ws_sink<float>>(id);
     } else if (type == "cf32") {
-        return std::make_shared<ws_sink<std::complex<float>>>();
+        return composite::make_component<ws_sink<std::complex<float>>>(id);
     } else if (type == "f64") {
-        return std::make_shared<ws_sink<double>>();
+        return composite::make_component<ws_sink<double>>(id);
     } else if (type == "cf64") {
-        return std::make_shared<ws_sink<std::complex<double>>>();
+        return composite::make_component<ws_sink<std::complex<double>>>(id);
     }
-    throw std::invalid_argument("Invalid type. Supported: f32, cf32, f64, cf64");
-}
-}
+    throw std::runtime_error(
+        std::format("unknown type '{}' for ws_sink component (supported: f32, cf32, f64, cf64)", type));
+})

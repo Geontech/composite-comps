@@ -1,0 +1,27 @@
+{
+  "project": {
+    "name": "@PROJECT_NAME@",
+    "version": "@PROJECT_VERSION@",
+    "revision": "@COMPS_GIT_SHA@"
+  },
+  "composite_comps": {
+    "version": "@COMPS_VERSION@"
+  },
+  "framework": {
+    "name": "composite",
+    "required": "@COMPS_COMPOSITE_VERSION@",
+    "resolved": "@COMPS_FRAMEWORK_RESOLVED@",
+    "provider": "@COMPS_FRAMEWORK_PROVIDER@"
+  },
+  "build": {
+    "cxx_compiler": "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@",
+    "cxx_standard": "@COMPS_CXX_STANDARD@",
+    "cpu_baseline": "@COMPS_CPU_BASELINE@",
+    "cpu_tune": "@COMPS_CPU_TUNE@",
+    "build_type": "@CMAKE_BUILD_TYPE@",
+    "fast_math": @COMPS_FAST_MATH_JSON@,
+    "dpdk": @COMPS_HAS_DPDK_JSON@,
+    "sanitizer": "@COMPS_SANITIZER@"
+  },
+  "modules": [@COMPS_MODULE_JSON@]
+}
