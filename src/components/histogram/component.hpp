@@ -20,7 +20,9 @@
 #include "frame_decimator.hpp"
 
 #include <composite/core/component.hpp>
+#include <composite/metrics/metrics.hpp>
 #include <composite/properties/config.hpp>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -56,15 +58,19 @@ public:
     auto on_end_of_stream() -> void override;
 
 private:
+    static constexpr std::size_t INPUT_BATCH_SIZE{32};
+
     auto build_lookup() -> void;
     auto allocate_histogram() -> void;
     auto apply_decimation() -> void;   // recompute the frame/sample thresholds from the config
+    auto process_packet(input_port_t::queue_type& packet) -> void;
     template <typename T>
     auto process_samples(const uint8_t* bytes, std::size_t nbytes) -> void;
 
     // Ports
     input_port_t m_in_port{"data_in"};
     output_port_t m_out_port{"data_out"};
+    std::array<input_port_t::queue_type, INPUT_BATCH_SIZE> m_input_batch;
 
     // Properties (grouped as one reflected config<T>)
     composite::config<histogram_config> m_cfg{};
@@ -86,6 +92,13 @@ private:
     bool m_byteswap{};        // effective swap used this frame (config override, else auto)
     bool m_auto_byteswap{};   // metadata-derived swap (endianness vs host)
     composite::timestamp m_last_ts{};  // ts of the most recent input frame, for the end-of-stream flush
+
+    // Frames consumed while no sample rate is known (no config fallback and none in the
+    // metadata yet): the send threshold cannot be sized, so the frame is DISCARDED. The
+    // counter plus a one-shot warning make that state visible — a histogram wired to a
+    // rate-less stream used to eat its input forever in silence.
+    composite::metrics::counter<uint64_t>* m_frames_no_rate{nullptr};
+    bool m_no_rate_warned{false};
 
     // MUST be last: stops the framework worker before any member above destructs (the base
     // ~component stops too late). See component.hpp auto_stop.

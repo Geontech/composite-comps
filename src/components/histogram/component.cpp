@@ -25,6 +25,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <span>
 #include <type_traits>
 
 namespace {
@@ -57,6 +58,9 @@ histogram::histogram(std::string_view id) : composite::component(id) {
         }
     });
     add_config(m_cfg);
+    m_frames_no_rate = &create_counter(
+        "histogram.frames_discarded_no_rate",
+        "Frames consumed and discarded because no sample rate is known (send threshold unsizable)");
 }
 
 // Precompute, for every possible 16-bit sample value, the number of significant bits it uses
@@ -137,6 +141,7 @@ auto histogram::initialize() -> void {
     m_sample_rate = m_cfg->sample_rate;
     m_source_bits = 16U;   // until metadata says otherwise
     m_bits_warn = false;
+    m_no_rate_warned = false;
     apply_decimation();
     build_lookup();
     allocate_histogram();  // also zeroes m_histogram_samples
@@ -144,18 +149,38 @@ auto histogram::initialize() -> void {
 
 auto histogram::process() -> composite::retval {
     using enum composite::retval;
-    auto pkt = m_in_port.try_get();
-    if (!pkt) {
+    // Drain a bounded batch with one ring-head publication (the fleet ingest pattern:
+    // this component sits on the raw byte stream, the highest-rate position in the graph).
+    // Packets are processed sequentially — metadata is ordered stream state.
+    const auto count = m_in_port.get_batch(std::span{m_input_batch});
+    if (count == 0) {
         return NOOP;
     }
-    auto& [data, ts, meta] = *pkt;
+    for (std::size_t i = 0; i < count; ++i) {
+        process_packet(m_input_batch[i]);
+        m_input_batch[i] = {};  // release the buffer now, not when a later batch overwrites it
+    }
+    // A consumed packet is work done even when the frame was discarded (decimated or
+    // rate-unknown): NOOP here would misreport the cycle and belongs only to the empty ring.
+    return NORMAL;
+}
+
+auto histogram::process_packet(input_port_t::queue_type& packet) -> void {
+    auto& [data, ts, meta] = packet;
     m_last_ts = ts;
 
     // Stream characteristics (rate, bit width, complex, endianness) come from the metadata.
     if (meta != nullptr) {
-        const auto rate = static_cast<float>(meta->sample_rate);
-        if (meta->sample_rate > 0.0 && std::isfinite(rate) && m_sample_rate != rate) {
-            m_sample_rate = rate;
+        // Resolve THIS metadata's rate: its own value when valid, else the config fallback.
+        // Only updating on a VALID rate (as this used to) latched the previous stream's
+        // rate across a transition to a rate-less stream — the histogram kept binning at
+        // the old stream's threshold, silently bypassing both the configured fallback and
+        // the no-rate discard signal below.
+        const auto meta_rate = static_cast<float>(meta->sample_rate);
+        const bool meta_rate_valid = meta->sample_rate > 0.0 && std::isfinite(meta_rate);
+        const auto resolved = meta_rate_valid ? meta_rate : m_cfg->sample_rate;
+        if (m_sample_rate != resolved) {
+            m_sample_rate = resolved;
             apply_decimation();
         }
         // Sample width comes off the wire, so bound it before it reaches the allocator or a shift.
@@ -180,10 +205,21 @@ auto histogram::process() -> composite::retval {
     // Config override wins when set; otherwise use the metadata-derived value.
     m_byteswap = m_cfg->byteswap.value_or(m_auto_byteswap);
 
-    // Can't size the per-message send threshold until the sample rate is known.
+    // Can't size the per-message send threshold until the sample rate is known. The frame
+    // is discarded — say so ONCE and count every occurrence, or a histogram wired to a
+    // rate-less stream (no config fallback, metadata never carries a rate) eats its input
+    // forever with nothing for an operator to see.
     if (m_send_threshold == 0) {
-        return NOOP;
+        if (m_frames_no_rate != nullptr) { m_frames_no_rate->inc(); }
+        if (!m_no_rate_warned) {
+            m_no_rate_warned = true;
+            logger()->warn("histogram: no sample rate known (config sample_rate unset and none "
+                           "in metadata); discarding input until one arrives "
+                           "(counted in histogram.frames_discarded_no_rate)");
+        }
+        return;
     }
+    m_no_rate_warned = false;  // re-arm: a rate is known now
 
     // Decimate whole frames by percent_sampled, then bin the kept frame.
     if (m_decimator.keep()) {
@@ -200,7 +236,6 @@ auto histogram::process() -> composite::retval {
             m_histogram_samples = 0;
         }
     }
-    return NORMAL;
 }
 
 auto histogram::on_end_of_stream() -> void {
