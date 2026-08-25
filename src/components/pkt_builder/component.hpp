@@ -20,10 +20,12 @@
 #pragma once
 
 #include <composite/composite.hpp>
+#include <composite/metrics/metrics.hpp>
 
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,6 +63,9 @@ public:
     ~pkt_builder() override = default;
     auto property_change_handler(const composite::properties::json& diff) -> void override;
     auto process() -> composite::retval override;
+    // Best-effort flush of an in-flight packetization; per-stream residues (< 4 bytes each)
+    // cannot be emitted without fabricating pad samples and are counted as dropped.
+    auto on_end_of_stream() -> void override;
 
 private:
     // Ports
@@ -84,6 +89,7 @@ private:
     bool m_include_class_id{true};
     bool m_include_timestamp{true};
     bool m_warn_on_missing_metadata{true};
+    bool m_payload_clamp_warned{false};  // one-time warning that max_payload_size was clamped to the VITA word limit
 
     // Per-stream state tracking
     struct stream_state {
@@ -95,19 +101,76 @@ private:
         std::chrono::steady_clock::time_point last_context_time{};
         bool first_packet{true};
         bool warned_missing_metadata{false};
+        bool warned_bad_format{false};   ///< one-shot: unsupported format on this stream
+        bool warned_invalid_rf{false};   ///< one-shot: non-finite/out-of-range RF values reset
+        bool warned_unaligned{false};    ///< one-shot: partial-sample bytes dropped
+        // Whole-sample bytes (< one 32-bit word) left over from the previous buffer: carried
+        // into the next packet rather than discarded or zero-padded (VITA payloads are
+        // word-granular). At most 3 bytes; dropped (counted) on a signal change, since the
+        // format they were captured under may no longer apply.
+        std::vector<std::byte> residue;
+        std::chrono::steady_clock::time_point last_seen{};  ///< for LRU eviction at the cap
     };
 
+    /// Distinct-stream state cap: ids come from upstream metadata, so unbounded distinct ids
+    /// must not grow memory without limit. At the cap the least-recently-seen stream is
+    /// EVICTED (its next packet recreates state, resending context with a fresh sequence) —
+    /// a hard reject would let 64 disposable ids permanently lock legitimate new streams out.
+    static constexpr std::size_t MAX_STREAM_STATES = 64;
+
+    /// Chunks emitted per process() invocation: with a writable output, one enormous input
+    /// and a tiny max_payload_size must not pin the worker in the emit loop (stop/property
+    /// handling runs between process() calls). The pending state carries across calls.
+    static constexpr std::size_t EMIT_BUDGET_PER_CALL = 64;
+
+    /// One input buffer mid-packetization. Packetizing is RESUMABLE: emit_pending() sends the
+    /// (optional) context packet and word-aligned whole-sample chunks only while the output
+    /// has room, returning AWAIT_OUTPUT when full so the worker parks on the reverse doorbell
+    /// instead of drop-flooding send_data() — no packet of a partially-emitted buffer is lost.
+    /// Per-chunk timestamps are derived from the total emitted-sample offset (drift-free and
+    /// trivially resumable).
+    struct pending_send {
+        composite::immutable_buffer<std::byte> data;
+        composite::timestamp base_ts{};
+        uint32_t stream_id{0};
+        std::shared_ptr<std::vector<uint8_t>> context;  // non-null until sent
+        std::vector<std::byte> lead;  // residue carried from the previous buffer (< 4 bytes)
+        std::size_t offset{0};        // consumed bytes of `data` (lead excluded)
+        std::size_t payload_end{0};
+        std::size_t sample_size{0};
+        std::size_t max_chunk_bytes{0};
+        double rate{0.0};  // sanitized; 0 = no per-chunk timestamp advance
+        composite::metadata_ptr out_meta;
+        composite::data_format fmt{};
+    };
+    std::optional<pending_send> m_pending;
+    auto emit_pending() -> composite::retval;
+
     std::unordered_map<uint32_t, stream_state> m_stream_states;
+    bool m_stream_cap_warned{false};  ///< one-shot: distinct-stream cap reached (see MAX_STREAM_STATES)
+
+    // Stream-id lookup cache keyed on the incoming shared metadata instance: steady state
+    // (same instance every packet) skips the annotation find + parse.
+    composite::metadata_ptr m_sid_cache_meta;
+    uint32_t m_sid_cache_id{0};
+
+    // Observability: input buffers dropped (unsupported format / stream-cap overflow), and
+    // trailing bytes dropped to keep packets whole-sample and word-aligned.
+    composite::metrics::counter<uint64_t>* m_packets_dropped{nullptr};
+    composite::metrics::counter<uint64_t>* m_bytes_dropped{nullptr};
 
     // Helper methods
     auto get_stream_id(const composite::metadata& metadata) -> uint32_t;
-    auto get_or_create_stream_state(uint32_t stream_id) -> stream_state&;
+    /// nullptr when the distinct-stream cap is reached (caller drops + counts).
+    auto find_or_create_stream_state(uint32_t stream_id) -> stream_state*;
     auto apply_defaults(composite::metadata& metadata) -> void;
     auto validate_metadata(stream_state& state, const composite::metadata& metadata) -> void;
-    auto build_context_packet(stream_state& state, const composite::metadata& metadata)
+    auto build_context_packet(stream_state& state, const composite::metadata& metadata,
+                              const composite::timestamp& ts)
         -> std::shared_ptr<std::vector<uint8_t>>;
-    auto build_data_packet(stream_state& state, std::span<const std::byte> payload,
-                           const composite::timestamp& ts, const composite::data_format& fmt)
+    auto build_data_packet(stream_state& state, std::span<const std::byte> lead,
+                           std::span<const std::byte> payload, const composite::timestamp& ts,
+                           const composite::data_format& fmt)
         -> std::shared_ptr<std::vector<uint8_t>>;
 
     // MUST be last: stops the framework worker before any member above destructs.
