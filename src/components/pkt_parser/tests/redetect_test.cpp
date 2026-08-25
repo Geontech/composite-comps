@@ -69,6 +69,27 @@ auto make_garbage() -> composite::immutable_buffer<uint8_t> {
     return composite::immutable_buffer<uint8_t>(v);
 }
 
+// Real-world SDDS sets the standard-format flag (0x80): its high nibble reads as an
+// UNDEFINED VITA packet type (8..15) when misinterpreted as a V49 header — the exact bytes
+// a vita49-locked parser sees when the pipeline is re-steered to an SDDS receiver.
+auto make_sdds_standard_format() -> composite::immutable_buffer<uint8_t> {
+    auto v = std::make_shared<std::vector<uint8_t>>(SDDS_PACKET_SIZE, 0);
+    (*v)[0] = 0x82;  // standard_format | data_mode = 2 (DM_16BIT_SIGNED)
+    (*v)[1] = 0x10;  // bps = 16
+    return composite::immutable_buffer<uint8_t>(v);
+}
+
+// A BARE (un-wrapped) big-endian V49 signal-data packet, so detection locks plain vita49
+// rather than vita49.1.
+auto make_v49_data() -> composite::immutable_buffer<uint8_t> {
+    vrtgen::packing::Header hdr;
+    hdr.packet_type(vrtgen::packing::PacketType::SIGNAL_DATA_STREAM_ID);
+    auto v = std::make_shared<std::vector<uint8_t>>(hdr.size() + sizeof(uint32_t) + 8, 0);
+    hdr.packet_size(static_cast<uint16_t>(v->size() / sizeof(uint32_t)));
+    hdr.pack_into(v->data());
+    return composite::immutable_buffer<uint8_t>(v);
+}
+
 // --- VITA 49.1 packet builders (VRL header wrapping a big-endian inner V49 packet) ---
 // Built with the same vrtgen packing classes the overlay parses with, so the bit layout
 // cannot drift from the parser's expectations.
@@ -159,8 +180,9 @@ struct redetect_harness {
     // Send one packet, run one process() cycle, and return how many packets the
     // component emitted downstream (drained from the sink). Records the metadata that
     // rode the last emitted packet in last_md.
-    auto feed(const composite::immutable_buffer<uint8_t>& pkt) -> std::size_t {
-        src.send_data(pkt, composite::timestamp{0, 0});
+    auto feed(const composite::immutable_buffer<uint8_t>& pkt,
+              composite::metadata_ptr md = nullptr) -> std::size_t {
+        src.send_data(pkt, composite::timestamp{0, 0}, std::move(md));
         uut->process();
         std::size_t emitted = 0;
         while (sink.size() > 0) {
@@ -258,6 +280,125 @@ int main() {
     check(h.active_name() == "sdds", "re-detects and re-locks on the next valid packet");
     check(emitted == 1, "output resumes after re-detection");
     check(h.failures() == 0, "clean state after re-lock");
+
+    // --- 3a. Mid-stream PROTOCOL FLIP, both directions ------------------------------
+    // Re-steering a pipeline from one receiver to another (SDDS <-> V49) must self-heal via
+    // re-detection. The V49 -> SDDS direction used to be permanently broken: an SDDS flags
+    // byte (standard_format 0x80) reads as an UNDEFINED V49 packet type, and the vita49
+    // parser treated that as a SUCCESSFUL "unsupported type" parse — resetting the failure
+    // counter every packet, so re-detection never fired and the pipeline went silent forever.
+    {
+        redetect_harness flip;
+
+        // Lock plain vita49 with a bare data packet and confirm data flows.
+        check(flip.feed(make_v49_data()) == 1, "flip: bare V49 data packet locks and forwards");
+        check(flip.active_name() == "vita49", "flip: locked on vita49");
+
+        // The stream becomes SDDS. Every packet must now COUNT as a failure...
+        for (uint32_t i = 1; i < flip.threshold(); ++i) {
+            check(flip.feed(make_sdds_standard_format()) == 0, "flip: SDDS packet dropped while locked on vita49");
+            check(flip.failures() == i, "flip: SDDS packets count toward re-detection");
+        }
+        // ...until the threshold un-locks, and the NEXT packet re-detects as SDDS.
+        (void)flip.feed(make_sdds_standard_format());
+        check(flip.active_name() == "<none>", "flip: un-locks after sustained SDDS traffic");
+        check(flip.feed(make_sdds_standard_format()) == 1, "flip: re-detects SDDS and output resumes");
+        check(flip.active_name() == "sdds", "flip: locked on sdds after the flip");
+
+        // And back: SDDS -> V49. Wrong-size packets throw in sdds_parser, so this direction
+        // counts failures and re-detects the same way.
+        for (uint32_t i = 0; i < flip.threshold(); ++i) {
+            (void)flip.feed(make_v49_data());
+        }
+        check(flip.active_name() == "<none>", "flip back: un-locks after sustained V49 traffic");
+        check(flip.feed(make_v49_data()) == 1, "flip back: re-detects V49 and output resumes");
+        check(flip.active_name() == "vita49", "flip back: locked on vita49 again");
+    }
+
+    // A GENUINE V49 extension packet on a V49 stream must remain a quiet drop, never a
+    // re-detection trigger (the fix distinguishes undefined type codes from defined ones).
+    {
+        redetect_harness ext;
+        check(ext.feed(make_v49_data()) == 1, "ext: vita49 locked");
+        vrtgen::packing::Header hdr;
+        hdr.packet_type(vrtgen::packing::PacketType::EXTENSION_DATA);
+        auto v = std::make_shared<std::vector<uint8_t>>(hdr.size() + 8, 0);
+        hdr.packet_size(static_cast<uint16_t>(v->size() / sizeof(uint32_t)));
+        hdr.pack_into(v->data());
+        const auto ext_pkt = composite::immutable_buffer<uint8_t>(v);
+        for (uint32_t i = 0; i < ext.threshold() * 2; ++i) {
+            check(ext.feed(ext_pkt) == 0, "ext: extension packet dropped quietly");
+        }
+        check(ext.active_name() == "vita49", "ext: genuine extension packets never trigger re-detection");
+        check(ext.failures() == 0, "ext: extension packets are not parse failures");
+    }
+
+    // --- 3a2. IN-BAND stream boundary (the primary path) ------------------------------
+    // udp_source stamps a monotonic stream_session annotation, bumped per receiver
+    // (re)construction. A session change resets detection CAUSALLY with the first packet of
+    // the new stream: the very first packet of the new protocol is detected and forwarded —
+    // zero packets spent on failure counting, no orchestration race.
+    {
+        redetect_harness inband;
+        auto session = [](std::int64_t n) {
+            composite::metadata md;
+            md.annotations["stream_session"] = n;
+            return composite::make_metadata(std::move(md));
+        };
+        const auto s1 = session(1);
+        const auto s2 = session(2);
+
+        check(inband.feed(make_v49_data(), s1) == 1, "in-band: vita49 locked and forwarding");
+        check(inband.active_name() == "vita49", "in-band: locked on vita49");
+        check(inband.feed(make_v49_data(), s1) == 1, "in-band: same session stays locked");
+        check(inband.failures() == 0, "in-band: same session is not a failure");
+
+        // The receiver was rebuilt (new stream): the FIRST packet re-detects and forwards.
+        check(inband.feed(make_sdds_standard_format(), s2) == 1,
+              "in-band: first packet of the new session is forwarded (zero loss)");
+        check(inband.active_name() == "sdds", "in-band: locked on sdds at the session boundary");
+
+        // The published metadata carries the session for downstream stream-state consumers —
+        // with its ORIGINAL type preserved (an int64 stays an int64, never coerced to string) —
+        // and the previous stream's carried metadata did NOT leak across the boundary.
+        check(inband.last_md != nullptr &&
+                  inband.last_md->annotations.count("stream_session") == 1 &&
+                  inband.last_md->annotations.at("stream_session").holds<std::int64_t>() &&
+                  inband.last_md->annotations.at("stream_session").get<std::int64_t>() == 2,
+              "in-band: published metadata carries the new stream_session, type preserved");
+    }
+
+    // FIRST-OBSERVED session against pre-existing state: a parser locked from an UNANNOTATED
+    // source, then re-pointed at an annotated one, must treat the first session it ever sees
+    // as a boundary — not parse the new stream's first packets as the old protocol.
+    {
+        redetect_harness first;
+        check(first.feed(make_v49_data()) == 1, "first-session: locked from an unannotated source");
+        check(first.active_name() == "vita49", "first-session: vita49 active");
+
+        composite::metadata md;
+        md.annotations["stream_session"] = std::string{"udp0:7"};
+        check(first.feed(make_sdds_standard_format(), composite::make_metadata(std::move(md))) == 1,
+              "first-session: first annotated packet re-detects and forwards (zero loss)");
+        check(first.active_name() == "sdds", "first-session: locked on sdds");
+    }
+
+    // Source REPLACEMENT: a new udp_source instance restarts its counter, so the token must
+    // embed source identity ("<id>:<generation>") — two sources both at generation 1 are
+    // still DIFFERENT sessions, and the parser must reset between them.
+    {
+        redetect_harness swap;
+        auto session_of = [](const char* token) {
+            composite::metadata md;
+            md.annotations["stream_session"] = std::string{token};
+            return composite::make_metadata(std::move(md));
+        };
+        check(swap.feed(make_v49_data(), session_of("source_a:1")) == 1, "swap: locked via source A");
+        check(swap.active_name() == "vita49", "swap: vita49 active");
+        check(swap.feed(make_sdds_standard_format(), session_of("source_b:1")) == 1,
+              "swap: replacement source at the SAME generation still resets (identity in the token)");
+        check(swap.active_name() == "sdds", "swap: re-detected across the source replacement");
+    }
 
     // --- 3b. One process cycle drains a complete producer batch -------------------
     {

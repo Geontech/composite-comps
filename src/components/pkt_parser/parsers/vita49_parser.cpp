@@ -200,16 +200,33 @@ auto vita49_parser::parse(
     } else {
         // Neither a data nor a context packet. Reachable even with can_parse() narrowed, because
         // protocol lock-in keeps calling parse() for every packet on the stream once vita49 is the
-        // active parser -- so an extension-data (or command) packet can still arrive here.
+        // active parser -- so an extension-data (or command) packet can still arrive here. But TWO
+        // very different cases land in this branch, and they must be told apart:
         //
-        // Previously this fell through to a default-constructed parse_result, whose should_send
-        // defaults to TRUE: the component forwarded an EMPTY payload with a zero timestamp
-        // downstream, silently, uncounted, as though it were valid data. Drop it and say so once.
+        //  - a GENUINE V49 extension/command packet (a defined type code, 0..7, with geometry that
+        //    fits the datagram): drop it quietly with a one-shot warning. This is NOT a parse
+        //    failure -- a V49 stream carrying occasional extension packets must never trip
+        //    re-detection.
+        //
+        //  - bytes that are NOT VITA 49 AT ALL. The high nibble of an SDDS flags byte (standard
+        //    format 0x80) reads as "packet type" 8..15 here, so when a pipeline is re-steered from
+        //    a V49 receiver to an SDDS one, every SDDS packet used to land in this branch as a
+        //    SUCCESSFUL parse with should_send=false -- which RESET the consecutive-failure
+        //    counter, made protocol re-detection unreachable, and left the pipeline locked on
+        //    vita49 and silent forever. Throw instead: the component counts the failure and
+        //    re-detection self-heals onto the stream's real protocol.
+        const auto type_val = std::to_underlying(packet.header().packet_type());
+        const auto claimed_bytes = static_cast<std::size_t>(packet.header().packet_size()) * 4;
+        if (type_val > 7 || claimed_bytes < 4 || claimed_bytes > data.size()) {
+            throw std::out_of_range(
+                "vita49_parser: not a VITA 49 packet (undefined type code or geometry that does "
+                "not fit the datagram) — likely a protocol change on the stream");
+        }
         result.should_send = false;
         if (!m_ext_warn) {
             result.warning = std::format(
                 "unsupported VITA 49 packet type {} (extension/command); dropping these packets",
-                static_cast<unsigned>(std::to_underlying(packet.header().packet_type())));
+                static_cast<unsigned>(type_val));
             m_ext_warn = true;
         }
     }

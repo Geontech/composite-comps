@@ -130,7 +130,45 @@ auto pkt_parser::process() -> composite::retval {
 }
 
 auto pkt_parser::process_packet(input_port_t::queue_type packet) -> void {
-    auto& [data, _, __] = packet;
+    auto& [data, _, in_md] = packet;
+
+    // IN-BAND stream boundary: udp_source stamps a monotonic `stream_session` annotation on
+    // every packet, bumped whenever its receiver is (re)constructed (an ip/port rewrite, a
+    // reactivation). A session change is an authoritative "this is a NEW stream" — reset
+    // protocol detection and the carried metadata immediately, causally ordered with the
+    // first packet of the new stream: no failure-counting loss window, and no stale-format
+    // republish from the previous stream. Steady state is one pointer compare (the source
+    // latches the instance per session). The failure-counting re-detection below remains the
+    // safety net for stream changes nobody announced.
+    if (in_md != m_last_in_md) [[unlikely]] {
+        if (in_md != nullptr) {
+            if (const auto it = in_md->annotations.find("stream_session"); it != in_md->annotations.end()) {
+                // Compare (and later republish) the TYPED annotation_value: coercing through
+                // to_string() would both change the annotation's type downstream and make
+                // distinct values (integer 1, string "1") indistinguishable. The FIRST
+                // observed session is itself a boundary whenever stream state already exists
+                // (a parser locked from an unannotated source, then re-pointed at an
+                // annotated one, must not parse the new stream's first packets as the old
+                // protocol) — only a parser with no state yet skips the reset.
+                const bool session_changed =
+                    m_seen_session ? !(it->second == m_last_session)
+                                   : (m_active_parser != nullptr || m_init_metadata);
+                if (session_changed) {
+                    logger()->info("stream session changed ({} -> {}); re-running protocol detection",
+                                   m_last_session.to_string(), it->second.to_string());
+                    m_active_parser = nullptr;
+                    m_consecutive_parse_failures = 0;
+                    m_drop_warned = false;
+                    m_metadata = composite::metadata{};
+                    m_metadata_shared = nullptr;
+                    m_init_metadata = false;
+                }
+                m_last_session = it->second;
+                m_seen_session = true;
+            }
+        }
+        m_last_in_md = in_md;
+    }
 
     // The packet bytes are UNTRUSTED (raw UDP). A malformed/short datagram must
     // never propagate an exception out of process() — that would FINISH the
@@ -217,6 +255,11 @@ auto pkt_parser::process_packet(input_port_t::queue_type packet) -> void {
         // retrigger a republish per packet.
         for (const auto& [key, value] : m_annotation_overrides) {
             m_metadata.annotations[key] = value;
+        }
+        // Propagate the stream-session boundary downstream: consumers with stream state
+        // (framer anchors, exp_smooth baselines) can key off the same signal.
+        if (m_seen_session) {
+            m_metadata.annotations["stream_session"] = m_last_session;
         }
         m_metadata_shared = composite::make_metadata(m_metadata);
         logger()->trace("Updated metadata:\n{}", m_metadata.to_string());

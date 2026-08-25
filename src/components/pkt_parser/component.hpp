@@ -71,6 +71,12 @@ private:
     composite::metadata m_metadata;
     composite::metadata_ptr m_metadata_shared;
     bool m_init_metadata{false};
+    // In-band stream-boundary tracking (udp_source's `stream_session` annotation): a session
+    // change resets detection + carried metadata. Pointer-compared per packet; parsed only
+    // when the upstream instance changes.
+    composite::metadata_ptr m_last_in_md;
+    composite::annotation_value m_last_session;  // typed: preserved as emitted upstream
+    bool m_seen_session{false};
     bool m_drop_warned{false};   ///< rate-limit drop warnings (the counter carries the real signal)
     uint32_t m_consecutive_parse_failures{0};  ///< a run of these triggers protocol re-detection
 
