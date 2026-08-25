@@ -171,6 +171,12 @@ auto copy_swap(uint8_t* dst, const uint8_t* src, std::size_t len, std::size_t wi
 /// Copy the payload into the packet, converting to big-endian wire order in the same pass.
 inline auto copy_payload_to_be(uint8_t* dst, const std::byte* src, std::size_t len,
                                const composite::data_format& fmt) -> void {
+    if (len == 0) {
+        // An EMPTY span's data() is null (the lead span is empty whenever no sub-word
+        // remainder is carried), and memcpy's pointer arguments are attribute-nonnull:
+        // passing null is undefined behavior even with a zero length (UBSan traps it).
+        return;
+    }
     const auto* bytes = reinterpret_cast<const uint8_t*>(src);
     if (fmt.endianness == std::endian::big || fmt.bit_width <= 8) {
         std::memcpy(dst, bytes, len);
