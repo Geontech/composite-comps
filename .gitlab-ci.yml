@@ -24,27 +24,24 @@ stages:
 variables:
   # The framework release the fleet is qualified against, and the images it is built ON and runs ON.
   #
-  # 0.5.0 GA. OpenTelemetry and OpenSSL are compiled IN (`composite-cli --features` reports
-  # "opentelemetry, openssl"; the DPDK family adds "dpdk"). The four published tags are:
+  # 0.5.2 patch release. OpenTelemetry and OpenSSL are compiled IN (`composite-cli --features`
+  # reports "opentelemetry, openssl"; the DPDK family adds "dpdk"). The four published tags
+  # follow the same shape as 0.5.0: 0.5.2 (runtime), 0.5.2-devel (SDK), 0.5.2-dpdk,
+  # 0.5.2-dpdk-devel.
   #
-  #   0.5.0                   runtime, otel + openssl              72 MB
-  #   0.5.0-devel             SDK, same features                  241 MB
-  #   0.5.0-dpdk              runtime + dpdk                       78 MB
-  #   0.5.0-dpdk-devel        SDK + dpdk                          264 MB
-  #
-  # Moving off the rc.2 images picks up two framework fixes the fleet depends on:
-  # pipeline_component::stop_pool() now publishes its stop flag under the pool mutex (an unlocked
-  # store could land between a pool worker's predicate check and its block -- a lost wakeup on the
-  # one unbounded wait, wedging the joining thread; fft/psd/framer all run that pool), and a
-  # stacked input-port pause no longer clobbers the saved depth, which could otherwise "restore"
-  # depth 0 and leave a component reporting running while silently discarding every packet.
+  # Moving off 0.5.0 picks up the 0.5.1 correctness patch (SSE metrics streams no longer delay
+  # shutdown, REST component creation is loader-consistent and race-free under concurrent
+  # requests, fan-out send_batch overflow callbacks aggregate, slab_pool::release() validation
+  # is always on, connect-time element-type checks compare type_index) and the 0.5.2
+  # disabled-input gating fix (a component configured `enabled: false` before first start no
+  # longer retains a stale input backlog that a later enable would consume first).
   #
   # Keep COMPOSITE_REF and COMPOSITE_IMAGE_TAG in step: the git tag v$COMPOSITE_REF is the commit
-  # those images were built from (v0.5.0 == b91fad56, per the images'
-  # org.opencontainers.image.revision label).
-  COMPOSITE_VERSION: "0.5.0"
-  COMPOSITE_REF: "v0.5.0"
-  COMPOSITE_IMAGE_TAG: "0.5.0"
+  # those images were built from (v0.5.2 == 9c26fe21 per `git rev-parse`; cross-check the images'
+  # org.opencontainers.image.revision label when promoting).
+  COMPOSITE_VERSION: "0.5.2"
+  COMPOSITE_REF: "v0.5.2"
+  COMPOSITE_IMAGE_TAG: "0.5.2"
   COMPOSITE_REPO: "https://github.com/geontech/composite.git"
   COMPOSITE_DEVEL_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}-devel"
   COMPOSITE_RUNTIME_IMAGE: "geontech/composite:${COMPOSITE_IMAGE_TAG}"

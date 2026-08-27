@@ -31,8 +31,9 @@ cmake_minimum_required(VERSION 3.22)
 #
 # The framework compatibility contract is expressed separately, by
 # COMPS_COMPOSITE_VERSION below. Because composite's package config declares
-# SameMinorVersion compatibility, a non-EXACT find_package(composite 0.5.0)
-# accepts any 0.5.x and rejects 0.6 -- which is exactly the range the fleet means.
+# SameMinorVersion compatibility, a non-EXACT find_package(composite 0.5.2)
+# accepts any 0.5.x >= 0.5.2 and rejects 0.6 -- which is exactly the range the
+# fleet means (the rc.4 qualification depends on the 0.5.1/0.5.2 fixes).
 #
 # Two consequences worth keeping in mind:
 #   * the fleet version cannot tell you which modules an image contains, so the
@@ -77,7 +78,7 @@ endif()
 
 # The framework release this fleet is qualified against. Enforced rather than
 # hoped for -- see COMPS_REQUIRE_EXACT_COMPOSITE in cmake/CompsDependencies.cmake.
-set(COMPS_COMPOSITE_VERSION "0.5.0" CACHE STRING "composite framework version to build against")
+set(COMPS_COMPOSITE_VERSION "0.5.2" CACHE STRING "composite framework version to build against")
 
 # Captured because the helpers are usable from a CONSUMING project (an overlay repo that
 # FetchContent's this one and calls comps_add_component() for its own components). Inside such a
