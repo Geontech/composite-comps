@@ -1,7 +1,10 @@
 /*
  * MIDAS Blue File Format Support
  *
- * Adapted from REDHAWK blueFileLib (GPL v3)
+ * SPDX-License-Identifier: LGPL-3.0-or-later
+ *
+ * Adapted from REDHAWK rh.blueFileLib (LGPL v3):
+ *   https://github.com/RedhawkSDR/blueFileLib
  * Simplified header-only implementation for sigmf_source component.
  */
 
