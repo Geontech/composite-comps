@@ -28,3 +28,6 @@ set_target_properties(sigmf_source PROPERTIES
 install(TARGETS sigmf_source
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
+
+# Tests
+add_subdirectory(tests)

@@ -8,13 +8,16 @@
 #pragma once
 
 #include <composite/composite.hpp>
-
+#include <array>
 #include <chrono>
 #include <complex>
 #include <cstdint>
+#include <numeric>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include <sys/mman.h>
@@ -47,14 +50,70 @@ namespace struct_props {
  * If a field has a value, it overrides what's in the .sigmf-meta file.
  */
 struct sigmf_overrides {
+    // Runtime-mutable: edits propagate via refresh_runtime_from_spec.
     std::optional<double> sample_rate;
     std::optional<double> center_frequency;
     std::optional<double> bandwidth;
+    // Load-time-only: changes after the file is loaded are ignored (the mmap
+    // was sized / byte-swapped / opened against the original values, and
+    // retroactively reinterpreting bytes is unsafe). To change either field,
+    // remove the file (files[i] = null) and add it back.
     std::optional<std::string> datatype;  // e.g., "cf32_le", "ri16_be", "cu8"
     std::optional<std::string> filetype;  // "raw" or "bluefile-1000"
 };
 
+// Incoming file identity
+struct file_spec {
+    std::string file_path; // identity of file
+    int32_t stream_id{0};
+    // Per-file egress destination. Assigned by the controlling service, which
+    // owns address allocation; this component only forwards what it is given.
+    // destination_ip empty -> emit no annotation, so udp_sink's default_dest_ip
+    // applies. destination_port 0 -> fall back to the component-level
+    // destination_port property. Streams are separated by group address, not by
+    // port, so that receivers joining one group are not forwarded the others.
+    std::string destination_ip;
+    uint32_t destination_port{0};
+    bool loop{false};
+    bool rate_control{true};
+    bool wallclock_timestamps{false};
+    double max_sample_rate{-1.0};
+    sigmf_overrides overrides{};
+};
+
 } // namespace struct_props
+
+// Property traits for sigmf_overrides struct
+template<>
+struct composite::properties::property_traits<struct_props::sigmf_overrides> {
+    static void register_fields(composite::properties::property_set& ps, struct_props::sigmf_overrides& o) {
+        using enum composite::properties::config_type;
+        ps.add("sample_rate", o.sample_rate, RUNTIME);
+        ps.add("center_frequency", o.center_frequency, RUNTIME);
+        ps.add("bandwidth", o.bandwidth, RUNTIME);
+        ps.add("datatype", o.datatype, RUNTIME);
+        ps.add("filetype", o.filetype, RUNTIME);
+    }
+};
+
+// File template
+template<>
+struct composite::properties::property_traits<struct_props::file_spec> {
+    static constexpr std::string_view type_name = "file_spec";
+    static void register_fields(composite::properties::property_set& ps,
+                    struct_props::file_spec& s) {
+        using composite::properties::config_type;
+        ps.add("path", s.file_path, config_type::RUNTIME);
+        ps.add("stream_id", s.stream_id, config_type::RUNTIME);
+        ps.add("destination_ip", s.destination_ip, config_type::RUNTIME);
+        ps.add("destination_port", s.destination_port, config_type::RUNTIME);
+        ps.add("loop", s.loop, config_type::RUNTIME);
+        ps.add("rate_control", s.rate_control, config_type::RUNTIME);
+        ps.add("wallclock_timestamps", s.wallclock_timestamps, config_type::RUNTIME);
+        ps.add("max_sample_rate", s.max_sample_rate, config_type::RUNTIME);
+        ps.add("overrides", s.overrides, config_type::RUNTIME);
+    }
+};
 
 /**
  * RAII wrapper for memory-mapped file region.
@@ -162,39 +221,6 @@ private:
 };
 
 /**
- * Lightweight view into a portion of an MmapRegion.
- * Satisfies ValidBufferContainer for use with immutable_buffer.
- * Keeps the underlying MmapRegion alive via shared_ptr.
- */
-template<typename T>
-class MmapView {
-public:
-    using value_type = T;
-
-    MmapView(std::shared_ptr<MmapRegion<T>> region, std::size_t offset, std::size_t count)
-        : m_region(std::move(region)), m_offset(offset), m_count(count) {}
-
-    MmapView(const MmapView&) = default;
-    MmapView& operator=(const MmapView&) = default;
-    MmapView(MmapView&&) = default;
-    MmapView& operator=(MmapView&&) = default;
-
-    T* data() noexcept { return m_region->data() + m_offset; }
-    const T* data() const noexcept { return m_region->data() + m_offset; }
-    std::size_t size() const noexcept { return m_count; }
-
-    T* begin() noexcept { return data(); }
-    T* end() noexcept { return data() + m_count; }
-    const T* begin() const noexcept { return data(); }
-    const T* end() const noexcept { return data() + m_count; }
-
-private:
-    std::shared_ptr<MmapRegion<T>> m_region;
-    std::size_t m_offset{0};
-    std::size_t m_count{0};
-};
-
-/**
  * @brief SigMF file source component with dynamic datatype support
  *
  * Reads SigMF files and outputs raw bytes with format metadata.
@@ -214,86 +240,118 @@ public:
     auto start() -> void override;
     auto stop() -> void override;
     auto process() -> composite::retval override;
-    auto property_change_handler() -> void override;
 
 private:
-    void parse_metadata();
-    void send_metadata_to_port();
-    void configure_file();       // Load/mmap file when enabled
-    void configure_blue_file();  // Configure MIDAS Blue file
-    void calculate_timing();
-    auto process_chunk() -> composite::retval;
-    auto detect_filetype(const std::string& data_path) -> std::string;
+    struct file_runtime {
+        // File identity
+        std::string file_path;
+        std::string data_path;
 
-    // Datatype parsing
+        // File / Format 
+        char blue_type_code{0};
+        std::shared_ptr<MmapRegion<std::byte>> mmap;
+        composite::metadata cached_meta;
+        std::size_t bytes_per_sample{0};
+        std::size_t total_samples{0};
+        std::size_t data_start_offset{0};
+        bool needs_swap{false};
+
+        // Playback state
+        std::size_t current_byte_offset{0};
+        uint64_t samples_sent{0};
+        std::chrono::steady_clock::time_point start_time;
+        uint32_t utc_epoch_seconds{0};
+        bool eof{false};
+
+        // Timing / rate control
+        double effective_sample_rate{0.0};
+        std::chrono::microseconds chunk_interval{0};
+        uint32_t chunks_per_wakeup{1};
+        bool rate_control{true};
+
+        // Spec mirrored flags
+        bool loop{false};
+        bool wallclock_timestamps{false};
+
+        // Lifecycle
+        bool load_error{false};
+
+        // Metrics
+        static constexpr std::size_t kRollingWindow = 6;
+        uint64_t prev_samples_sent{0};
+        std::chrono::steady_clock::time_point prev_tick_time{};
+        std::array<double, kRollingWindow> recent_rates{};
+        std::size_t recent_idx{0};
+        std::size_t recent_count{0};
+        double rolling_rate_sps{0.0};
+        uint64_t loop_count{0};
+        enum class health { ok, warn, err };
+        health prev_health{health::ok};
+        bool prev_eof{false};
+    };
+
+    // Stores files metadata
+    struct parsed_metadata {
+        std::string filetype{"raw"};
+        double sample_rate{0.0};
+        double center_frequency{0.0};
+        std::string description;
+        SigmfFormat format;
+    };
+
+    // Property change listeners
+    bool on_files_changed();
+    bool on_streaming_changed();
+
+    // File loading
+    bool load_file(const struct_props::file_spec& spec, file_runtime& rt);
+    bool load_blue_file(const struct_props::file_spec& spec, parsed_metadata& meta, file_runtime& rt);
+    bool parse_metadata(const struct_props::file_spec& spec, parsed_metadata& meta);
+
+    // Runtime Helpers
+    void reset_runtime_for_playback(file_runtime& rt, std::chrono::steady_clock::time_point now, uint32_t utc_epoch_seconds);
+    bool remap_runtime(file_runtime& rt);
+    void refresh_runtime_from_spec(const struct_props::file_spec& spec, file_runtime& rt);
+    void calculate_timing(const struct_props::file_spec& spec, file_runtime& rt, parsed_metadata& meta);
+
+    // Metrics
+    void spawn_metrics_thread();
+    void stop_metrics_thread();
+    void log_metrics();
+
+    // Processing
+    auto process_chunk(file_runtime& rt) -> composite::retval;
+    bool apply_endianness_swap_raw(file_runtime& rt);
+    bool apply_endianness_swap_blue(file_runtime& rt);
+    void build_metadata(const struct_props::file_spec& spec, file_runtime& rt, const parsed_metadata& meta);
+    void stamp_destination(const struct_props::file_spec& spec, file_runtime& rt);
+    
+    // Static helpers
     static auto parse_datatype(std::string_view datatype_str) -> std::optional<SigmfFormat>;
-
-    // Endianness handling - swap bytes in mmap region (MAP_PRIVATE allows this)
-    void apply_endianness_swap();
-
-    // Helper to convert SigmfFormat to composite::data_format
     static auto to_composite_format(const SigmfFormat& fmt) -> composite::data_format;
+    static std::string format_rate(double sps);
+    static std::string stream_id_of(const file_runtime& rt); 
 
+    // Single output port
     output_port_t m_out_port{"data_out"};
 
-    // Configuration properties
+    // Vector of statuses
+    std::vector<file_runtime> m_runtime;
+
+    // mutex and thread
+    std::shared_mutex m_runtime_mutex;
+    std::jthread m_metrics_thread;
+
+
+    // Configuration (RUNTIME) properties
     bool m_streaming{false};
-    std::string m_file_path;
+    std::vector<struct_props::file_spec> m_files;
     std::size_t m_chunk_samples{8192};
-    bool m_loop{false};
-    uint32_t m_stream_id{0};
+    uint32_t m_destination_port{5000};
 
-    // Rate control properties
-    bool m_rate_control{true};
-    double m_max_sample_rate{-1.0};
-
-    // Timestamp mode: false = file-time (sample-based), true = wall-clock
-    bool m_wallclock_timestamps{false};
-
-    // Metadata overrides (override values from .sigmf-meta file)
-    struct_props::sigmf_overrides m_overrides;
-
-    // Memory-mapped file (as raw bytes)
-    std::shared_ptr<MmapRegion<std::byte>> m_mmap;
-    std::size_t m_current_byte_offset{0};
-    std::size_t m_data_start_offset{0};  // Offset where sample data begins (0 for raw, 512+ for Blue)
-    std::size_t m_total_samples{0};
-    std::size_t m_bytes_per_sample{0};
-    bool m_eof{false};
-    bool m_configured{false};  // True once file is loaded and ready
-    std::string m_filetype{"raw"};  // "raw" or "bluefile-1000"
-
-    // Metadata from SigMF file
-    double m_sample_rate{0.0};
-    double m_center_frequency{0.0};
-    std::string m_description;
-    SigmfFormat m_format;
-
-    // UTC epoch anchor (seconds since Unix epoch, captured from system_clock at start)
-    uint32_t m_utc_epoch_seconds{0};
-
-    // Rate control timing state
-    double m_effective_sample_rate{0.0};
-    std::chrono::steady_clock::time_point m_start_time;
-    std::chrono::steady_clock::time_point m_next_send_time;
-    std::chrono::microseconds m_chunk_interval{0};
-    uint32_t m_chunks_per_wakeup{1};
-
-    // Track samples sent for timestamp calculation
-    uint64_t m_samples_sent{0};
-};
-
-// Property traits for sigmf_overrides struct
-template<>
-struct composite::properties::property_traits<struct_props::sigmf_overrides> {
-    static void register_fields(composite::properties::property_set& ps, struct_props::sigmf_overrides& o) {
-        using enum composite::properties::config_type;
-        ps.add("sample_rate", o.sample_rate, RUNTIME);
-        ps.add("center_frequency", o.center_frequency, RUNTIME);
-        ps.add("bandwidth", o.bandwidth, RUNTIME);
-        ps.add("datatype", o.datatype, RUNTIME);
-        ps.add("filetype", o.filetype, RUNTIME);
-    }
+    // Metrics constants
+    static constexpr auto kMetricsTickInterval = std::chrono::seconds(5);
+    static constexpr double kRateDeviationThreshold = 0.05;  // 5%
 };
 
 #ifndef UNIT_TESTS

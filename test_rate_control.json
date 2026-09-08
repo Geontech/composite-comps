@@ -5,11 +5,19 @@
             "library": "build/components/libsigmf_source.so",
             "subtype": "cf32",
             "properties": {
-                "file_path": "test_50msps_big",
                 "chunk_samples": 8192,
-                "loop": true,
-                "rate_control": true,
-                "max_sample_rate": -1
+                "destination_port": 5000,
+                "files": [
+                    {
+                        "path": "/home/chinkey/temp/sigmf_test/test_1000msps_big",
+                        "stream_id": 0,
+                        "loop": true,
+                        "rate_control": true,
+                        "wallclock_timestamps": false,
+                        "max_sample_rate": -1
+                    }
+                ],
+                "streaming": true
             }
         },
         {

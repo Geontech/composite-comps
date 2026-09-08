@@ -1,0 +1,270 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2025 Geon Technologies, LLC
+
+// Covers the egress destination that sigmf_source stamps into output metadata
+// for udp_sink to route on. The invariant under test: concurrent streams are
+// separated by group address with the port held flat, because IGMP membership
+// is per group and a shared group forwards every stream to every subscriber.
+
+#include <catch2/catch_test_macros.hpp>
+
+#include "../component.hpp"
+
+#include <composite/composite.hpp>
+
+#include <complex>
+#include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+constexpr std::size_t kTestSamples = 64;
+constexpr double kSampleRate = 1000000.0;
+constexpr auto kComponentDefaultPort = "5000";
+
+using annotation_map = std::map<std::string, std::string>;
+
+auto next_dir_id() -> std::size_t {
+    static std::size_t counter = 0;
+    return ++counter;
+}
+
+// Writes a minimal cf32_le SigMF pair, returning the .sigmf-data path.
+auto write_sigmf_pair(const std::filesystem::path& dir, const std::string& stem) -> std::string {
+    const auto data_path = dir / (stem + ".sigmf-data");
+    const auto meta_path = dir / (stem + ".sigmf-meta");
+
+    std::vector<std::complex<float>> samples(kTestSamples);
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        samples[i] = {static_cast<float>(i), -static_cast<float>(i)};
+    }
+
+    std::ofstream data(data_path, std::ios::binary);
+    data.write(reinterpret_cast<const char*>(samples.data()),
+               static_cast<std::streamsize>(samples.size() * sizeof(std::complex<float>)));
+    data.close();
+
+    std::ofstream meta(meta_path);
+    meta << R"({"global":{"core:datatype":"cf32_le","core:sample_rate":)" << kSampleRate
+         << R"(},"captures":[{"core:sample_start":0,"core:frequency":100000000.0}]})";
+    meta.close();
+
+    return data_path.string();
+}
+
+struct destination_fixture {
+    using byte_buffer = composite::immutable_buffer<std::byte>;
+
+    std::filesystem::path dir;
+    std::shared_ptr<sigmf_source> source;
+    std::shared_ptr<composite::input_port<byte_buffer>> sink;
+
+    destination_fixture() {
+        dir = std::filesystem::temp_directory_path() /
+              ("sigmf_source_dest_" + std::to_string(next_dir_id()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+
+        source = std::make_shared<sigmf_source>("test_sigmf_source");
+        sink = std::make_shared<composite::input_port<byte_buffer>>("sink");
+
+        auto* out = source->get_port<composite::output_port<byte_buffer>>("data_out");
+        REQUIRE(out != nullptr);
+        out->connect(sink.get());
+
+        source->set_properties({{"chunk_samples", std::to_string(kTestSamples)}});
+    }
+
+    ~destination_fixture() {
+        source->set_properties({{"streaming", "false"}});
+        source->stop();
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+
+    // Appends a file spec. Empty dest_ip / zero dest_port are omitted from the
+    // spec entirely, exercising the fall-through-to-default paths.
+    auto add_file(const std::string& stem,
+                  int stream_id,
+                  const std::string& dest_ip = "",
+                  uint32_t dest_port = 0) -> std::size_t {
+        std::vector<std::pair<std::string, std::string>> fields{
+            {"path", write_sigmf_pair(dir, stem)},
+            {"stream_id", std::to_string(stream_id)},
+            {"rate_control", "false"},  // emit as fast as the port accepts
+            {"loop", "true"},
+        };
+        if (!dest_ip.empty()) {
+            fields.emplace_back("destination_ip", dest_ip);
+        }
+        if (dest_port != 0) {
+            fields.emplace_back("destination_port", std::to_string(dest_port));
+        }
+        return source->append_struct_list("files", fields);
+    }
+
+    void start_streaming() {
+        source->set_properties({{"streaming", "true"}});
+    }
+
+    // Pumps the component until every expected stream has emitted, returning the
+    // annotations each one carried, keyed by stream_id.
+    auto collect_annotations(std::size_t expected_streams) -> std::map<std::string, annotation_map> {
+        std::map<std::string, annotation_map> by_stream;
+        for (int attempt = 0; attempt < 200 && by_stream.size() < expected_streams; ++attempt) {
+            source->process();
+            while (sink->size() > 0) {
+                auto [data, ts, meta] = sink->get_data();
+                if (!data || !meta) continue;
+                auto id = meta->annotations.find("stream_id");
+                if (id == meta->annotations.end()) continue;
+                by_stream[id->second] = meta->annotations;
+            }
+        }
+        return by_stream;
+    }
+};
+
+} // namespace
+
+TEST_CASE("sigmf_source: concurrent streams get distinct groups on a flat port", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    fx.add_file("stream_a", 1, "239.0.10.3");
+    fx.add_file("stream_b", 2, "239.0.10.4");
+    fx.add_file("stream_c", 3, "239.0.10.5");
+    fx.start_streaming();
+
+    auto streams = fx.collect_annotations(3);
+    REQUIRE(streams.size() == 3);
+
+    CHECK(streams["1"]["destination_ip"] == "239.0.10.3");
+    CHECK(streams["2"]["destination_ip"] == "239.0.10.4");
+    CHECK(streams["3"]["destination_ip"] == "239.0.10.5");
+
+    // The regression this component's addressing exists to prevent: the port
+    // must NOT be offset per stream, or receivers joining one group are
+    // forwarded all of them.
+    CHECK(streams["1"]["destination_port"] == kComponentDefaultPort);
+    CHECK(streams["2"]["destination_port"] == kComponentDefaultPort);
+    CHECK(streams["3"]["destination_port"] == kComponentDefaultPort);
+}
+
+TEST_CASE("sigmf_source: absent destination_ip emits no annotation", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    fx.add_file("no_dest", 7);
+    fx.start_streaming();
+
+    auto streams = fx.collect_annotations(1);
+    REQUIRE(streams.size() == 1);
+
+    // No annotation at all, so udp_sink applies its default_dest_ip rather than
+    // routing to a half-configured destination.
+    CHECK_FALSE(streams["7"].contains("destination_ip"));
+    CHECK(streams["7"]["destination_port"] == kComponentDefaultPort);
+}
+
+TEST_CASE("sigmf_source: per-file destination_port overrides the component default", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    fx.add_file("custom_port", 1, "239.0.10.3", 6100);
+    fx.add_file("default_port", 2, "239.0.10.4");
+    fx.start_streaming();
+
+    auto streams = fx.collect_annotations(2);
+    REQUIRE(streams.size() == 2);
+
+    CHECK(streams["1"]["destination_port"] == "6100");
+    CHECK(streams["2"]["destination_port"] == kComponentDefaultPort);
+}
+
+TEST_CASE("sigmf_source: component destination_port applies to every stream", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    fx.source->set_properties({{"destination_port", "7000"}});
+    fx.add_file("stream_a", 1, "239.0.10.3");
+    fx.add_file("stream_b", 2, "239.0.10.4");
+    fx.start_streaming();
+
+    auto streams = fx.collect_annotations(2);
+    REQUIRE(streams.size() == 2);
+
+    CHECK(streams["1"]["destination_port"] == "7000");
+    CHECK(streams["2"]["destination_port"] == "7000");
+}
+
+TEST_CASE("sigmf_source: editing a live spec re-stamps the destination", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    auto index = fx.add_file("movable", 1, "239.0.10.3");
+    fx.start_streaming();
+
+    auto before = fx.collect_annotations(1);
+    REQUIRE(before.size() == 1);
+    REQUIRE(before["1"]["destination_ip"] == "239.0.10.3");
+
+    // Live edit goes through refresh_runtime_from_spec, a separate path from the
+    // initial load's build_metadata.
+    const std::vector<std::pair<std::string, std::string>> edit{
+        {"destination_ip", "239.0.10.9"},
+        {"destination_port", "6200"},
+    };
+    fx.source->update_struct_list_element("files", index, edit);
+
+    auto after = fx.collect_annotations(1);
+    REQUIRE(after.size() == 1);
+    CHECK(after["1"]["destination_ip"] == "239.0.10.9");
+    CHECK(after["1"]["destination_port"] == "6200");
+}
+
+TEST_CASE("sigmf_source: clearing destination_ip falls back to the udp_sink default", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    auto index = fx.add_file("clearable", 1, "239.0.10.3");
+    fx.start_streaming();
+
+    auto before = fx.collect_annotations(1);
+    REQUIRE(before["1"]["destination_ip"] == "239.0.10.3");
+
+    // A stale annotation here would keep transmitting to the old group after the
+    // controller has released it.
+    const std::vector<std::pair<std::string, std::string>> clear{{"destination_ip", ""}};
+    fx.source->update_struct_list_element("files", index, clear);
+
+    auto after = fx.collect_annotations(1);
+    REQUIRE(after.size() == 1);
+    CHECK_FALSE(after["1"].contains("destination_ip"));
+}
+
+TEST_CASE("sigmf_source: duplicate destinations do not both stream", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    fx.add_file("first", 1, "239.0.10.3");
+    fx.add_file("collides", 2, "239.0.10.3");  // same group and port as `first`
+    fx.start_streaming();
+
+    // Interleaving two files on one destination is unrecoverable for a receiver,
+    // so the later spec is errored rather than transmitted.
+    auto streams = fx.collect_annotations(2);
+    CHECK(streams.size() == 1);
+    CHECK(streams.contains("1"));
+}
+
+TEST_CASE("sigmf_source: only one spec may omit destination_ip", "[sigmf_source][destination]") {
+    destination_fixture fx;
+
+    fx.add_file("implicit_default", 1);
+    fx.add_file("also_implicit_default", 2);  // both resolve to udp_sink's default group
+    fx.start_streaming();
+
+    auto streams = fx.collect_annotations(2);
+    CHECK(streams.size() == 1);
+    CHECK(streams.contains("1"));
+}
