@@ -23,11 +23,16 @@
 #include <arpa/inet.h>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <net/if.h>
 #include <netinet/ether.h>
 #include <string>
 #include <stdexcept>
+#include <chrono>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 
 namespace net {
@@ -109,12 +114,29 @@ auto create_ip_mreq(int fd, std::string_view interface, std::string_view ip_addr
 }
 
 auto set_socket_recv_buffer(int fd, std::size_t size) -> void {
-    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) < 0) {
+    if (size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        ::close(fd);
+        throw std::invalid_argument("receive buffer size exceeds SO_RCVBUF integer range");
+    }
+    const auto requested = static_cast<int>(size);
+    if (::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) < 0) {
         ::close(fd);
         throw std::runtime_error(
             std::format("failed to set receive buffer size: {}", std::strerror(errno))
         );
     }
+}
+
+auto get_socket_recv_buffer(int fd) -> std::size_t {
+    int effective{};
+    socklen_t len = sizeof(effective);
+    if (::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &effective, &len) < 0) {
+        ::close(fd);
+        throw std::runtime_error(
+            std::format("failed to read effective receive buffer size: {}", std::strerror(errno))
+        );
+    }
+    return effective > 0 ? static_cast<std::size_t>(effective) : 0;
 }
 
 auto set_socket_reuse_addr(int fd, bool enable) -> void {
@@ -145,6 +167,62 @@ auto get_interface_index(std::string_view interface) -> std::size_t {
         );
     }
     return idx;
+}
+
+} // namespace net
+
+namespace net {
+
+auto receive_fd(const std::string& path, int timeout_ms) -> int {
+    const int sock = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        throw std::runtime_error(std::format("receive_fd: socket: {}", std::string{strerror(errno)}));
+    }
+    struct sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(addr.sun_path)) {
+        ::close(sock);
+        throw std::runtime_error("receive_fd: socket path too long");
+    }
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+
+    // Bounded connect: the helper may still be coming up.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (::connect(sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            const auto err = errno;
+            ::close(sock);
+            throw std::runtime_error(std::format("receive_fd: connect to '{}' timed out: {}",
+                                                 path, std::string{strerror(err)}));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    struct timeval tv{.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
+    (void)::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    char data = 0;
+    struct iovec iov{.iov_base = &data, .iov_len = 1};
+    alignas(struct cmsghdr) char ctrl[CMSG_SPACE(sizeof(int))]{};
+    struct msghdr msg{};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctrl;
+    msg.msg_controllen = sizeof(ctrl);
+    const auto n = ::recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+    ::close(sock);
+    if (n < 0) {
+        throw std::runtime_error(std::format("receive_fd: recvmsg: {}", std::string{strerror(errno)}));
+    }
+    for (auto* cmsg = CMSG_FIRSTHDR(&msg); cmsg != nullptr; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+            int fd = -1;
+            std::memcpy(&fd, CMSG_DATA(cmsg), sizeof(fd));
+            return fd;
+        }
+    }
+    throw std::runtime_error("receive_fd: no SCM_RIGHTS control message received");
 }
 
 } // namespace net

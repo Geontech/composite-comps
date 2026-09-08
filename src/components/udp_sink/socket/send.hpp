@@ -47,7 +47,10 @@ public:
     auto get_stats() const -> std::map<std::string, std::string> override;
 
 private:
-    // Per-destination stats
+    // Per-destination stats, keyed numerically (ip_be, port) — no per-packet string
+    // formatting; the printable form is built only for logging/reporting. Capped: new
+    // destinations beyond the cap are delivered but not tracked.
+    static constexpr std::size_t MAX_TRACKED_DESTS = 4096;
     struct dest_stats {
         std::chrono::steady_clock::time_point last_used{};
         uint64_t packets_sent{0};
@@ -56,15 +59,25 @@ private:
 
     config m_config;
     int m_socket_fd{-1};
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
 
-    std::unordered_map<std::string, dest_stats> m_dest_stats;
+    std::unordered_map<uint64_t, dest_stats> m_dest_stats;
+
+    // Memoized destination parse (steady state = one endpoint: string compare, not inet_pton).
+    std::string m_memo_ip;
+    uint16_t m_memo_port{0};
+    struct sockaddr_in m_memo_addr{};
+
+    // One-shot log latches; the counters carry the ongoing rate.
+    bool m_invalid_ip_warned{false};
+    bool m_send_error_warned{false};
 
     std::atomic<uint64_t> m_total_packets{0};
     std::atomic<uint64_t> m_total_bytes{0};
     std::atomic<uint64_t> m_total_errors{0};
 
-    auto make_dest_key(const std::string& ip, uint16_t port) -> std::string;
+    static auto pack_dest_key(const struct sockaddr_in& addr) -> uint64_t;
+    static auto format_dest_key(uint64_t key) -> std::string;
     auto create_socket() -> int;
 
 }; // class send_tx

@@ -21,7 +21,6 @@
 
 #include <bit>
 #include <cstdint>
-#include <map>
 #include <optional>
 #include <span>
 #include <vrtgen/vrtgen.hpp>
@@ -53,16 +52,22 @@ public:
     auto sample_rate() const -> std::optional<double>;
     auto signal_data_format() const -> const std::optional<vrtgen::packing::PayloadFormat>&;
 
-    // Static 32-bit word byteswap utilities (for PLRV endianness conversion)
+    // 32-bit word byteswap (for PLRV endianness conversion). SIMD selection is GCC native
+    // function multiversioning inside the implementation; trailing sub-word bytes (< 4) are
+    // not touched — V49 is word-granular, so they are never part of the decoded packet.
     static auto byteswap_u32_words(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
-    static auto byteswap_u32_words_scalar(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
-    static auto byteswap_u32_words_avx2(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
-    static auto byteswap_u32_words_avx512(std::span<const uint8_t> src, std::span<uint8_t> dst) -> void;
 
 private:
     std::span<const uint8_t> m_data;
-    std::map<std::string, std::size_t> m_positions;
-    vrtgen::packing::Header m_header;
+    // Payload offset for data packets. A plain offset + presence flag: this sits on the
+    // per-packet hot path, so it must not allocate (a prior std::map<string,size_t> here
+    // cost a red-black-tree node + string key per packet).
+    std::size_t m_payload_pos{};
+    bool m_has_payload{false};
+    // A DataHeader (derives from Header, adds no state) so the data-packet trailer-included bit
+    // is read from the single decoded header word — no second unpack of the same bytes. The
+    // header() accessor still hands back a const Header&; the extra bit is only read in is_data().
+    vrtgen::packing::DataHeader m_header;
     std::optional<uint32_t> m_stream_id;
     std::optional<vrtgen::packing::ClassIdentifier> m_class_id;
     std::optional<uint32_t> m_int_ts;

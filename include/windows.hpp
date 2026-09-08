@@ -36,6 +36,17 @@ template <typename T>
 auto blackman_harris(const std::size_t length, bool complex=true) {
     auto window = composite::make_aligned<T>(ALIGNMENT, length * (complex ? 2 : 1));
 
+    // Degenerate single-point window: the general formula divides by (length - 1), which for
+    // length 1 is 0/0 = NaN poisoning every downstream sample. The standard convention
+    // (matching MATLAB) is a unit window.
+    if (length == 1) {
+        window->at(0) = T{1};
+        if (complex) {
+            window->at(1) = T{1};
+        }
+        return window;
+    }
+
     constexpr T a0 = 0.35875;
     constexpr T a1 = 0.48829;
     constexpr T a2 = 0.14128;
@@ -65,6 +76,15 @@ auto blackman_harris(const std::size_t length, bool complex=true) {
 template <typename T>
 auto hamming(const std::size_t length, bool complex=true) {
     auto window = composite::make_aligned<T>(ALIGNMENT, length *  (complex ? 2 : 1));
+
+    // Degenerate single-point window: see blackman_harris — avoid the 0/0 = NaN.
+    if (length == 1) {
+        window->at(0) = T{1};
+        if (complex) {
+            window->at(1) = T{1};
+        }
+        return window;
+    }
 
     constexpr T a0 = 0.54;
     constexpr T a1 = 0.46;

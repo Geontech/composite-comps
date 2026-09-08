@@ -26,7 +26,8 @@
 #include <span>
 #include <string>
 
-#include <spdlog/logger.h>
+#include <composite/core/logger.hpp>
+#include <composite/metrics/metrics.hpp>
 
 namespace udp_tx {
 
@@ -34,13 +35,20 @@ namespace udp_tx {
  * @brief Configuration for UDP TX backends
  */
 struct config {
-    std::shared_ptr<spdlog::logger> logger;
+    std::shared_ptr<composite::logger> logger;
     uint32_t send_buf_size{0};          // Socket send buffer size (0 = system default)
     uint32_t socket_timeout_s{30};      // Close idle sockets after N seconds
     uint32_t batch_size{64};            // Max packets per sendmmsg() call
     uint32_t batch_timeout_us{1000};    // Flush batch after N microseconds
     uint32_t max_packet_size{4096};     // Max expected packet size (for buffer pre-allocation)
     std::string bind_interface;         // Optional: bind to specific interface
+
+    // Component-owned egress counters (nullptr = not recorded). The senders increment these
+    // on the send path so operators get the fleet-standard counter series; the get_stats()
+    // string map remains the periodic debug view.
+    composite::metrics::counter<uint64_t>* packets_sent{nullptr};
+    composite::metrics::counter<uint64_t>* bytes_sent{nullptr};
+    composite::metrics::counter<uint64_t>* send_errors{nullptr};
 };
 
 /**

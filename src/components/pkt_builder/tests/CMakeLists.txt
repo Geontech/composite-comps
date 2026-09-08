@@ -1,47 +1,41 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
-# SPDX-FileCopyrightText: 2025 Geon Technologies, LLC
+#
+# Copyright (C) 2024 Geon Technologies, LLC
+#
+# This file is part of composite-comps.
+#
+# composite-comps is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# composite-comps is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program. If not, see http://www.gnu.org/licenses/.
+#
 
-# pkt_builder integration tests
-
-# Fetch Catch2 for testing
-include(FetchContent)
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG v3.11.0
-)
-FetchContent_MakeAvailable(Catch2)
-
-# Integration tests for pkt_builder -> pkt_debug pipeline
-add_executable(pkt_builder_integration_tests
-    pkt_builder_integration_tests.cpp
-    ../component.cpp
-    ../../pkt_debug/component.cpp
-)
+# pkt_builder integration tests, including a loopback through the real vita49 parser:
+# what the builder emits must round-trip through the parser (one wire-format truth).
+#
+# pkt_protocols, not pkt_parser_objs: the latter carries pkt_parser's COMPOSITE_REGISTER_SIMPLE,
+# whose create()/composite_abi_version() would collide with pkt_builder's.
+add_executable(pkt_builder_integration_tests pkt_builder_integration_tests.cpp)
 target_link_libraries(pkt_builder_integration_tests
     PRIVATE
+        pkt_builder_objs
+        pkt_protocols
         Catch2::Catch2WithMain
-        composite::composite
-        spdlog::spdlog_header_only
+        Threads::Threads
 )
-target_include_directories(pkt_builder_integration_tests
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../pkt_debug
-        ${CMAKE_SOURCE_DIR}/include
-)
-target_compile_features(pkt_builder_integration_tests PRIVATE cxx_std_23)
-target_compile_options(pkt_builder_integration_tests PRIVATE -march=x86-64-v2)
-target_compile_definitions(pkt_builder_integration_tests PRIVATE UNIT_TESTS)
 
-# Register tests with CTest
-include(CTest)
-list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
-include(Catch)
 catch_discover_tests(pkt_builder_integration_tests)
 
-# Install test executables (optional)
-install(TARGETS pkt_builder_integration_tests
+install(TARGETS
+    pkt_builder_integration_tests
     RUNTIME DESTINATION bin/tests
+    COMPONENT Tests
     OPTIONAL
 )

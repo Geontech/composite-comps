@@ -23,7 +23,10 @@
 #include "vita49_parser.hpp"
 #include "config.hpp"
 
+#include <composite/buffers/slab_pool.hpp>
+
 #include <cstdint>
+#include <memory>
 
 namespace parsers {
 
@@ -41,10 +44,22 @@ public:
         const composite::metadata& current_metadata
     ) -> parse_result override;
     auto name() const -> std::string_view override { return "vita49.1"; }
+    // Delegates parsing (and thus metadata change-tracking) to the inner V49 parser, so the
+    // (re)activation latch must be forwarded to it.
+    auto on_activated() -> void override { m_vita49_parser.on_activated(); }
 
 private:
     struct_props::signal_overrides m_overrides;
     vita49_parser m_vita49_parser;  // Delegate to standard V49 parser
+
+    // PLRV (little-endian VRL) packets must be byteswapped into a NEW buffer whose lifetime
+    // escapes downstream, which used to cost two heap allocations per packet. Steady state
+    // now recycles slabs from this pool (created lazily at the first PLRV packet, resized by
+    // recreation if a larger packet arrives; outstanding slabs keep the old pool alive until
+    // released). Exhaustion (downstream holding > capacity packets) falls back to the heap.
+    static constexpr std::size_t SWAP_POOL_BUFFERS{128};
+    std::shared_ptr<composite::slab_pool<uint8_t>> m_swap_pool;
+    std::size_t m_swap_pool_size{0};  ///< slab size of m_swap_pool (no pool accessor for it)
 
 }; // class vita49dot1_parser
 

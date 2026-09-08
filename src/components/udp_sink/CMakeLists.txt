@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2025 Geon Technologies, LLC
+# Copyright (C) 2024 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -17,44 +17,12 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.20)
-project(udp_sink VERSION 0.1.0 LANGUAGES CXX)
-include(GNUInstallDirs)
-
-# Set the C++ version required
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Set compile flags
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-add_compile_options(-march=x86-64-v2 -mtune=generic)
-
-# Library
-add_library(udp_sink MODULE
-    component.cpp
-    socket/send.cpp
-    socket/sendmmsg.cpp
+comps_add_component(udp_sink
+    SOURCES component.cpp
+            socket/send.cpp
+            socket/sendmmsg.cpp
 )
-set_target_properties(udp_sink PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/components
-)
-# Includes
-target_include_directories(udp_sink
-    PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-# Link
-target_link_libraries(udp_sink
-    PRIVATE
-    composite::composite
-    spdlog::spdlog_header_only
-)
-# Install
-install(TARGETS udp_sink
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
+
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

@@ -81,7 +81,50 @@ Intel DPDK (Data Plane Development Kit) userspace networking.
 | `frame_count` | uint32 | 8192 | Number of pre-allocated frame buffers in the pool |
 | `autodiscovery_timeout` | uint32 | 10 | Timeout in seconds for packet size auto-discovery (recvmmsg only) |
 
-**Runtime reconfigurable:** `interface`, `ip_addr`, `port`, `num_msgs`, `frame_count`
+### recvmmsg Output Batching
+
+The standard UDP backend uses a fixed, interruptible window after the socket becomes readable so
+additional datagrams can accumulate before a nonblocking `recvmmsg()` call. Packets returned by
+successive calls are accumulated in userspace and published downstream with one `send_batch()`
+when the requested output size is reached. A deadline measured from initial socket readability
+bounds requested batching latency and flushes partial batches for sparse or stopped streams.
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `recvmmsg.receive_batch_wait_us` | uint32 | 100 | Fixed pre-receive accumulation window; clamped to 5000 µs |
+| `recvmmsg.output_batch_size` | uint32 | 0 | Packets per downstream publication; 0 selects `num_msgs` |
+| `recvmmsg.max_batch_delay_us` | uint32 | 1000 | Maximum age of the oldest packet in a partial output batch; 0 flushes each receive result immediately |
+
+Setting `max_batch_delay_us` to zero also disables the pre-receive accumulation window: a zero
+total latency budget cannot fund a nonzero `receive_batch_wait_us`.
+
+`receive_batch_wait_us` is the CPU/latency dial: a larger value generally returns more packets per
+receive syscall. If a call fills the entire `num_msgs` vector, the backend skips both waits and
+continues receiving immediately until a non-full result indicates that the observed backlog has
+cleared. Linux timer slack and ordinary scheduler latency can extend an actual wait beyond the
+configured value, so these are requested batching bounds rather than hard real-time guarantees.
+
+`num_msgs` and `output_batch_size` are intentionally independent. The former caps one kernel
+receive vector; the latter controls downstream ring-publication amortization. A receive call can
+therefore produce multiple output batches, and a partial output batch can span multiple receive
+calls. All properties in the `recvmmsg` object are runtime reconfigurable (the receiver is
+reconstructed).
+
+Example:
+```json
+{
+  "num_msgs": 256,
+  "recv_buf_size": 16777216,
+  "recvmmsg": {
+    "receive_batch_wait_us": 100,
+    "output_batch_size": 64,
+    "max_batch_delay_us": 1000
+  }
+}
+```
+
+**Runtime reconfigurable:** `interface`, `ip_addr`, `port`, `num_msgs`, `frame_count`, `overrides`,
+and `recvmmsg`
 
 ### Overrides
 
@@ -320,6 +363,30 @@ Runtime statistics are logged every 5 seconds at debug level:
 
 ### recvmmsg
 - `pkts_recvd`: Total packets received since component start
+- `recv_syscalls`: Total `recvmmsg()` calls
+- `wait_syscalls`: Total outer socket waits and fixed-window waits
+- `total_receive_syscalls`: Sum of receive and wait syscalls
+- `full_receive_vectors`: Calls that filled all `num_msgs` slots and activated the backlog fast path
+- `receive_batch_wait_us`: Effective fixed accumulation window after safety clamping
+- `output_batch_size`: Configured downstream publication target
+- `max_batch_delay_us`: Configured maximum hold time for a partial output batch
+- `output_batches`: Total downstream batch publications
+- `partial_batch_flushes`: Publications forced by a deadline, shutdown, or error before full
+- `pending_output_packets`: Packets currently retained in the userspace output accumulator
+- `effective_recv_buf`: Effective kernel `SO_RCVBUF` accounting limit after clamping
+- `estimated_packet_charge`: Conservative estimate of per-packet kernel socket-memory use
+- `socket_rmem_bytes`: Most recently observed receive-memory allocation
+- `socket_rmem_peak_bytes`: Maximum observed receive-memory allocation since the previous stats
+  report (reset on read; catches pressure between the instantaneous samples)
+- `kernel_drops`: Packets dropped at this UDP socket according to `SO_MEMINFO`
+- `congest_pool_stall`: Pool-acquisition stall episodes
+- `pool_capacity` / `pool_outstanding` / `pool_available`: Slab-pool occupancy, proving or
+  disproving downstream buffer retention
+- `pool_stall_backoff_us`: Total time the receive thread has waited for pool buffers
+
+Kernel receive-queue drops are also exported separately as the
+`udp_source.kernel_drops` counter; they are not mixed into `udp_source.packets_dropped`, which
+remains reserved for filtering and receiver-internal errors.
 
 ### packet_mmap
 - `pkts_recvd`: Total packets received by userspace since component start
@@ -348,11 +415,13 @@ Runtime statistics are logged every 5 seconds at debug level:
 ### High CPU usage
 **Problem:** Component consuming excessive CPU when idle
 
-**Note:** This is intentional for low-latency operation. The component uses:
-- 1ms poll timeout
-- 50μs backoff when waiting for frame pool slots
+The recvmmsg backend sleeps indefinitely when both the socket and output accumulator are empty. A
+partial batch uses an interruptible deadline. Persistent CPU usage therefore indicates an active
+stream, downstream backpressure, or repeated pool-acquisition stalls.
 
-For lower CPU usage at the cost of latency, consider patching with longer timeouts.
+For fewer receive syscalls, raise `recvmmsg.receive_batch_wait_us`; for fewer downstream ring
+publications, raise `recvmmsg.output_batch_size`. Keep `max_batch_delay_us` within the
+application's latency budget and qualify CPU, kernel drops, and downstream ring drops together.
 
 ### DPDK initialization failure
 **Problem:** "DPDK support not compiled in" or DPDK port initialization errors

@@ -18,14 +18,21 @@
  */
 
 #include "dpdk.hpp"
+#include "ether_frame.hpp"
 #include "igmp.hpp"
 #include "net/utils.hpp"
+// classify_frame: the shared, unit-tested IP/UDP classifier (bounds checks, fragment
+// rejection, UDP length validation). It lives in the packet_mmap helper header but has no
+// AF_PACKET dependency — both capture backends parse the same untrusted wire bytes, and
+// sharing it means the DPDK path is covered by the same hermetic tests even though DPDK
+// itself cannot be compiled or run in CI.
+#include "packet_mmap_frame.hpp"
 
 #include <composite/buffers/buffer.hpp>
 #include <composite/buffers/external_buffer.hpp>
 #include <composite/dpdk/manager.hpp>
 
-#include <spdlog/spdlog.h>
+#include <composite/core/logger.hpp>
 
 #include <rte_mbuf.h>
 #include <rte_ethdev.h>
@@ -38,16 +45,19 @@
 #include <thread>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <utility>
+#include <vector>
 #include <arpa/inet.h>
 
 namespace {
 struct mbuf_release {
     rte_mbuf* mbuf{};
-    void operator()() {
+    // external_buffer<uint8_t> invokes its deleter as release(uint8_t*) (the data pointer). The
+    // mbuf to free is captured as a member, so the pointer argument is unused.
+    void operator()(uint8_t* /*data*/) const {
         if (mbuf) {
             rte_pktmbuf_free(mbuf);
-            mbuf = nullptr;
         }
     }
 };
@@ -56,7 +66,7 @@ struct mbuf_release {
 namespace udp {
 
 dpdk::dpdk(const config& cfg) :
-  interface(cfg.logger, cfg.metrics),
+  interface(cfg.logger, cfg.metrics, cfg.session_metadata),
   m_config(cfg) {
     // Get DPDK manager and acquire resources
     auto& dpdk_mgr = composite::dpdk::manager::instance();
@@ -119,6 +129,23 @@ dpdk::dpdk(const config& cfg) :
     }
     m_queue_allocated = true;
 
+    // From here on this instance owns manager/NIC state (the queue, later possibly a MAC
+    // filter) that only the DESTRUCTOR releases — and a throw below means the destructor
+    // never runs, leaking the queue allocation for the process lifetime (the manager is a
+    // singleton). Release on any construction failure, then rethrow. m_igmp_mgr needs no
+    // handling here: fully-constructed members are destroyed on a ctor throw, which sends
+    // the IGMP leave.
+    try {
+        init_after_queue_allocation();
+    } catch (...) {
+        release_nic_resources();
+        throw;
+    }
+}
+
+auto dpdk::init_after_queue_allocation() -> void {
+    auto& dpdk_mgr = composite::dpdk::manager::instance();
+
     // Get mempool from framework
     m_mempool = dpdk_mgr.get_mempool(m_config.mempool_name);
     if (!m_mempool) {
@@ -136,12 +163,15 @@ dpdk::dpdk(const config& cfg) :
 
     if (!m_config.ip_addr.empty()) {
         struct in_addr dst{};
-        if (inet_pton(AF_INET, m_config.ip_addr.c_str(), &dst) == 1) {
-            m_dst_ip_be = dst.s_addr;
-        } else {
-            m_logger->warn("invalid ip_addr '{}' specified; destination filtering disabled",
-                          m_config.ip_addr);
+        if (inet_pton(AF_INET, m_config.ip_addr.c_str(), &dst) != 1) {
+            // Fail CLOSED: the operator asked for destination filtering, so silently
+            // accepting every flow on the queue instead is the wrong failure mode (and the
+            // invalid src_ip below already throws — same class of misconfiguration).
+            auto msg = std::format("invalid ip_addr '{}'", m_config.ip_addr);
+            m_logger->error(msg);
+            throw std::runtime_error(msg);
         }
+        m_dst_ip_be = dst.s_addr;
     }
 
     // Automatically enable IGMP for multicast destinations if src_ip is provided
@@ -234,7 +264,12 @@ dpdk::dpdk(const config& cfg) :
 
 dpdk::~dpdk() {
     stop_recv();
+    release_nic_resources();
+}
 
+// Shared by the destructor and the constructor's failure path: everything this instance
+// holds in the (process-lifetime, singleton) DPDK manager and on the NIC. Idempotent.
+auto dpdk::release_nic_resources() -> void {
     // Clear multicast address filter if added
     if (m_mcast_mac_added) {
         rte_ether_addr dpdk_mac;
@@ -246,6 +281,7 @@ dpdk::~dpdk() {
             m_logger->warn("failed to clear multicast address filter: {} (ret={})",
                           strerror(-ret), ret);
         }
+        m_mcast_mac_added = false;
     }
 
     if (m_queue_allocated) {
@@ -285,6 +321,8 @@ auto dpdk::stop_recv() -> void {
 
 auto dpdk::receive(std::stop_token token) -> void {
     auto* pkts = m_rx_burst.data();
+    std::vector<composite::immutable_buffer<uint8_t>> output_buffers;
+    output_buffers.reserve(m_config.burst_size);
     while (!token.stop_requested()) [[likely]] {
 
         // Receive burst of packets from DPDK port
@@ -305,6 +343,11 @@ auto dpdk::receive(std::stop_token token) -> void {
         // Record batch size metric
         m_metrics.batch_sizes.record(static_cast<double>(nb_rx));
 
+        // Accumulate the per-packet counts in locals and record them with one atomic add each
+        // after the burst, instead of a locked RMW per packet on the hot path.
+        uint64_t acc_recv = 0, acc_bytes = 0, acc_dropped = 0;
+
+        output_buffers.clear();
         // Process each received packet
         for (uint16_t i = 0; i < nb_rx; i++) {
             struct rte_mbuf* mbuf = pkts[i];
@@ -318,10 +361,14 @@ auto dpdk::receive(std::stop_token token) -> void {
             // Extract UDP payload from packet
             auto payload = extract_udp_payload(mbuf);
 
+            // "Total UDP packets received": count EVERY observed packet as received; a
+            // dropped/filtered one was received then dropped, so it is also counted in
+            // packets_dropped. This matches the packet_mmap backend so the metric means the same
+            // thing regardless of socket type (received = forwarded + dropped).
+            ++acc_recv;
+
             if (payload.valid) {
-                m_pkts_recvd.fetch_add(1, std::memory_order_relaxed);
-                m_metrics.packets_received.inc();
-                m_metrics.bytes_received.add(payload.length);
+                acc_bytes += payload.length;
 
                 // Wrap payload in external_buffer with DPDK mbuf release callback (zero-allocation)
                 auto buffer = composite::external_buffer<uint8_t>(
@@ -329,12 +376,27 @@ auto dpdk::receive(std::stop_token token) -> void {
                     payload.length,
                     mbuf_release{mbuf}
                 );
-                m_out_port->send_data(composite::immutable_buffer<uint8_t>(std::move(buffer)), {});
+                output_buffers.emplace_back(std::move(buffer));
             } else {
-                m_pkts_dropped.fetch_add(1, std::memory_order_relaxed);
-                m_metrics.packets_dropped.inc();
+                ++acc_dropped;
                 rte_pktmbuf_free(mbuf);
             }
+        }
+
+        if (!output_buffers.empty()) {
+            m_out_port->send_batch(std::span{output_buffers}, {}, m_session_metadata);
+            output_buffers.clear();
+        }
+
+        // One atomic add per counter for the whole burst (a burst of only IGMP queries adds none).
+        if (acc_recv != 0) {
+            m_pkts_recvd.fetch_add(acc_recv, std::memory_order_relaxed);
+            m_metrics.packets_received.add(acc_recv);
+        }
+        if (acc_bytes != 0) { m_metrics.bytes_received.add(acc_bytes); }
+        if (acc_dropped != 0) {
+            m_pkts_dropped.fetch_add(acc_dropped, std::memory_order_relaxed);
+            m_metrics.packets_dropped.add(acc_dropped);
         }
 
         if (m_igmp_mgr) {
@@ -350,7 +412,8 @@ auto dpdk::receive(std::stop_token token) -> void {
 auto dpdk::extract_udp_payload(rte_mbuf* mbuf) -> udp_payload {
     udp_payload result{nullptr, 0, false};
 
-    // Check for chained (multi-segment) mbufs
+    // Check for chained (multi-segment) mbufs: the parse below assumes the whole packet is
+    // contiguous in the first segment.
     if (mbuf->nb_segs > 1) {
         m_logger->warn(
             "Chained mbuf detected ({} segments), dropping packet. "
@@ -360,126 +423,94 @@ auto dpdk::extract_udp_payload(rte_mbuf* mbuf) -> udp_payload {
         return result;
     }
 
-    // Get pointer to start of packet data
     uint8_t* pkt_data = rte_pktmbuf_mtod(mbuf, uint8_t*);
     uint32_t pkt_len = rte_pktmbuf_pkt_len(mbuf);
 
-    // Parse Ethernet header
-    if (pkt_len < sizeof(rte_ether_hdr)) {
-        m_logger->trace("Packet too short for Ethernet header");
-        return result;
-    }
-
-    auto* eth_hdr = reinterpret_cast<rte_ether_hdr*>(pkt_data);
-    uint16_t ether_type = rte_be_to_cpu_16(eth_hdr->ether_type);
-
-    // Skip broadcast packets
-    if (rte_is_broadcast_ether_addr(&eth_hdr->dst_addr)) {
+    // Skip broadcast packets before any header parsing (cheap MAC compare).
+    if (pkt_len >= sizeof(rte_ether_hdr) &&
+        rte_is_broadcast_ether_addr(&reinterpret_cast<rte_ether_hdr*>(pkt_data)->dst_addr)) {
         m_logger->trace("Skipping broadcast packet");
         return result;
     }
 
-    // Strip ALL VLAN tags (handles Q-in-Q / 802.1ad double tagging)
-    size_t l3_offset = sizeof(rte_ether_hdr);
-    while (ether_type == RTE_ETHER_TYPE_VLAN) {
-        // Check packet has room for VLAN header
-        if (pkt_len < l3_offset + sizeof(rte_vlan_hdr)) {
-            m_logger->trace("Packet too short for VLAN header");
-            return result;
-        }
-
-        auto* vlan_hdr = reinterpret_cast<rte_vlan_hdr*>(pkt_data + l3_offset);
-        ether_type = rte_be_to_cpu_16(vlan_hdr->eth_proto);
-        l3_offset += sizeof(rte_vlan_hdr);
-    }
-
-    // We only handle IPv4 for now
-    if (ether_type != RTE_ETHER_TYPE_IPV4) {
-        // Log first 32 bytes of packet for diagnostics
-        if (m_logger->should_log(spdlog::level::debug)) {
+    // L2: Ethernet + any VLAN stack (802.1Q and 802.1ad Q-in-Q), pure helper.
+    const auto l3 = locate_ipv4(pkt_data, pkt_len);
+    if (l3.verdict != l3_locate::kind::ipv4) {
+        if (l3.verdict == l3_locate::kind::truncated) {
+            m_logger->trace("Packet too short for Ethernet/VLAN headers ({} bytes)", pkt_len);
+        } else if (m_logger->should_log(composite::log_level::debug)) {
+            // Log first 32 bytes of packet for diagnostics
             std::string hex_dump;
             for (uint32_t i = 0; i < std::min(32u, pkt_len); i++) {
                 char buf[4];
                 snprintf(buf, sizeof(buf), "%02x ", pkt_data[i]);
                 hex_dump += buf;
             }
-            m_logger->debug("Non-IPv4 packet (ether_type=0x{:04x}): {}", ether_type, hex_dump);
+            m_logger->debug("Non-IPv4 packet (ether_type=0x{:04x}): {}", l3.ether_type, hex_dump);
         } else {
-            m_logger->trace("Non-IPv4 packet (ether_type=0x{:04x})", ether_type);
+            m_logger->trace("Non-IPv4 packet (ether_type=0x{:04x})", l3.ether_type);
         }
         return result;
     }
 
-    // Parse IP header (after Ethernet header and all VLAN tags)
-    auto* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(
-        pkt_data + l3_offset
-    );
-
-    if (pkt_len < l3_offset + sizeof(rte_ipv4_hdr)) {
-        m_logger->trace("Packet too short for IP header");
+    // L3/L4: the shared classifier bounds-checks every field of the UNTRUSTED bytes before
+    // reading it, rejects IP fragments (a non-first fragment carries payload where a UDP
+    // header would be read — its "dst port" is arbitrary bytes that could match the filter),
+    // validates IHL, and validates the UDP length against both its minimum and the captured
+    // bytes (so a dgram_len < 8 cannot underflow into a huge payload).
+    const auto frame =
+        classify_frame(pkt_data + l3.offset, pkt_len - l3.offset, m_dst_ip_be, m_config.port);
+    if (frame.verdict != frame_verdict::kind::forward) {
+        m_logger->trace("{} IPv4/UDP packet ({} bytes)",
+                        frame.verdict == frame_verdict::kind::filtered ? "Filtered" : "Malformed",
+                        pkt_len);
         return result;
     }
 
-    // Check if it's UDP
-    if (ip_hdr->next_proto_id != IPPROTO_UDP) {
-        m_logger->trace("Non-UDP packet (proto={})", ip_hdr->next_proto_id);
-        return result;
-    }
-
-    // Optional: Filter by destination IP
-    if (m_dst_ip_be.has_value() && ip_hdr->dst_addr != m_dst_ip_be.value()) {
-        if (m_logger->should_log(spdlog::level::trace)) {
-            char ip_str[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &ip_hdr->dst_addr, ip_str, sizeof(ip_str));
-            m_logger->trace("IP mismatch: {} != {}", ip_str, m_config.ip_addr);
-        }
-        return result;
-    }
-
-    // Parse UDP header
-    size_t ip_hdr_len = rte_ipv4_hdr_len(ip_hdr);
-    size_t l4_offset = l3_offset + ip_hdr_len;
-    auto* udp_hdr = reinterpret_cast<rte_udp_hdr*>(
-        pkt_data + l4_offset
-    );
-
-    if (pkt_len < l4_offset + sizeof(rte_udp_hdr)) {
-        m_logger->trace("Packet too short for UDP header");
-        return result;
-    }
-
-    // Optional: Filter by destination port
-    uint16_t dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
-    if (m_config.port != 0 && dst_port != m_config.port) {
-        m_logger->trace("Port mismatch: {} != {}", dst_port, m_config.port);
-        return result;
-    }
-
-    // Extract UDP payload
-    uint16_t udp_len = rte_be_to_cpu_16(udp_hdr->dgram_len);
-    uint16_t payload_len = udp_len - sizeof(rte_udp_hdr);
-
-    size_t payload_offset = l4_offset + sizeof(rte_udp_hdr);
-    if (pkt_len <= payload_offset) {
-        m_logger->trace("No UDP payload");
-        return result;
-    }
-
-    uint8_t* payload_data = pkt_data + payload_offset;
-
-    // Validate payload length
-    if (payload_len == 0 ||
-        (pkt_data + pkt_len) < (payload_data + payload_len)) {
-        m_logger->trace("Invalid UDP payload length: {}", payload_len);
-        return result;
-    }
-
-    result.data = payload_data;
-    result.length = payload_len;
+    result.data = pkt_data + l3.offset + frame.payload_off;
+    // payload_len <= 65535 - sizeof(udphdr): always fits uint16_t.
+    result.length = static_cast<uint16_t>(frame.payload_len);
     result.valid = true;
 
     return result;
 }
+
+// Resolve, once, the xstats ids for this queue's packet/byte/error counters, then read them.
+//
+// The generic names DPDK synthesises are rx_q<N>_packets / _bytes / _errors. They are
+// driver-supplied: if this PMD does not publish them the lookup fails, and the fields are omitted
+// rather than reported as a misleading zero.
+auto dpdk::add_queue_stats(std::map<std::string, std::string>& stats) -> void {
+    if (m_queue_xstats_missing) {
+        return;
+    }
+    static constexpr std::array<const char*, QUEUE_XSTAT_COUNT> suffixes{"packets", "bytes", "errors"};
+    static constexpr std::array<const char*, QUEUE_XSTAT_COUNT> keys{"hw_q_pkts", "hw_q_bytes", "hw_q_errors"};
+
+    if (!m_queue_xstats_resolved) {
+        for (std::size_t i = 0; i < QUEUE_XSTAT_COUNT; ++i) {
+            const auto name = std::format("rx_q{}_{}", m_resolved_queue_id, suffixes[i]);
+            if (rte_eth_xstats_get_id_by_name(m_resolved_port_id, name.c_str(),
+                                              &m_queue_xstat_ids[i]) != 0) {
+                m_logger->debug("DPDK port {} queue {}: no per-queue xstat '{}'; omitting "
+                                "hw_q_* counters", m_resolved_port_id, m_resolved_queue_id, name);
+                m_queue_xstats_missing = true;
+                return;
+            }
+        }
+        m_queue_xstats_resolved = true;
+    }
+
+    std::array<uint64_t, QUEUE_XSTAT_COUNT> values{};
+    if (rte_eth_xstats_get_by_id(m_resolved_port_id, m_queue_xstat_ids.data(), values.data(),
+                                 static_cast<unsigned int>(values.size())) < 0) {
+        return;   // transient read failure; the port-level counters above still went out
+    }
+    for (std::size_t i = 0; i < QUEUE_XSTAT_COUNT; ++i) {
+        stats[keys[i]] = std::to_string(values[i]);
+    }
+}
+
 
 auto dpdk::get_stats() -> std::map<std::string, std::string> {
     std::map<std::string, std::string> stats;
@@ -505,13 +536,12 @@ auto dpdk::get_stats() -> std::map<std::string, std::string> {
         stats["hw_rx_errors"] = std::to_string(eth_stats.ierrors);
         stats["hw_rx_nombuf"] = std::to_string(eth_stats.rx_nombuf);
 
-        // Per-queue stats (for our queue only)
-        if (m_resolved_queue_id < RTE_ETHDEV_QUEUE_STAT_CNTRS) {
-            stats["hw_q_pkts"] = std::to_string(eth_stats.q_ipackets[m_resolved_queue_id]);
-            stats["hw_q_bytes"] = std::to_string(eth_stats.q_ibytes[m_resolved_queue_id]);
-            stats["hw_q_errors"] = std::to_string(eth_stats.q_errors[m_resolved_queue_id]);
-        }
     }
+
+    // Per-queue counters for OUR queue. These matter rather than being a nicety: the DPDK manager
+    // hands out individual queues on a shared port, so the port-level counters above aggregate
+    // every component bound to that interface, not just this one.
+    add_queue_stats(stats);
 
     return stats;
 }

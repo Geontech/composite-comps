@@ -60,7 +60,10 @@ private:
     // Maximum expected packet size (configurable via config)
     size_t m_max_packet_size;
 
-    // Per-destination stats and last-used tracking
+    // Per-destination stats and last-used tracking. Keyed NUMERICALLY (ip_be, port packed
+    // into a uint64) so neither the send path nor the flush loop ever formats a string or
+    // calls inet_ntoa (non-reentrant) per packet; the printable form is built only when a
+    // key is logged or reported.
     struct dest_stats {
         std::chrono::steady_clock::time_point last_used{};
         uint64_t packets_sent{0};
@@ -69,7 +72,7 @@ private:
 
     config m_config;
     int m_socket_fd{-1};
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
 
     // Batch queue (packets waiting to be sent)
     std::vector<queued_packet> m_batch_queue;
@@ -83,8 +86,24 @@ private:
     std::vector<struct iovec> m_iovecs;
     std::vector<struct mmsghdr> m_msgs;
 
-    // Per-destination stats for monitoring
-    std::unordered_map<std::string, dest_stats> m_dest_stats;
+    // Per-destination stats for monitoring (see dest_stats for the numeric-key rationale).
+    // Insertion is capped: beyond MAX_TRACKED_DESTS new destinations are simply not tracked
+    // (delivery is unaffected) — an upstream cycling destination annotations must not grow
+    // this map without bound, and evicting per insert would itself be a hot-path scan.
+    static constexpr std::size_t MAX_TRACKED_DESTS = 4096;
+    std::unordered_map<uint64_t, dest_stats> m_dest_stats;
+
+    // Memoized destination parse: steady state sends to one destination, so a string
+    // compare replaces inet_pton per packet.
+    std::string m_memo_ip;
+    uint16_t m_memo_port{0};
+    struct sockaddr_in m_memo_addr{};
+
+    // One-shot log latches: the first occurrence logs, the counters carry the rate. A
+    // malformed-metadata or unreachable-destination flood must not become a log flood.
+    bool m_invalid_ip_warned{false};
+    bool m_oversize_warned{false};
+    bool m_send_error_warned{false};
 
     // Global stats
     std::atomic<uint64_t> m_total_packets{0};
@@ -93,7 +112,8 @@ private:
     std::atomic<uint64_t> m_total_flushes{0};
 
     // Helper methods
-    auto make_dest_key(const std::string& ip, uint16_t port) -> std::string;
+    static auto pack_dest_key(const struct sockaddr_in& addr) -> uint64_t;
+    static auto format_dest_key(uint64_t key) -> std::string;
     auto create_socket() -> int;
     auto flush_locked() -> void;
 

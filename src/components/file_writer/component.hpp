@@ -17,27 +17,43 @@
  * along with this program.  If not, see http://www.gnu.org/licenses/.
  */
 
-#include <composite/component.hpp>
-#include <vector>
+#include <composite/core/component.hpp>
+#include <composite/metrics/metrics.hpp>
+#include <array>
+#include <cstdint>
+#include <string>
 
 class file_writer : public composite::component {
-    using input_port_t = composite::input_port<std::vector<std::vector<uint8_t>>>;
+    // General-purpose byte-stream writer. In the redesigned pipeline every data hop is an
+    // immutable_buffer<uint8_t>; pkt_parser already strips VITA-49 headers and emits payload
+    // bytes, so file_writer just appends the byte stream it receives (no overlay parsing here).
+    using input_port_t = composite::input_port<composite::immutable_buffer<uint8_t>>;
+
+    // One writev() covers the whole drained batch, so this also caps the iovec count —
+    // far below IOV_MAX (1024).
+    static constexpr std::size_t INPUT_BATCH_SIZE{32};
 public:
-    file_writer();
+    explicit file_writer(std::string_view id);
     ~file_writer() override;
     auto initialize() -> void override;
     auto process() -> composite::retval override;
 
 private:
     // Ports
-    std::unique_ptr<input_port_t> m_in_port{std::make_unique<input_port_t>("data_in")};
+    input_port_t m_in_port{"data_in"};
+    std::array<input_port_t::queue_type, INPUT_BATCH_SIZE> m_input_batch;
 
     // Properties
     std::string m_filename;
-    uint64_t m_num_bytes{};
+    uint64_t m_num_bytes{};  // stop after this many bytes; 0 means write until the stream ends
 
     // Members
     int m_file{-1};
     uint64_t m_total_bytes{};
+    composite::metrics::counter<uint64_t>* m_bytes_written{nullptr};
+
+    // MUST be last: stops the framework worker before any member above destructs (the base
+    // ~component stops too late). See component.hpp auto_stop.
+    composite::component::auto_stop m_auto_stop{*this};
 
 }; // class file_writer

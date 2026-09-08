@@ -1,0 +1,147 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "BUILD_TESTING": "ON",
+        "CMAKE_PREFIX_PATH": "$penv{COMPOSITE_PREFIX}"
+      }
+    },
+    {
+      "name": "default",
+      "displayName": "Debug + tests",
+      "description": "Everyday development build. Resolves the framework via COMPS_COMPOSITE_PROVIDER=auto, so it works with an installed composite (point COMPOSITE_PREFIX at it) or falls back to fetching the pinned tag.",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release + tests",
+      "description": "The build any performance measurement must use. The bare default is RelWithDebInfo (-O2 -g); this is -O3.",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "ci",
+      "displayName": "Debug + tests + warnings-as-errors",
+      "description": "The build gate. The fleet is warning-clean under -Wall -Wextra -Wpedantic as of the CMake restructure, so warnings fail here.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COMPS_WERROR": "ON"
+      }
+    },
+    {
+      "name": "asan-ubsan",
+      "displayName": "Address+UB Sanitizer + tests",
+      "description": "The gate for the untrusted-input parse path (pkt_parser_fuzz) and the buffer/memory paths. Applies -fsanitize at directory scope, so every TU including Catch2 is instrumented.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COMPS_SANITIZER": "address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer + tests",
+      "description": "The gate for the concurrency-dense components (psd/fft worker pools, udp_source receiver and stats threads, ws_sink server). test/race/ only has teeth under this preset.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "COMPS_SANITIZER": "thread"
+      }
+    },
+    {
+      "name": "portable",
+      "displayName": "Release, no CPU baseline, no fast-math",
+      "description": "Proves nothing in the fleet depends on -march=x86-64-v2 or -ffast-math to compile. Also the starting point for any future non-x86 port.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "COMPS_WERROR": "ON",
+        "COMPS_CPU_BASELINE": "",
+        "COMPS_FAST_MATH": "OFF"
+      }
+    },
+    {
+      "name": "install",
+      "displayName": "Release install tree",
+      "description": "What the container image builds: no tests, warnings-as-errors, and the framework version pinned EXACTLY so an image can never be built against a framework nobody chose.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "OFF",
+        "COMPS_WERROR": "ON",
+        "COMPS_COMPOSITE_PROVIDER": "package",
+        "COMPS_REQUIRE_EXACT_COMPOSITE": "ON",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/install/prefix"
+      }
+    },
+    {
+      "name": "dpdk",
+      "displayName": "Release + DPDK backend",
+      "description": "Compile gate for udp_source/socket/dpdk.cpp and igmp.cpp, which are invisible to every other preset. REQUIRES a framework built with COMPOSITE_USE_DPDK=ON -- point COMPOSITE_PREFIX at it; COMPS_HAS_DPDK is detected from the framework's interface definitions, not set here. Tests off: the DPDK paths need a NIC and hugepages to run, so compile coverage is the goal.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "OFF",
+        "COMPS_WERROR": "ON",
+        "COMPS_COMPOSITE_PROVIDER": "package"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default",    "configurePreset": "default" },
+    { "name": "release",    "configurePreset": "release" },
+    { "name": "ci",         "configurePreset": "ci" },
+    { "name": "asan-ubsan", "configurePreset": "asan-ubsan" },
+    { "name": "tsan",       "configurePreset": "tsan" },
+    { "name": "portable",   "configurePreset": "portable" },
+    { "name": "install",    "configurePreset": "install", "targets": ["install"] },
+    { "name": "dpdk",       "configurePreset": "dpdk" }
+  ],
+  "testPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "ci",
+      "configurePreset": "ci",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "asan-ubsan",
+      "configurePreset": "asan-ubsan",
+      "output": { "outputOnFailure": true },
+      "environment": {
+        "ASAN_OPTIONS": "halt_on_error=1",
+        "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": { "outputOnFailure": true },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1 second_deadlock_stack=1"
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "portable",
+      "configurePreset": "portable",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

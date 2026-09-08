@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2025 Geon Technologies, LLC
+# Copyright (C) 2024 Geon Technologies, LLC
 #
 # This file is part of composite-comps.
 #
@@ -17,45 +17,12 @@
 # along with this program. If not, see http://www.gnu.org/licenses/.
 #
 
-cmake_minimum_required(VERSION 3.15)
-project(pkt_builder VERSION 0.1.0 LANGUAGES CXX)
-include(GNUInstallDirs)
-
-# Set the C++ version required
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Set compile flags
-set(CMAKE_CXX_FLAGS_INIT "-Wall -Wextra -Wpedantic")
-set(CMAKE_CXX_FLAGS_DEBUG_INIT "-g -ggdb -O0")
-set(CMAKE_CXX_FLAGS_RELEASE_INIT "-O3")
-
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Custom compile options
-add_compile_options(-march=x86-64-v2 -mtune=generic -ffast-math)
-
-# Library
-add_library(pkt_builder MODULE
-    component.cpp
-)
-# Includes
-target_include_directories(pkt_builder
-    PRIVATE
-    ${PROJECT_SOURCE_DIR}/../../../include
-)
-target_link_libraries(pkt_builder
-    PRIVATE
-    composite::composite
-    spdlog::spdlog_header_only
-)
-set_target_properties(pkt_builder PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/components
-)
-# Install
-install(TARGETS pkt_builder
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+# vrtgen: packets are built with the same packing classes pkt_parser parses with.
+comps_add_component(pkt_builder
+    SOURCES component.cpp
+    LINK    comps::vrtgen
 )
 
-# Tests
-add_subdirectory(tests)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()

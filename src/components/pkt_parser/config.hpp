@@ -19,16 +19,24 @@
 
 #pragma once
 
+#include <composite/properties/reflect.hpp>
+
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace struct_props {
 
 /**
  * @brief Signal override configuration
  *
- * Allows manual override of protocol-extracted metadata
+ * Allows manual override of protocol-extracted metadata.
+ *
+ * Reflection is declared in-body via COMPOSITE_FIELDS (the hidden-friend ADL hook), which
+ * works inside this namespace and on the nested struct directly — retiring the prior
+ * COMPOSITE_STRUCT-at-namespace-scope workaround. The wire contract is unchanged: this
+ * whole struct is still registered as the single "signal_overrides" property.
  */
 struct signal_overrides {
     std::optional<double> center_frequency;
@@ -40,10 +48,20 @@ struct signal_overrides {
         std::string type;
         uint32_t bit_width{};
         std::string endianness;
+        COMPOSITE_FIELDS(format, is_complex, type, bit_width, endianness);
     };
 
     format data_format;
     std::string transport;
+    // Operator-declared metadata annotations, "key=value" per entry, merged into every
+    // published metadata (operator wins over parser-set keys). This is the ingest-boundary
+    // hook for stream facts the wire protocol cannot carry — e.g. a stream that is ALREADY
+    // FFT data from a remote producer: declaring fft_size / fft_window_sum_sq here lets a
+    // downstream psd normalize exactly as it would behind a local fft component.
+    std::vector<std::string> annotations;
+    COMPOSITE_FIELDS(signal_overrides,
+                     center_frequency, bandwidth, sample_rate, data_format, transport,
+                     annotations);
 };
 
 } // namespace struct_props
