@@ -49,6 +49,17 @@
       }
     },
     {
+      "id": "smoke_rate_monitor",
+      "library": "rate_monitor",
+      "args": {
+        "type": "cf32"
+      }
+    },
+    {
+      "id": "smoke_sigmf_source",
+      "library": "sigmf_source"
+    },
+    {
       "id": "smoke_udp_sink",
       "library": "udp_sink"
     },

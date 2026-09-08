@@ -6,10 +6,11 @@
  */
 
 #include "component.hpp"
+
+#include <composite/core/register.hpp>
 #include "blue/BlueFile.hpp"
 
 #include <composite/properties/property_set.hpp>
-#include <composite/properties/property.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -27,26 +28,28 @@
 #include <thread>
 
 sigmf_source::sigmf_source(std::string_view id)
-    : composite::component(id) {
+    // The base creates and registers the output port; passing the name keeps the
+    // wire contract ("data_out") that existing graphs connect to.
+    : base_t(id, "data_out") {
     using enum composite::properties::config_type;
-    add_port(&m_out_port);
 
     add_property("destination_port", m_destination_port, RUNTIME);
     
-    add_property("chunk_samples", m_chunk_samples, RUNTIME);
+    // chunk_samples feeds calculate_timing (chunk_interval, chunks_per_wakeup) and
+    // the per-chunk read size, so an edit has to re-derive timing. Without a
+    // listener the new value applied to reads while timing stayed on the old one.
+    add_property("chunk_samples", m_chunk_samples, RUNTIME)
+        .on_change([this](const composite::properties::json&) { on_files_changed(); });
 
     // File spec - starts empty, append files on every allocation added
+    // One listener now: 0.5.2 delivers a JSON diff rather than an element index, and
+    // the handler re-derives its own path-keyed diff from m_files regardless.
     add_property("files", m_files, RUNTIME)
-        .change_listener([this](std::size_t idx) { return on_files_changed(); })
-        // Two change listeners needed:
-        // - Indexed: framework fires this for per-element changes (add/edit/single erase)
-        // - No-arg: framework fires this for whole-list reset, e.g., setting "files": null
-        // Both forward to the same handler since our diff is path-keyed
-        .change_listener([this]() { return on_files_changed(); });
+        .on_change([this](const composite::properties::json&) { on_files_changed(); });
 
     // Streaming control - starts disabled, set streaming=true when ready to stream
     add_property("streaming", m_streaming, RUNTIME)
-        .change_listener([this]() { return on_streaming_changed(); });
+        .on_change([this](const composite::properties::json&) { on_streaming_changed(); });
 }
 
 auto sigmf_source::initialize() -> void {
@@ -54,7 +57,11 @@ auto sigmf_source::initialize() -> void {
     logger()->info("sigmf_source initialized (streaming disabled, set streaming=true after configuring file_path)");
 }
 
-auto sigmf_source::start() -> void {
+auto sigmf_source::on_worker_start() -> void {
+    // Required: the base drops any packet held from a prior run, so a restart does
+    // not replay a stale buffer ahead of fresh data.
+    base_t::on_worker_start();
+
     logger()->info("sigmf_source starting");
 
     // Always track start time (needed for wallclock_timestamps and rate_control)
@@ -77,118 +84,84 @@ auto sigmf_source::start() -> void {
     if (m_streaming) {
         spawn_metrics_thread();
     }
-    composite::component::start();
+    m_next_file = 0;
 }
 
-auto sigmf_source::stop() -> void {
+auto sigmf_source::on_worker_stop() -> void {
     stop_metrics_thread();
 
     std::unique_lock<std::shared_mutex> lock(m_runtime_mutex);
     for (auto& rt : m_runtime) {
         rt.mmap.reset();
     }
-    composite::component::stop();
 }
 
-auto sigmf_source::process() -> composite::retval {
-    using enum composite::retval;
-
+auto sigmf_source::produce() -> produce_result {
     std::unique_lock<std::shared_mutex> lock(m_runtime_mutex);
 
     if (!m_streaming || m_runtime.empty()) {
-        return NOOP;
+        return produce_result::idle();
     }
 
-    auto now = std::chrono::steady_clock::now();
-    auto earliest_due = std::chrono::steady_clock::time_point::max();
+    const auto now = std::chrono::steady_clock::now();
+    const std::size_t n = m_runtime.size();
 
-    // --- Pass 1: classify each runtime ---
-    // Collect indices of runtimes that have work ready RIGHT NOW.
-    // For ones not ready, accumulate the earliest "due" time.
-    std::vector<std::size_t> ready_now;
-    ready_now.reserve(m_runtime.size());
+    // A file that could still yield data (now or later).
+    bool any_live = false;
+    // A file that loaded successfully and has run to its end. Distinguishing this
+    // from "never worked" is what keeps a spec of only-bad files recoverable: it
+    // idles for a corrected spec instead of finishing the component.
+    bool any_completed = false;
 
-    for (std::size_t i = 0; i < m_runtime.size(); ++i) {
-        const auto& rt = m_runtime[i];
+    // Round-robin from where we stopped: one packet per call means a fixed scan
+    // order would let stream 0 monopolise a saturated output.
+    for (std::size_t k = 0; k < n; ++k) {
+        const std::size_t i = (m_next_file + k) % n;
+        auto& rt = m_runtime[i];
 
-        if (rt.load_error) continue;
-        if (rt.eof && !rt.loop) continue;  // no more work
-
-        constexpr auto kBackoffWhenDownstreamFull = std::chrono::microseconds(500);
-
-        if (!rt.rate_control) {
-            if (m_out_port.can_send()) {
-                // As-fast-as-possible mode: always ready
-                ready_now.push_back(i);
-            } else {
-                earliest_due = std::min(earliest_due, now + kBackoffWhenDownstreamFull);
-            }
+        if (rt.load_error) {
+            continue;
+        }
+        if (rt.eof && !rt.loop) {
+            any_completed = true;
             continue;
         }
 
-        // Rate-controlled: ready only if behind schedule
-        auto elapsed = std::chrono::duration<double>(now - rt.start_time).count();
-        auto expected_samples = static_cast<uint64_t>(elapsed * rt.effective_sample_rate);
+        any_live = true;
 
-        if (rt.samples_sent < expected_samples) {
-            ready_now.push_back(i);
-        } else {
-            // Ahead of schedule — compute when this file's next chunk is due
-            double next_due_sec = static_cast<double>(rt.samples_sent) / rt.effective_sample_rate;
-            auto next_due = rt.start_time + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>(next_due_sec));
-            earliest_due = std::min(earliest_due, next_due);
-        }
-    }
-
-    // --- Pass 2: execute the ready set ---
-    bool any_work_done = false;
-
-    if (!ready_now.empty()) {
-        // Per-iteration budget: cap how many chunks each ready runtime sends per process() call
-        // to keep latency fair across streams. For rate-controlled, use chunks_per_wakeup * 2
-        // (matches old catch-up cap). For non-rate-controlled, use a fixed small budget.
-        for (auto idx : ready_now) {
-            auto& rt = m_runtime[idx];
-
-            uint32_t budget = rt.rate_control
-                ? rt.chunks_per_wakeup * 2
-                : 1;  // non-rate-controlled: one chunk per process(), no hogging
-
-            uint32_t sent = 0;
-            while (sent < budget) {
-                if (rt.rate_control) {
-                    // Re-check we're still behind (catch-up loop terminates when current)
-                    auto elapsed = std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - rt.start_time).count();
-                    auto expected = static_cast<uint64_t>(elapsed * rt.effective_sample_rate);
-                    if (rt.samples_sent >= expected && sent >= rt.chunks_per_wakeup) {
-                        break;
-                    }
-                }
-
-                if (process_chunk(rt) != NORMAL) break;
-                sent++;
+        // Rate control is now purely "am I behind schedule?". Pacing needs no sleep
+        // here: returning idle() parks the worker on the doorbell, and while we are
+        // behind, the base calls produce() back-to-back so catch-up is immediate.
+        if (rt.rate_control) {
+            const auto elapsed = std::chrono::duration<double>(now - rt.start_time).count();
+            const auto expected = static_cast<uint64_t>(elapsed * rt.effective_sample_rate);
+            if (rt.samples_sent >= expected) {
+                continue;
             }
+        }
 
-            if (sent > 0) any_work_done = true;
+        auto r = next_chunk(rt);
+        if (r.status == produce_status::data) {
+            m_next_file = (i + 1) % n;
+            return r;
+        }
+        // Hit its end on this call; let the loop consider the remaining files.
+        if (rt.eof && !rt.loop) {
+            any_completed = true;
         }
     }
 
-    // --- Sleep if no one was ready and we have a future due time ---
-    if (!any_work_done && earliest_due != std::chrono::steady_clock::time_point::max()) {
-        lock.unlock();
-        auto now2 = std::chrono::steady_clock::now();
-        if (earliest_due > now2) {
-            auto sleep_duration = std::clamp(
-                std::chrono::duration_cast<std::chrono::microseconds>(earliest_due - now2),
-                std::chrono::microseconds(250),
-                std::chrono::microseconds(10000));
-            std::this_thread::sleep_for(sleep_duration);
-        }
+    // Every loaded file has run out and none can restart: the stream is genuinely
+    // over. done() makes the base send EOS (out-of-band, never gated by
+    // backpressure) and FINISH, so the downstream graph completes instead of
+    // idling forever -- which a plain component could not express.
+    if (!any_live && any_completed) {
+        return produce_result::done();
     }
 
-    return any_work_done ? NORMAL : NOOP;
+    // Backpressure is deliberately absent from all of the above: the base holds an
+    // unaccepted packet and re-sends it, so this never has to poll can_send().
+    return produce_result::idle();
 }
 
 bool sigmf_source::on_files_changed() {
@@ -200,10 +173,10 @@ bool sigmf_source::on_files_changed() {
     std::unordered_set<std::string> seen_paths;
     std::unordered_set<std::string> path_conflicts;
     for (const auto& s : m_files) {
-        if (!seen_paths.insert(s.file_path).second) {
-            path_conflicts.insert(s.file_path);
+        if (!seen_paths.insert(s.path).second) {
+            path_conflicts.insert(s.path);
             logger()->warn("sigmf_source: duplicate file_path '{}' in files list, "
-                           "marking as load_error", s.file_path);
+                           "marking as load_error", s.path);
         }
     }
 
@@ -213,11 +186,11 @@ bool sigmf_source::on_files_changed() {
     std::unordered_set<std::string> stream_id_conflicts;
     for (const auto& s : m_files) {
         if (!seen_stream_ids.insert(s.stream_id).second) {
-            stream_id_conflicts.insert(s.file_path);
+            stream_id_conflicts.insert(s.path);
             logger()->warn("sigmf_source: duplicate stream_id {} on path '{}', "
                            "marking this spec as load_error. To recover, send "
                            "files[i]=null and re-add with a unique stream_id.",
-                           s.stream_id, s.file_path);
+                           s.stream_id, s.path);
         }
     }
 
@@ -231,16 +204,16 @@ bool sigmf_source::on_files_changed() {
         const auto port = s.destination_port != 0 ? s.destination_port : m_destination_port;
         const auto ip = s.destination_ip.empty() ? "<udp_sink default>" : s.destination_ip;
         if (!seen_destinations.insert(std::format("{}:{}", ip, port)).second) {
-            destination_conflicts.insert(s.file_path);
+            destination_conflicts.insert(s.path);
             logger()->warn("sigmf_source: duplicate destination {}:{} on path '{}', "
                            "marking this spec as load_error. Streams are separated by "
                            "group address; assign each spec a unique destination_ip.",
-                           ip, port, s.file_path);
+                           ip, port, s.path);
         }
     }
 
     std::unordered_map<std::string, const struct_props::file_spec*> desired;
-    for (const auto& s : m_files) desired.emplace(s.file_path, &s);
+    for (const auto& s : m_files) desired.emplace(s.path, &s);
 
     std::size_t removed = 0;
     std::erase_if(m_runtime, [&](const file_runtime& rt) {
@@ -254,17 +227,17 @@ bool sigmf_source::on_files_changed() {
     for (const auto& s : m_files) {
         // Handle new requests
         bool exists = std::ranges::any_of(m_runtime,
-            [&](const file_runtime& rt){ return rt.file_path == s.file_path; });
+            [&](const file_runtime& rt){ return rt.file_path == s.path; });
         if (exists) continue;
 
         // Check for duplicate file names, stream ids, and destinations
         file_runtime rt;
-        if (stream_id_conflicts.contains(s.file_path) || path_conflicts.contains(s.file_path)
-            || destination_conflicts.contains(s.file_path)) {
-            rt.file_path = s.file_path;
+        if (stream_id_conflicts.contains(s.path) || path_conflicts.contains(s.path)
+            || destination_conflicts.contains(s.path)) {
+            rt.file_path = s.path;
             rt.load_error = true;
         } else if (!load_file(s, rt)) {
-            rt.file_path = s.file_path;
+            rt.file_path = s.path;
             rt.load_error = true;
         }
         if (rt.load_error) ++added_err;
@@ -328,10 +301,10 @@ bool sigmf_source::on_streaming_changed() {
 }
 
 bool sigmf_source::load_file(const struct_props::file_spec& spec, file_runtime& rt) {
-    logger()->info("sigmf_source: load_file() called with file_path='{}'", spec.file_path);
+    logger()->info("sigmf_source: load_file() called with file_path='{}'", spec.path);
 
     // Can't load runtime if spec doesn't contain a file path
-    if (spec.file_path.empty()) {
+    if (spec.path.empty()) {
         logger()->warn("sigmf_source: cannot load - file_path is empty");
         return false;
     }
@@ -346,14 +319,25 @@ bool sigmf_source::load_file(const struct_props::file_spec& spec, file_runtime& 
         return load_blue_file(spec, meta, rt);
     }
 
-    // Derive the actual data file path
-    std::string data_path = spec.file_path;
+    // Derive the actual data file path. Three accepted spellings, matching what
+    // parse_metadata already accepts for the sidecar: the .sigmf-data file itself,
+    // the .sigmf-meta sidecar, or the bare SigMF basename. The bare stem is the
+    // form graphs and the controller actually use, and it used to fall through to
+    // the not-found path below because only the .sigmf-meta rewrite was handled.
+    std::string data_path = spec.path;
     if (data_path.ends_with(".sigmf-meta")) {
         data_path = data_path.substr(0, data_path.length() - 11) + ".sigmf-data";
+    } else if (!std::filesystem::exists(data_path) &&
+               std::filesystem::exists(data_path + ".sigmf-data")) {
+        data_path += ".sigmf-data";
     }
 
-    // Verify file exists
-    if (!std::filesystem::exists(data_path)) return false;
+    if (!std::filesystem::exists(data_path)) {
+        logger()->warn("sigmf_source: no data file for spec path '{}' (looked for '{}'); "
+                       "give the .sigmf-data file, the .sigmf-meta sidecar, or their shared basename",
+                       spec.path, data_path);
+        return false;
+    }
 
     rt.data_path = data_path;
 
@@ -364,7 +348,11 @@ bool sigmf_source::load_file(const struct_props::file_spec& spec, file_runtime& 
 
     // Calculate bytes per sample from format
     rt.bytes_per_sample = meta.format.bytes_per_sample();
-    if (rt.bytes_per_sample == 0) return false;
+    if (rt.bytes_per_sample == 0) {
+        logger()->warn("sigmf_source: datatype '{}' yields a zero-byte sample for '{}'",
+                       meta.format.datatype_str, spec.path);
+        return false;
+    }
 
     // Memory-map the file as raw bytes
     // Use writable=true if we need to swap bytes (MAP_PRIVATE allows in-place modification)
@@ -390,9 +378,10 @@ bool sigmf_source::load_file(const struct_props::file_spec& spec, file_runtime& 
         if (!apply_endianness_swap_raw(rt)) return false;
         meta.format.is_big_endian = (std::endian::native == std::endian::big);
         rt.cached_meta.format.endianness = std::endian::native;
+        rt.md_dirty = true;
     }
 
-    rt.file_path = spec.file_path;
+    rt.file_path = spec.path;
     rt.start_time = std::chrono::steady_clock::now();
     auto utc_now = std::chrono::system_clock::now();
     rt.utc_epoch_seconds = static_cast<uint32_t>(
@@ -415,7 +404,7 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
     logger()->info("sigmf_source: loading MIDAS Blue file");
 
     // Derive the .blue file path from spec
-    std::string blue_path = spec.file_path;
+    std::string blue_path = spec.path;
     if (blue_path.ends_with(".sigmf-meta")) {
         blue_path = blue_path.substr(0, blue_path.length() - 11) + ".blue";
     } else if (blue_path.ends_with(".sigmf-data")) {
@@ -471,7 +460,7 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
     }
 
     // Identity field
-    rt.file_path = spec.file_path;
+    rt.file_path = spec.path;
 
     // Format-derived fields
     rt.bytes_per_sample = blueInfo->format.sampleSize;
@@ -508,9 +497,10 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
         logger()->info("sigmf_source: applying endianness swap on Blue data ({} bytes)", blueInfo->dataSize);
         if (!apply_endianness_swap_blue(rt)) { return false; }
         rt.cached_meta.format.endianness = std::endian::native;
+        rt.md_dirty = true;
     }
 
-    rt.file_path = spec.file_path;
+    rt.file_path = spec.path;
     rt.start_time = std::chrono::steady_clock::now();
     auto utc_now = std::chrono::system_clock::now();
     rt.utc_epoch_seconds = static_cast<uint32_t>(
@@ -531,7 +521,7 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
 
 bool sigmf_source::parse_metadata(const struct_props::file_spec& spec, parsed_metadata& meta) {
     // extract path from spec
-    std::string meta_path = spec.file_path;
+    std::string meta_path = spec.path;
 
     // Extract sigmf-meta file from specs file path
     if (meta_path.ends_with(".sigmf-data")) {
@@ -541,11 +531,11 @@ bool sigmf_source::parse_metadata(const struct_props::file_spec& spec, parsed_me
         meta_path = meta_path.substr(0, meta_path.length() - 5) + ".sigmf-meta";
     } else if (!meta_path.ends_with(".sigmf-meta")) {
         // Check if the file exists as-is (raw binary file without .sigmf- extension)
-        if (!std::filesystem::exists(spec.file_path) || std::filesystem::is_directory(spec.file_path)) {
+        if (!std::filesystem::exists(spec.path) || std::filesystem::is_directory(spec.path)) {
             meta_path = meta_path + ".sigmf-meta";
         } else {
             // File exists as-is, derive meta path by appending .sigmf-meta
-            meta_path = spec.file_path + ".sigmf-meta";
+            meta_path = spec.path + ".sigmf-meta";
         }
     }
 
@@ -654,6 +644,8 @@ void sigmf_source::stamp_destination(const struct_props::file_spec& spec, file_r
     // the port by stream_id would only defeat receivers' IGMP filtering.
     const auto port = spec.destination_port != 0 ? spec.destination_port : m_destination_port;
     rt.cached_meta.annotations["destination_port"] = std::to_string(port);
+
+    rt.md_dirty = true;
 }
 
 void sigmf_source::build_metadata(const struct_props::file_spec& spec, file_runtime& rt, const parsed_metadata& meta) {
@@ -668,6 +660,8 @@ void sigmf_source::build_metadata(const struct_props::file_spec& spec, file_runt
     }
 
     rt.cached_meta.format = to_composite_format(meta.format);
+
+    rt.md_dirty = true;
 }
 
 void sigmf_source::reset_runtime_for_playback(file_runtime& rt, std::chrono::steady_clock::time_point now, uint32_t utc_epoch_seconds) {
@@ -727,6 +721,7 @@ void sigmf_source::refresh_runtime_from_spec(const struct_props::file_spec& spec
     const double new_rate = spec.overrides.sample_rate.value_or(rt.cached_meta.sample_rate);
     rt.cached_meta.sample_rate = new_rate;
     rt.cached_meta.bandwidth = spec.overrides.bandwidth.value_or(new_rate);
+    rt.md_dirty = true;
 
     // Recompute timing - handles rate_control on/off and max_sample_rate changes
     parsed_metadata meta;
@@ -796,11 +791,9 @@ void sigmf_source::calculate_timing(const struct_props::file_spec& spec, file_ru
                   rt.effective_sample_rate, m_chunk_samples, rt.chunks_per_wakeup, rt.chunk_interval.count());
 }
 
-auto sigmf_source::process_chunk(file_runtime& rt) -> composite::retval {
-    using enum composite::retval;
-
+auto sigmf_source::next_chunk(file_runtime& rt) -> produce_result {
     if (rt.eof && !rt.loop) {
-        return NOOP;
+        return produce_result::idle();
     }
 
     if (rt.eof && rt.loop) {
@@ -822,7 +815,7 @@ auto sigmf_source::process_chunk(file_runtime& rt) -> composite::retval {
         if (!rt.loop) {
             logger()->info("sigmf_source: reached end of file after {} samples", rt.samples_sent);
         }
-        return NOOP;
+        return produce_result::idle();
     }
 
     // Convert sample count to byte count for buffer copy
@@ -831,6 +824,12 @@ auto sigmf_source::process_chunk(file_runtime& rt) -> composite::retval {
     // Copy chunk bytes from the mmap region into a shared buffer.
     auto* src = rt.mmap->data() + rt.current_byte_offset;
     auto chunk = std::make_shared<std::vector<std::byte>>(src, src + bytes_to_read);
+
+    // Captured BEFORE the counters advance: the packet timestamps the first sample
+    // it carries. Reading samples_sent after the increment dated every packet one
+    // full chunk late.
+    const uint64_t chunk_start_sample = rt.samples_sent;
+
     rt.current_byte_offset += bytes_to_read;
     rt.samples_sent += samples_to_read;
 
@@ -845,12 +844,16 @@ auto sigmf_source::process_chunk(file_runtime& rt) -> composite::retval {
         auto now = std::chrono::steady_clock::now();
         offset_seconds = std::chrono::duration<double>(now - rt.start_time).count();
     } else {
-        // File-time mode (default): offset based on sample position
-        if (rt.effective_sample_rate > 0) {
-            offset_seconds = static_cast<double>(rt.samples_sent) / rt.effective_sample_rate;
-        } else {
-            offset_seconds = 0.0;
-        }
+        // File-time mode (default): position on the RECORDING's timeline, so this
+        // uses the file's true rate. effective_sample_rate is the throttled playback
+        // rate -- deriving file time from it let max_sample_rate silently rewrite the
+        // recording's timestamps.
+        const double file_rate = rt.cached_meta.sample_rate > 0.0
+            ? rt.cached_meta.sample_rate
+            : rt.effective_sample_rate;
+        offset_seconds = file_rate > 0.0
+            ? static_cast<double>(chunk_start_sample) / file_rate
+            : 0.0;
     }
 
     // Split offset into integer seconds and sub-second fractional part
@@ -860,15 +863,17 @@ auto sigmf_source::process_chunk(file_runtime& rt) -> composite::retval {
     ts.seconds = rt.utc_epoch_seconds + offset_int;
     ts.picoseconds = static_cast<uint64_t>(offset_frac * 1e12);
 
-    // Send metadata for specific file
-    m_out_port.send_metadata(rt.cached_meta);
+    // send_metadata() is gone in 0.5.2: metadata travels with the packet. Re-latch
+    // only when it actually changed, so the hot path reuses one shared instance.
+    if (rt.md_dirty || !rt.latched_md) {
+        rt.latched_md = composite::make_metadata(rt.cached_meta);
+        rt.md_dirty = false;
+    }
 
-    // Send data - chunk is a copy of the mmap region (intentional, not a view).
-    // Keeps mmap.reset() as a true release independent of downstream pipeline
+    // chunk is a copy of the mmap region (intentional, not a view), which keeps
+    // mmap.reset() a true release independent of the downstream pipeline.
     composite::immutable_buffer<std::byte> buf(chunk);
-    m_out_port.send_data(std::move(buf), ts);
-
-    return NORMAL;
+    return produce_result::emit(std::move(buf), ts, rt.latched_md);
 }
 
 bool sigmf_source::apply_endianness_swap_raw(file_runtime& rt) {
@@ -1153,13 +1158,12 @@ std::string sigmf_source::format_rate(double sps) {
 
 std::string sigmf_source::stream_id_of(const file_runtime& rt) {
     auto it = rt.cached_meta.annotations.find("stream_id");
-    return it != rt.cached_meta.annotations.end() ? it->second : "?";
+    return it != rt.cached_meta.annotations.end() ? it->second.to_string() : "?";
 }
 
 #ifndef UNIT_TESTS
-extern "C" {
-auto create(std::string_view id) -> std::shared_ptr<composite::component> {
-    return std::make_shared<sigmf_source>(id);
-}
-}
+// Emits create() plus composite_abi_version. Uses make_component (not make_shared):
+// its deleter stops the worker while the leaf vtable is still intact, which a
+// source_component requires because produce() is pure in the base.
+COMPOSITE_REGISTER_SIMPLE(sigmf_source)
 #endif

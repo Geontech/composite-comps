@@ -8,6 +8,8 @@
 #pragma once
 
 #include <composite/composite.hpp>
+// Not pulled in by the composite.hpp umbrella.
+#include <composite/core/source_component.hpp>
 #include <array>
 #include <chrono>
 #include <complex>
@@ -60,11 +62,25 @@ struct sigmf_overrides {
     // remove the file (files[i] = null) and add it back.
     std::optional<std::string> datatype;  // e.g., "cf32_le", "ri16_be", "cu8"
     std::optional<std::string> filetype;  // "raw" or "bluefile-1000"
+
+    // A vector-valued property is diffed by value, so the element type (and every
+    // nested struct) has to be equality-comparable.
+    friend auto operator==(const sigmf_overrides&, const sigmf_overrides&) -> bool = default;
+
+    COMPOSITE_FIELDS(sigmf_overrides,
+        (sample_rate, runtime, unit("sps")),
+        (center_frequency, runtime, unit("Hz")),
+        (bandwidth, runtime, unit("Hz")),
+        (datatype, runtime),
+        (filetype, runtime));
 };
 
 // Incoming file identity
 struct file_spec {
-    std::string file_path; // identity of file
+    // NOTE: the reflected field name IS the wire key ("path"), so this member is
+    // named for the JSON contract rather than for its C++ role. file_runtime has
+    // its own file_path, which is internal and not reflected.
+    std::string path; // identity of file
     int32_t stream_id{0};
     // Per-file egress destination. Assigned by the controlling service, which
     // owns address allocation; this component only forwards what it is given.
@@ -79,41 +95,22 @@ struct file_spec {
     bool wallclock_timestamps{false};
     double max_sample_rate{-1.0};
     sigmf_overrides overrides{};
+
+    friend auto operator==(const file_spec&, const file_spec&) -> bool = default;
+
+    COMPOSITE_FIELDS(file_spec,
+        (path, runtime),
+        (stream_id, runtime),
+        (destination_ip, runtime),
+        (destination_port, runtime),
+        (loop, runtime),
+        (rate_control, runtime),
+        (wallclock_timestamps, runtime),
+        (max_sample_rate, runtime, unit("sps")),
+        (overrides, runtime));
 };
 
 } // namespace struct_props
-
-// Property traits for sigmf_overrides struct
-template<>
-struct composite::properties::property_traits<struct_props::sigmf_overrides> {
-    static void register_fields(composite::properties::property_set& ps, struct_props::sigmf_overrides& o) {
-        using enum composite::properties::config_type;
-        ps.add("sample_rate", o.sample_rate, RUNTIME);
-        ps.add("center_frequency", o.center_frequency, RUNTIME);
-        ps.add("bandwidth", o.bandwidth, RUNTIME);
-        ps.add("datatype", o.datatype, RUNTIME);
-        ps.add("filetype", o.filetype, RUNTIME);
-    }
-};
-
-// File template
-template<>
-struct composite::properties::property_traits<struct_props::file_spec> {
-    static constexpr std::string_view type_name = "file_spec";
-    static void register_fields(composite::properties::property_set& ps,
-                    struct_props::file_spec& s) {
-        using composite::properties::config_type;
-        ps.add("path", s.file_path, config_type::RUNTIME);
-        ps.add("stream_id", s.stream_id, config_type::RUNTIME);
-        ps.add("destination_ip", s.destination_ip, config_type::RUNTIME);
-        ps.add("destination_port", s.destination_port, config_type::RUNTIME);
-        ps.add("loop", s.loop, config_type::RUNTIME);
-        ps.add("rate_control", s.rate_control, config_type::RUNTIME);
-        ps.add("wallclock_timestamps", s.wallclock_timestamps, config_type::RUNTIME);
-        ps.add("max_sample_rate", s.max_sample_rate, config_type::RUNTIME);
-        ps.add("overrides", s.overrides, config_type::RUNTIME);
-    }
-};
 
 /**
  * RAII wrapper for memory-mapped file region.
@@ -229,17 +226,24 @@ private:
  *
  * Output: immutable_buffer<std::byte> with metadata.format populated
  */
-class sigmf_source : public composite::component {
-    using output_port_t = composite::output_port<composite::immutable_buffer<std::byte>>;
+class sigmf_source : public composite::source_component<composite::immutable_buffer<std::byte>> {
+    using base_t = composite::source_component<composite::immutable_buffer<std::byte>>;
 
 public:
     explicit sigmf_source(std::string_view id = "sigmf_source");
     ~sigmf_source() override = default;
 
     auto initialize() -> void override;
-    auto start() -> void override;
-    auto stop() -> void override;
-    auto process() -> composite::retval override;
+
+protected:
+    // The base owns the produce loop: it HOLDS a packet the downstream ring cannot
+    // accept and re-sends it (no drop), and turns done() into EOS + FINISH. Both are
+    // why this is a source_component rather than a plain component.
+    auto produce() -> produce_result override;
+
+    // start()/stop() are final in composite::component as of 0.5.2.
+    auto on_worker_start() -> void override;
+    auto on_worker_stop() -> void override;
 
 private:
     struct file_runtime {
@@ -251,6 +255,11 @@ private:
         char blue_type_code{0};
         std::shared_ptr<MmapRegion<std::byte>> mmap;
         composite::metadata cached_meta;
+        // The published snapshot handed to every packet. Rebuilt only when
+        // cached_meta changes (md_dirty), because make_metadata allocates and
+        // this is the per-chunk hot path.
+        composite::metadata_ptr latched_md;
+        bool md_dirty{true};
         std::size_t bytes_per_sample{0};
         std::size_t total_samples{0};
         std::size_t data_start_offset{0};
@@ -320,7 +329,7 @@ private:
     void log_metrics();
 
     // Processing
-    auto process_chunk(file_runtime& rt) -> composite::retval;
+    auto next_chunk(file_runtime& rt) -> produce_result;
     bool apply_endianness_swap_raw(file_runtime& rt);
     bool apply_endianness_swap_blue(file_runtime& rt);
     void build_metadata(const struct_props::file_spec& spec, file_runtime& rt, const parsed_metadata& meta);
@@ -332,11 +341,12 @@ private:
     static std::string format_rate(double sps);
     static std::string stream_id_of(const file_runtime& rt); 
 
-    // Single output port
-    output_port_t m_out_port{"data_out"};
-
     // Vector of statuses
     std::vector<file_runtime> m_runtime;
+
+    // Round-robin cursor into m_runtime. produce() yields ONE packet per call, so
+    // without this the scan would always restart at 0 and starve later streams.
+    std::size_t m_next_file{0};
 
     // mutex and thread
     std::shared_mutex m_runtime_mutex;
@@ -352,10 +362,13 @@ private:
     // Metrics constants
     static constexpr auto kMetricsTickInterval = std::chrono::seconds(5);
     static constexpr double kRateDeviationThreshold = 0.05;  // 5%
+
+    // MUST be the last data member. source_component::produce() is pure, so a worker
+    // still in the produce loop when the leaf destructor has run would dispatch to a
+    // pure virtual and abort. A base-class member runs too late; the stop has to live
+    // in the leaf. See source_component's "Destruction (IMPORTANT)" note.
+    composite::component::auto_stop m_auto_stop{*this};
 };
 
-#ifndef UNIT_TESTS
-extern "C" {
-auto create(std::string_view id) -> std::shared_ptr<composite::component>;
-}
-#endif
+// The factory ABI is emitted by COMPOSITE_REGISTER_SIMPLE in component.cpp; it
+// declares create() and the composite_abi_version handshake the loader checks.

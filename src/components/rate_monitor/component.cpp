@@ -6,6 +6,8 @@
 
 #include "component.hpp"
 
+#include <composite/core/register.hpp>
+
 #include <spdlog/spdlog.h>
 
 #include <format>
@@ -17,6 +19,7 @@ rate_monitor<T>::rate_monitor(std::string_view id)
     using enum composite::properties::config_type;
     add_port(&m_in_port);
     add_property("report_interval_sec", m_report_interval_sec, RUNTIME);
+    add_property("elements_per_sample", m_elements_per_sample, RUNTIME);
 }
 
 template<typename T>
@@ -25,11 +28,17 @@ auto rate_monitor<T>::initialize() -> void {
 }
 
 template<typename T>
-auto rate_monitor<T>::start() -> void {
+auto rate_monitor<T>::on_worker_start() -> void {
     m_total_samples = 0;
     m_samples_since_report = 0;
     m_chunks_received = 0;
     m_first_chunk = true;
+    m_final_printed = false;
+    // Seeded here as well as on the first chunk: without it a run that never
+    // receives data measures from the steady_clock epoch and reports a nonsense
+    // duration.
+    m_start_time = std::chrono::steady_clock::now();
+    m_last_report_time = m_start_time;
 
     std::cout << "\n";
     std::cout << "========================================\n";
@@ -37,19 +46,37 @@ auto rate_monitor<T>::start() -> void {
     std::cout << "========================================\n";
     std::cout << std::format("Report interval: {:.1f} seconds\n", m_report_interval_sec);
     std::cout << "----------------------------------------\n";
-
-    composite::component::start();
 }
 
 template<typename T>
-auto rate_monitor<T>::stop() -> void {
-    // Print final stats
+auto rate_monitor<T>::on_worker_stop() -> void {
+    print_final_stats();
+}
+
+template<typename T>
+auto rate_monitor<T>::on_end_of_stream() -> void {
+    // The upstream source ran to completion. Report now, while the run is still
+    // distinguishable from an operator-initiated stop.
+    std::cout << "End of stream reached.\n";
+    print_final_stats();
+}
+
+template<typename T>
+void rate_monitor<T>::print_final_stats() {
+    // Both end-of-stream and worker stop land here; totals print once per run.
+    if (m_final_printed) {
+        return;
+    }
+    m_final_printed = true;
+
     auto now = std::chrono::steady_clock::now();
     auto total_duration = std::chrono::duration<double>(now - m_start_time).count();
 
     std::cout << "----------------------------------------\n";
     std::cout << "FINAL STATISTICS:\n";
-    if (total_duration > 0) {
+    if (m_first_chunk) {
+        std::cout << "  No data received.\n";
+    } else if (total_duration > 0) {
         double overall_rate = static_cast<double>(m_total_samples) / total_duration;
         std::cout << std::format("  Total samples:    {}\n", m_total_samples);
         std::cout << std::format("  Total chunks:     {}\n", m_chunks_received);
@@ -61,8 +88,6 @@ auto rate_monitor<T>::stop() -> void {
         }
     }
     std::cout << "========================================\n\n";
-
-    composite::component::stop();
 }
 
 template<typename T>
@@ -108,7 +133,8 @@ auto rate_monitor<T>::process() -> composite::retval {
     }
 
     // Count samples
-    std::size_t num_samples = data.size();
+    const double divisor = m_elements_per_sample > 0.0 ? m_elements_per_sample : 1.0;
+    auto num_samples = static_cast<std::size_t>(static_cast<double>(data.size()) / divisor);
     m_total_samples += num_samples;
     m_samples_since_report += num_samples;
     m_chunks_received++;
@@ -128,22 +154,33 @@ template class rate_monitor<std::complex<int16_t>>;
 template class rate_monitor<std::complex<int8_t>>;
 template class rate_monitor<float>;
 template class rate_monitor<int16_t>;
+template class rate_monitor<std::byte>;
 
 #ifndef UNIT_TESTS
-extern "C" {
-auto create(std::string_view id, std::string_view type) -> std::shared_ptr<composite::component> {
+// create() now takes create_args, and the template discriminator arrives as
+// args.type() -- which is why a graph selects the variant with
+// "args": {"type": "cf32"} rather than the old top-level "subtype".
+COMPOSITE_REGISTER_COMPONENT([](std::string_view id, const composite::create_args& args)
+                                 -> std::shared_ptr<composite::component> {
+    const auto type = args.type();
     if (type == "cf32" || type.empty()) {
-        return std::make_shared<rate_monitor_cf32>(id);
-    } else if (type == "ci16") {
-        return std::make_shared<rate_monitor_ci16>(id);
-    } else if (type == "ci8") {
-        return std::make_shared<rate_monitor_ci8>(id);
-    } else if (type == "f32") {
-        return std::make_shared<rate_monitor_f32>(id);
-    } else if (type == "i16") {
-        return std::make_shared<rate_monitor_i16>(id);
+        return composite::make_component<rate_monitor_cf32>(id);
+    }
+    if (type == "ci16") {
+        return composite::make_component<rate_monitor_ci16>(id);
+    }
+    if (type == "ci8") {
+        return composite::make_component<rate_monitor_ci8>(id);
+    }
+    if (type == "f32") {
+        return composite::make_component<rate_monitor_f32>(id);
+    }
+    if (type == "i16") {
+        return composite::make_component<rate_monitor_i16>(id);
+    }
+    if (type == "bytes" || type == "u8") {
+        return composite::make_component<rate_monitor_bytes>(id);
     }
     throw std::runtime_error(std::format("rate_monitor: unknown type '{}'", type));
-}
-}
+})
 #endif

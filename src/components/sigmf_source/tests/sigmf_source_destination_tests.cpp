@@ -24,6 +24,14 @@
 
 namespace {
 
+// produce() is protected on the component. Re-exposing it here lets a test read the
+// emitted packet's metadata directly, with no worker thread and no connected sink --
+// the annotations under test are stamped into that metadata.
+struct testable_sigmf_source : sigmf_source {
+    using sigmf_source::sigmf_source;
+    using sigmf_source::produce;
+};
+
 constexpr std::size_t kTestSamples = 64;
 constexpr double kSampleRate = 1000000.0;
 constexpr auto kComponentDefaultPort = "5000";
@@ -62,8 +70,10 @@ struct destination_fixture {
     using byte_buffer = composite::immutable_buffer<std::byte>;
 
     std::filesystem::path dir;
-    std::shared_ptr<sigmf_source> source;
-    std::shared_ptr<composite::input_port<byte_buffer>> sink;
+    std::shared_ptr<testable_sigmf_source> source;
+    // Mirrors the component's "files" array. 0.5.2 writes properties as whole JSON
+    // values, so an edit re-sends the full array rather than patching one element.
+    composite::properties::json files_json = composite::properties::json::array();
 
     destination_fixture() {
         dir = std::filesystem::temp_directory_path() /
@@ -71,18 +81,17 @@ struct destination_fixture {
         std::filesystem::remove_all(dir);
         std::filesystem::create_directories(dir);
 
-        source = std::make_shared<sigmf_source>("test_sigmf_source");
-        sink = std::make_shared<composite::input_port<byte_buffer>>("sink");
+        source = std::make_shared<testable_sigmf_source>("test_sigmf_source");
 
-        auto* out = source->get_port<composite::output_port<byte_buffer>>("data_out");
-        REQUIRE(out != nullptr);
-        out->connect(sink.get());
+        // The port still has to exist under its documented name even though these
+        // tests read the packet from produce() instead of across a connection.
+        REQUIRE(source->get_port<composite::output_port<byte_buffer>>("data_out") != nullptr);
 
-        source->set_properties({{"chunk_samples", std::to_string(kTestSamples)}});
+        source->set_properties({{"chunk_samples", kTestSamples}});
     }
 
     ~destination_fixture() {
-        source->set_properties({{"streaming", "false"}});
+        source->set_properties({{"streaming", false}});
         source->stop();
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
@@ -94,23 +103,34 @@ struct destination_fixture {
                   int stream_id,
                   const std::string& dest_ip = "",
                   uint32_t dest_port = 0) -> std::size_t {
-        std::vector<std::pair<std::string, std::string>> fields{
+        composite::properties::json spec{
             {"path", write_sigmf_pair(dir, stem)},
-            {"stream_id", std::to_string(stream_id)},
-            {"rate_control", "false"},  // emit as fast as the port accepts
-            {"loop", "true"},
+            {"stream_id", stream_id},
+            {"rate_control", false},  // produce on demand, unthrottled
+            {"loop", true},
         };
         if (!dest_ip.empty()) {
-            fields.emplace_back("destination_ip", dest_ip);
+            spec["destination_ip"] = dest_ip;
         }
         if (dest_port != 0) {
-            fields.emplace_back("destination_port", std::to_string(dest_port));
+            spec["destination_port"] = dest_port;
         }
-        return source->append_struct_list("files", fields);
+        files_json.push_back(std::move(spec));
+        source->set_properties({{"files", files_json}});
+        return files_json.size() - 1;
+    }
+
+    // Patches one element and re-sends the array, which is the live-edit path
+    // (refresh_runtime_from_spec) rather than the initial load.
+    void update_file(std::size_t index, const composite::properties::json& patch) {
+        for (auto it = patch.begin(); it != patch.end(); ++it) {
+            files_json[index][it.key()] = it.value();
+        }
+        source->set_properties({{"files", files_json}});
     }
 
     void start_streaming() {
-        source->set_properties({{"streaming", "true"}});
+        source->set_properties({{"streaming", true}});
     }
 
     // Pumps the component until every expected stream has emitted, returning the
@@ -118,14 +138,21 @@ struct destination_fixture {
     auto collect_annotations(std::size_t expected_streams) -> std::map<std::string, annotation_map> {
         std::map<std::string, annotation_map> by_stream;
         for (int attempt = 0; attempt < 200 && by_stream.size() < expected_streams; ++attempt) {
-            source->process();
-            while (sink->size() > 0) {
-                auto [data, ts, meta] = sink->get_data();
-                if (!data || !meta) continue;
-                auto id = meta->annotations.find("stream_id");
-                if (id == meta->annotations.end()) continue;
-                by_stream[id->second] = meta->annotations;
+            auto r = source->produce();
+            if (r.status != testable_sigmf_source::produce_status::data || !r.md) {
+                continue;
             }
+            auto id = r.md->annotations.find("stream_id");
+            if (id == r.md->annotations.end()) {
+                continue;
+            }
+            // annotation_value is a variant in 0.5.2; flatten to strings for the
+            // comparisons these tests make.
+            annotation_map flat;
+            for (const auto& [key, value] : r.md->annotations) {
+                flat[key] = value.to_string();
+            }
+            by_stream[id->second.to_string()] = std::move(flat);
         }
         return by_stream;
     }
@@ -188,7 +215,7 @@ TEST_CASE("sigmf_source: per-file destination_port overrides the component defau
 TEST_CASE("sigmf_source: component destination_port applies to every stream", "[sigmf_source][destination]") {
     destination_fixture fx;
 
-    fx.source->set_properties({{"destination_port", "7000"}});
+    fx.source->set_properties({{"destination_port", 7000}});
     fx.add_file("stream_a", 1, "239.0.10.3");
     fx.add_file("stream_b", 2, "239.0.10.4");
     fx.start_streaming();
@@ -212,11 +239,7 @@ TEST_CASE("sigmf_source: editing a live spec re-stamps the destination", "[sigmf
 
     // Live edit goes through refresh_runtime_from_spec, a separate path from the
     // initial load's build_metadata.
-    const std::vector<std::pair<std::string, std::string>> edit{
-        {"destination_ip", "239.0.10.9"},
-        {"destination_port", "6200"},
-    };
-    fx.source->update_struct_list_element("files", index, edit);
+    fx.update_file(index, {{"destination_ip", "239.0.10.9"}, {"destination_port", 6200}});
 
     auto after = fx.collect_annotations(1);
     REQUIRE(after.size() == 1);
@@ -235,8 +258,7 @@ TEST_CASE("sigmf_source: clearing destination_ip falls back to the udp_sink defa
 
     // A stale annotation here would keep transmitting to the old group after the
     // controller has released it.
-    const std::vector<std::pair<std::string, std::string>> clear{{"destination_ip", ""}};
-    fx.source->update_struct_list_element("files", index, clear);
+    fx.update_file(index, {{"destination_ip", ""}});
 
     auto after = fx.collect_annotations(1);
     REQUIRE(after.size() == 1);

@@ -1,33 +1,28 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
-# SPDX-FileCopyrightText: 2025 Geon Technologies, LLC
+#
+# Copyright (C) 2025 Geon Technologies, LLC
+#
+# This file is part of composite-comps.
+#
+# composite-comps is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# composite-comps is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with this program. If not, see http://www.gnu.org/licenses/.
+#
 
-# sigmf_source - SigMF file source component with rate-controlled playback
-
-include(GNUInstallDirs)
-
-add_library(sigmf_source SHARED
-    component.cpp
-)
-target_link_libraries(sigmf_source
-    PRIVATE
-        composite::composite
-        spdlog::spdlog_header_only
-        nlohmann_json::nlohmann_json
-)
-target_include_directories(sigmf_source
-    PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_compile_features(sigmf_source PRIVATE cxx_std_23)
-target_compile_options(sigmf_source PRIVATE -march=x86-64-v2)
-
-set_target_properties(sigmf_source PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/components
+# sigmf_source - SigMF/Blue file source with rate-controlled playback
+comps_add_component(sigmf_source
+    SOURCES component.cpp
+    LINK nlohmann_json::nlohmann_json
 )
 
-install(TARGETS sigmf_source
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-# Tests
-add_subdirectory(tests)
+if(BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
