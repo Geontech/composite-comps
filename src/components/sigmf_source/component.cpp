@@ -354,15 +354,13 @@ bool sigmf_source::load_file(const struct_props::file_spec& spec, file_runtime& 
         return false;
     }
 
-    // Memory-map the file as raw bytes
-    // Use writable=true if we need to swap bytes (MAP_PRIVATE allows in-place modification)
-    logger()->info("sigmf_source: memory-mapping file {} (writable={}, bytes_per_sample={})",
+    // Memory-map the file as raw bytes, read-only.
+    logger()->info("sigmf_source: memory-mapping file {} (byteswap={}, bytes_per_sample={})",
                   data_path, needs_swap, rt.bytes_per_sample);
-
 
     // Catch runtime error from MmapRegion on failure
     try {
-        rt.mmap = std::make_shared<MmapRegion<std::byte>>(data_path, needs_swap);
+        rt.mmap = std::make_shared<MmapRegion<std::byte>>(data_path);
     } catch (const std::exception& e) {
         logger()->warn("sigmf_source: mmap failed for '{}': {}", data_path, e.what());
         return false;
@@ -372,10 +370,12 @@ bool sigmf_source::load_file(const struct_props::file_spec& spec, file_runtime& 
 
     build_metadata(spec, rt, meta);
 
-    // Apply endianness conversion in-place if needed
+    // The swap itself happens per chunk in next_chunk(), on the copy. The metadata
+    // still advertises native order because that is what a consumer receives; only
+    // the bytes on disk remain foreign.
     if (needs_swap) {
-        logger()->info("sigmf_source: applying endianness swap on {} bytes", rt.mmap->file_size());
-        if (!apply_endianness_swap_raw(rt)) return false;
+        logger()->info("sigmf_source: {} data will be byte-swapped per chunk on emission",
+                       data_path);
         meta.format.is_big_endian = (std::endian::native == std::endian::big);
         rt.cached_meta.format.endianness = std::endian::native;
         rt.md_dirty = true;
@@ -447,6 +447,41 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
             meta.format.datatype = SigmfFormat::DataType::FLOAT;
     }
 
+    // parse_metadata already applied spec.overrides.datatype, and the block above
+    // has just overwritten it with the Blue header's own view. The override
+    // exists precisely for metadata that lies, so it has to win here too --
+    // silently discarding it was the bug.
+    //
+    // With one exception: the Blue swap counts elements by the effective
+    // bit_width but strides by the header's type code (see byteswap_chunk), so an
+    // override that changes the width on a byte-swapped file makes those two
+    // disagree and would mis-swap. That combination is refused rather than
+    // half-honoured.
+    if (spec.overrides.datatype.has_value()) {
+        auto overridden = parse_datatype(*spec.overrides.datatype);
+        if (!overridden) {
+            logger()->warn("sigmf_source: datatype override '{}' is not a datatype this "
+                           "component can read; refusing '{}'",
+                           *spec.overrides.datatype, blue_path);
+            return false;
+        }
+        const bool width_differs = overridden->bitwidth != meta.format.bitwidth;
+        if (blueInfo->needsDataSwap && width_differs) {
+            logger()->warn("sigmf_source: refusing '{}': datatype override '{}' is {} bits but the "
+                           "Blue header describes {} bits and its data needs byte swapping; the swap "
+                           "stride and the sample width would disagree. Convert the file, or drop the "
+                           "override.",
+                           blue_path, *spec.overrides.datatype, overridden->bitwidth,
+                           meta.format.bitwidth);
+            return false;
+        }
+        logger()->info("sigmf_source: datatype override '{}' takes precedence over the Blue "
+                       "header's {}-bit {} sample for '{}'",
+                       *spec.overrides.datatype, meta.format.bitwidth,
+                       meta.format.is_complex ? "complex" : "real", blue_path);
+        meta.format = *overridden;
+    }
+
     // Build datatype string for logging
     char rc = meta.format.is_complex ? 'c' : 'r';
     char tc = (meta.format.datatype == SigmfFormat::DataType::FLOAT) ? 'f' :
@@ -473,13 +508,12 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
     bool needs_swap = blueInfo->needsDataSwap && (meta.format.bitwidth >= 16);
     rt.needs_swap = needs_swap;
 
-    logger()->info("sigmf_source: memory-mapping Blue file {} (writable={}, data_offset={}, data_size={})",
+    logger()->info("sigmf_source: memory-mapping Blue file {} (byteswap={}, data_offset={}, data_size={})",
                   blue_path, needs_swap, blueInfo->dataOffset, blueInfo->dataSize);
-
 
     // Catch runtime error from MmapRegion on failure
     try {
-        rt.mmap = std::make_shared<MmapRegion<std::byte>>(blue_path, needs_swap);
+        rt.mmap = std::make_shared<MmapRegion<std::byte>>(blue_path);
     } catch (const std::exception& e) {
         logger()->warn("sigmf_source: mmap failed for '{}': {}", blue_path, e.what());
         return false;
@@ -492,10 +526,12 @@ bool sigmf_source::load_blue_file(const struct_props::file_spec& spec, parsed_me
     // Build cached metadata for downstream
     build_metadata(spec, rt, meta);
 
-    // Apply endianness conversion on the data portion only
+    // Swapped per chunk on emission (see next_chunk). Chunks are read from
+    // data_start_offset onward, so the header block is never in a swapped span --
+    // the previous whole-region swap had to skip it explicitly.
     if (needs_swap) {
-        logger()->info("sigmf_source: applying endianness swap on Blue data ({} bytes)", blueInfo->dataSize);
-        if (!apply_endianness_swap_blue(rt)) { return false; }
+        logger()->info("sigmf_source: Blue data for {} will be byte-swapped per chunk on emission",
+                       blue_path);
         rt.cached_meta.format.endianness = std::endian::native;
         rt.md_dirty = true;
     }
@@ -686,16 +722,10 @@ bool sigmf_source::remap_runtime(file_runtime& rt) {
     if (rt.mmap && rt.mmap->valid()) return true;  // already mapped
 
     try {
-        rt.mmap = std::make_shared<MmapRegion<std::byte>>(rt.data_path, rt.needs_swap);
-        if (rt.needs_swap) {
-            bool is_blue = (rt.blue_type_code != 0);
-            bool ok = is_blue ? apply_endianness_swap_blue(rt) : apply_endianness_swap_raw(rt);
-            if (!ok) {
-                logger()->error("sigmf_source: failed endianness swap on remap for '{}'", rt.file_path);
-                rt.load_error = true;
-                return false;
-            }
-        }
+        // No re-swap here any more. The mapping is never mutated, so a fresh one
+        // needs no fixing up -- where this previously re-swapped the entire file
+        // on every remap (each start, and each loop re-anchor).
+        rt.mmap = std::make_shared<MmapRegion<std::byte>>(rt.data_path);
         return true;
     } catch (const std::exception& e) {
         logger()->error("sigmf_source: failed to remap '{}': {}", rt.file_path, e.what());
@@ -825,6 +855,13 @@ auto sigmf_source::next_chunk(file_runtime& rt) -> produce_result {
     auto* src = rt.mmap->data() + rt.current_byte_offset;
     auto chunk = std::make_shared<std::vector<std::byte>>(src, src + bytes_to_read);
 
+    // Convert to host order on the copy. Doing it here rather than once over the
+    // mapping is what lets the mapping stay read-only: the previous approach faulted
+    // a private copy of the whole recording into memory before emitting a byte.
+    if (rt.needs_swap) {
+        byteswap_chunk(rt, std::span<std::byte>{*chunk});
+    }
+
     // Captured BEFORE the counters advance: the packet timestamps the first sample
     // it carries. Reading samples_sent after the increment dated every packet one
     // full chunk late.
@@ -876,56 +913,69 @@ auto sigmf_source::next_chunk(file_runtime& rt) -> produce_result {
     return produce_result::emit(std::move(buf), ts, rt.latched_md);
 }
 
-bool sigmf_source::apply_endianness_swap_raw(file_runtime& rt) {
-    if (!rt.mmap || !rt.mmap->valid()) {
-        return false;
+// Deliberate trade: swapping per chunk costs steady-state throughput to save
+// memory. Measured on this fleet with ci16 looping, unthrottled: ~4.4 GB/s
+// unswapped vs ~1.5 GB/s swapped, i.e. roughly 3x. Swapping the whole mapping
+// once at load (the previous design) paid nothing per chunk but faulted a private
+// copy of the entire recording into RSS, and re-ran in full on every loop
+// re-anchor. Single-pass playback does the same total work either way; looping
+// playback of a big-endian recording is where this costs.
+//
+// The gap is an artefact of the loops below, not of swapping per chunk: they go
+// byte-at-a-time through a uint8_t*, which does not vectorise. Rewriting them
+// over sized loads with __builtin_bswap* should recover most of it, and the
+// swap-correctness tests in tests/sigmf_source_bluefile_tests.cpp pin the
+// observable behaviour for exactly that change.
+void sigmf_source::byteswap_chunk(const file_runtime& rt, std::span<std::byte> chunk) {
+    if (chunk.empty()) {
+        return;
     }
 
-    if (rt.cached_meta.format.endianness == std::endian::native) {
-        // Already native postcondition is satisfied without swapping
-        return true;
+    auto* bytes = reinterpret_cast<uint8_t*>(chunk.data());
+    const std::size_t num_bytes = chunk.size();
+    const uint32_t bit_width = rt.cached_meta.format.bit_width;
+    const std::size_t elem = bit_width / 8U;
+
+    // 8-bit samples have no byte order. A width this code cannot address should
+    // never reach here -- parse_datatype restricts widths to 8/16/32/64 -- but
+    // bail rather than divide by zero if it ever did.
+    if (elem <= 1) {
+        return;
     }
 
-    auto* bytes = reinterpret_cast<uint8_t*>(rt.mmap->data());
-    const std::size_t num_bytes = rt.mmap->file_size();
+    // A chunk is always a whole number of samples, and a sample is a whole number
+    // of scalars, so a chunk never splits an element across a boundary. That is
+    // what makes swapping per chunk equivalent to swapping the whole region.
+    if (rt.blue_type_code != 0) {
+        // Blue keeps striding by the header's type code, which is the authority on
+        // the on-disk scalar for these files.
+        blue::byteswapData(bytes, num_bytes / elem, rt.blue_type_code);
+        return;
+    }
 
-    if (rt.cached_meta.format.bit_width == 16) {
+    switch (bit_width) {
+    case 16:
         for (std::size_t i = 0; i + 1 < num_bytes; i += 2) {
             std::swap(bytes[i], bytes[i + 1]);
         }
-        logger()->debug("sigmf_source: applied 16-bit byte swap for endianness on mmap region");
-    } else if (rt.cached_meta.format.bit_width == 32) {
+        break;
+    case 32:
         for (std::size_t i = 0; i + 3 < num_bytes; i += 4) {
             std::swap(bytes[i], bytes[i + 3]);
             std::swap(bytes[i + 1], bytes[i + 2]);
         }
-        logger()->debug("sigmf_source: applied 32-bit byte swap for endianness on mmap region");
-    } else if (rt.cached_meta.format.bit_width == 64) {
+        break;
+    case 64:
         for (std::size_t i = 0; i + 7 < num_bytes; i += 8) {
             std::swap(bytes[i], bytes[i + 7]);
             std::swap(bytes[i + 1], bytes[i + 6]);
             std::swap(bytes[i + 2], bytes[i + 5]);
             std::swap(bytes[i + 3], bytes[i + 4]);
         }
-        logger()->debug("sigmf_source: applied 64-bit byte swap for endianness on mmap region");
+        break;
+    default:
+        break;
     }
-    return true;
-}
-
-// blue endianness swap
-bool sigmf_source::apply_endianness_swap_blue(file_runtime& rt) {
-    if (!rt.mmap || !rt.mmap->valid()) return false;
-    if (rt.blue_type_code == 0) return false;
-
-    auto* data_start = reinterpret_cast<uint8_t*>(rt.mmap->data()) + rt.data_start_offset;
-    std::size_t data_bytes = rt.total_samples * rt.bytes_per_sample;
-    uint32_t bitwidth = rt.cached_meta.format.bit_width;
-
-    blue::byteswapData(data_start, data_bytes / (bitwidth / 8), rt.blue_type_code);
-
-    logger()->debug("sigmf_source: applied Blue byte swap on data region ({} bytes)", data_bytes);
-
-    return true;
 }
 
 void sigmf_source::spawn_metrics_thread() {
@@ -1121,6 +1171,13 @@ auto sigmf_source::parse_datatype(std::string_view sv) -> std::optional<SigmfFor
     uint32_t bw{};
     auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), bw);
     if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+        return std::nullopt;
+    }
+    // Only whole-byte, power-of-two widths are addressable here. The byte swap
+    // strides by bitwidth/8 and bytes_per_sample() divides by 8, so a packed
+    // width such as ci12 truncates to one byte per scalar and would walk the
+    // buffer at the wrong stride while metadata advertised 12 bits.
+    if (bw != 8 && bw != 16 && bw != 32 && bw != 64) {
         return std::nullopt;
     }
     fmt.bitwidth = bw;

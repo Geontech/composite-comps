@@ -17,12 +17,14 @@
 #include <numeric>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -123,16 +125,32 @@ public:
 
     MmapRegion() = default;
 
-    MmapRegion(const std::string& path, bool writable = false) {
-        int flags = writable ? O_RDWR : O_RDONLY;
-        m_fd = ::open(path.c_str(), flags);
+    explicit MmapRegion(const std::string& path) {
+        // Read-only throughout. Byte swapping happens on the per-chunk copy, not
+        // on the mapping, so nothing ever writes here -- which is what keeps a
+        // foreign-endian recording from faulting a private copy of the whole file
+        // into RSS, and lets a read-only mount or recording play.
+        m_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (m_fd < 0) {
             throw std::runtime_error("MmapRegion: failed to open file: " + path);
         }
 
-        // Get file size
-        m_file_size = ::lseek(m_fd, 0, SEEK_END);
-        ::lseek(m_fd, 0, SEEK_SET);
+        // fstat rather than lseek: lseek reports -1 on failure, which as an
+        // unsigned size became an enormous length handed straight to mmap, and it
+        // says nothing about what kind of file this is. Anything but a regular
+        // file has no meaningful mappable length (a directory, a FIFO, a socket).
+        struct ::stat st{};
+        if (::fstat(m_fd, &st) != 0) {
+            ::close(m_fd);
+            m_fd = -1;
+            throw std::runtime_error("MmapRegion: fstat failed for: " + path);
+        }
+        if (!S_ISREG(st.st_mode)) {
+            ::close(m_fd);
+            m_fd = -1;
+            throw std::runtime_error("MmapRegion: not a regular file: " + path);
+        }
+        m_file_size = static_cast<std::size_t>(st.st_size);
 
         if (m_file_size == 0) {
             ::close(m_fd);
@@ -140,10 +158,9 @@ public:
             throw std::runtime_error("MmapRegion: file is empty: " + path);
         }
 
-        // Map the file
-        int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
-        int mflags = writable ? MAP_PRIVATE : MAP_SHARED;  // MAP_PRIVATE allows in-place modification
-        m_data = static_cast<T*>(::mmap(nullptr, m_file_size, prot, mflags, m_fd, 0));
+        // MAP_PRIVATE with PROT_READ only: private so nothing can write through to
+        // the file, and with no writes there is no copy-on-write either.
+        m_data = static_cast<T*>(::mmap(nullptr, m_file_size, PROT_READ, MAP_PRIVATE, m_fd, 0));
 
         if (m_data == MAP_FAILED) {
             ::close(m_fd);
@@ -330,13 +347,21 @@ private:
 
     // Processing
     auto next_chunk(file_runtime& rt) -> produce_result;
-    bool apply_endianness_swap_raw(file_runtime& rt);
-    bool apply_endianness_swap_blue(file_runtime& rt);
+    // Byte-swaps one freshly-copied chunk in place, gated by rt.needs_swap.
+    // Replaces the previous pair of whole-mapping swaps: those had to map the file
+    // writably and touch every page up front, and re-ran in full on every remap.
+    static void byteswap_chunk(const file_runtime& rt, std::span<std::byte> chunk);
     void build_metadata(const struct_props::file_spec& spec, file_runtime& rt, const parsed_metadata& meta);
     void stamp_destination(const struct_props::file_spec& spec, file_runtime& rt);
     
-    // Static helpers
+    // Static helpers. parse_datatype is protected rather than private so the
+    // format-validation tests can exercise it directly -- it is pure and has no
+    // component state, and the alternative is asserting on it only indirectly
+    // through a file load.
+protected:
     static auto parse_datatype(std::string_view datatype_str) -> std::optional<SigmfFormat>;
+
+private:
     static auto to_composite_format(const SigmfFormat& fmt) -> composite::data_format;
     static std::string format_rate(double sps);
     static std::string stream_id_of(const file_runtime& rt); 

@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -281,6 +282,16 @@ inline std::optional<BlueFileInfo> parseBlueFile(const std::string& path) {
         return std::nullopt;
     }
 
+    // The header's data window is checked against the real file length below, so
+    // measure the file before reading.
+    in.seekg(0, std::ios::end);
+    const auto end_pos = in.tellg();
+    if (end_pos < 0) {
+        return std::nullopt;
+    }
+    const auto file_size = static_cast<std::uint64_t>(end_pos);
+    in.seekg(0, std::ios::beg);
+
     HeaderControlBlock hcb{};
     in.read(reinterpret_cast<char*>(&hcb), sizeof(hcb));
     if (in.gcount() != sizeof(hcb)) {
@@ -304,11 +315,51 @@ inline std::optional<BlueFileInfo> parseBlueFile(const std::string& path) {
         return std::nullopt;
     }
 
+    // ---- validate the data window before it is used to address anything ----
+    //
+    // dataStart/dataSize are IEEE doubles straight from an untrusted file, and
+    // they go on to index an mmap and to bound an IN-PLACE byte swap. Every
+    // rejection here is a write that would otherwise land outside the mapping.
+    //
+    // Order matters: the finite/sign checks come first because converting a
+    // negative or NaN double to an unsigned integer is undefined behaviour, so
+    // it cannot be deferred until after a range comparison.
+    if (!std::isfinite(hcb.dataStart) || !std::isfinite(hcb.dataSize)) {
+        return std::nullopt;
+    }
+    if (hcb.dataStart < 0.0 || hcb.dataSize < 0.0) {
+        return std::nullopt;
+    }
+    // Above 2^53 a double no longer represents consecutive integers, so a value
+    // this large is meaningless as a byte offset regardless of the file length.
+    constexpr double kMaxExactInteger = 9007199254740992.0; // 2^53
+    if (hcb.dataStart > kMaxExactInteger || hcb.dataSize > kMaxExactInteger) {
+        return std::nullopt;
+    }
+
+    const auto data_offset = static_cast<std::uint64_t>(hcb.dataStart);
+    const auto data_size = static_cast<std::uint64_t>(hcb.dataSize);
+
+    // Data cannot begin inside the 512-byte header block it was described by.
+    // This reader handles attached (single-file) Blue only; a detached header
+    // would legitimately point at offset 0 of a separate data file.
+    if (data_offset < sizeof(HeaderControlBlock)) {
+        return std::nullopt;
+    }
+    // Both halves of the window must lie within the file. Written as two
+    // comparisons rather than data_offset + data_size so the sum cannot wrap.
+    if (data_size > file_size || data_offset > file_size - data_size) {
+        return std::nullopt;
+    }
+
     BlueFileInfo info;
     info.valid = true;
     info.format = *formatOpt;
-    info.dataOffset = static_cast<std::size_t>(hcb.dataStart);
-    info.dataSize = static_cast<std::size_t>(hcb.dataSize);
+    info.dataOffset = static_cast<std::size_t>(data_offset);
+    info.dataSize = static_cast<std::size_t>(data_size);
+    // format.sampleSize is guaranteed non-zero: FormatInfo::parse rejects a type
+    // code with no scalar size, which is what stands between this and a
+    // division by zero.
     info.sampleCount = info.dataSize / info.format.sampleSize;
     info.typeCode = hcb.typeCode;
 
