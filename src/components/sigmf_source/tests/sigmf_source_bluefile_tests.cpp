@@ -192,8 +192,11 @@ TEST_CASE("blue: a dataStart before the header block is rejected", "[sigmf_sourc
     CHECK_FALSE(blue::parseBlueFile(path).has_value());
 }
 
-TEST_CASE("blue: a dataStart+dataSize overflow is rejected", "[sigmf_source][blue][validation]") {
+TEST_CASE("blue: a window beyond 2^53 is rejected", "[sigmf_source][blue][validation]") {
     temp_dir d;
+    // Past 2^53 a double no longer steps by ones, so the value is meaningless as
+    // a byte offset. This guard is also what makes dataStart+dataSize unable to
+    // wrap: the sum is only ever formed from two values already below 2^53.
     const auto path = write_blue_file(d.path, "ovf",
         {.data_start = 1e18, .data_size = 1e18, .data_bytes = 512});
     CHECK_FALSE(blue::parseBlueFile(path).has_value());
@@ -387,23 +390,6 @@ auto first_chunk_bytes(testable_sigmf_source& src, const composite::properties::
 
 } // namespace
 
-TEST_CASE("swap: big-endian 16-bit input is delivered native", "[sigmf_source][endianness]") {
-    temp_dir d;
-    // Four real int16 samples, big-endian on disk.
-    const std::vector<unsigned char> be{0x01,0x02, 0x03,0x04, 0x05,0x06, 0x07,0x08};
-    const auto path = write_raw_sigmf(d.path, "be16", "ri16_be", be);
-
-    testable_sigmf_source src("swap16");
-    auto got = first_chunk_bytes(src, {
-        {"path", path}, {"stream_id", 1}, {"rate_control", false},
-    });
-
-    REQUIRE(got.size() == be.size());
-    // Each 2-byte element reversed.
-    const std::vector<unsigned char> want{0x02,0x01, 0x04,0x03, 0x06,0x05, 0x08,0x07};
-    CHECK(got == want);
-}
-
 TEST_CASE("swap: big-endian 32-bit input is delivered native", "[sigmf_source][endianness]") {
     temp_dir d;
     // Two real float32 samples' worth of bytes, big-endian on disk.
@@ -438,6 +424,9 @@ TEST_CASE("swap: little-endian input is delivered unchanged", "[sigmf_source][en
 
 TEST_CASE("swap: a looped read re-delivers the same native bytes", "[sigmf_source][endianness]") {
     temp_dir d;
+    // Doubles as the 16-bit big-endian case: pass 0 pins the swapped bytes
+    // outright, so a separate single-shot 16-bit test asserts nothing new.
+    //
     // Guards a real hazard of swapping the source once rather than per read: a
     // second pass over the same region must not double-swap back to foreign order.
     const std::vector<unsigned char> be{0x01,0x02, 0x03,0x04, 0x05,0x06, 0x07,0x08};
@@ -470,55 +459,18 @@ TEST_CASE("swap: a looped read re-delivers the same native bytes", "[sigmf_sourc
 // integer math rather than against another float computation.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("timestamp: picoseconds are exact at 100 MSPS", "[sigmf_source][timestamp]") {
-    temp_dir d;
-    constexpr uint64_t kRate = 100000000;   // 100 MSPS
-    constexpr uint64_t kChunk = 8192;       // samples per packet
-    constexpr uint64_t kBytesPerSample = 4; // ci16
-    constexpr int kChunks = 6;
-
-    // ci16 little-endian so no swap is involved in this measurement.
-    std::vector<unsigned char> payload(kChunk * kBytesPerSample * kChunks, 0x00);
-    const auto path = write_raw_sigmf(d.path, "ts100", "ci16_le", payload);
-    {   // the helper hardcodes 1 MHz; this case needs the rate under test
-        std::ofstream meta(d.path / "ts100.sigmf-meta");
-        meta << R"({"global":{"core:datatype":"ci16_le","core:sample_rate":)" << kRate
-             << R"(.0,"core:version":"1.0.0"},"captures":[{"core:sample_start":0}],"annotations":[]})";
-    }
-
-    testable_sigmf_source src("ts100");
-    composite::properties::json files = composite::properties::json::array();
-    files.push_back({{"path", path}, {"stream_id", 1}, {"rate_control", false}});
-    src.set_properties({{"chunk_samples", kChunk}, {"files", files}, {"streaming", true}});
-
-    std::vector<composite::timestamp> stamps;
-    for (int i = 0; i < 200 && static_cast<int>(stamps.size()) < kChunks; ++i) {
-        auto p = src.produce();
-        if (p.status == testable_sigmf_source::produce_status::data) {
-            stamps.push_back(p.ts);
-        }
-    }
-    REQUIRE(stamps.size() == static_cast<std::size_t>(kChunks));
-
-    // Exact expectation, integer-only: sample k*kChunk sits at
-    // k*kChunk*1e12/kRate picoseconds into the recording.
-    constexpr uint64_t kPsPerSec = 1000000000000ULL;
-    const uint64_t base_sec = stamps.front().seconds;
-    for (int k = 0; k < kChunks; ++k) {
-        const uint64_t total_ps = static_cast<uint64_t>(k) * kChunk * kPsPerSec / kRate;
-        INFO("chunk " << k << " expected total " << total_ps << " ps");
-        CHECK(stamps[k].picoseconds == total_ps % kPsPerSec);
-        CHECK(stamps[k].seconds - base_sec == total_ps / kPsPerSec);
-    }
-}
-
 TEST_CASE("timestamp: the per-chunk step stays exact deep into a recording", "[sigmf_source][timestamp]") {
     temp_dir d;
     // The old code subtracted the whole-seconds part off a double, so its error
-    // grew as playback advanced. Rather than recompute the absolute expectation
-    // (which overflows 64 bits past a few tens of thousands of chunks, and would
-    // only restate the component's own formula), this asserts the INVARIANT: at a
-    // fixed rate every packet must advance by exactly the same picosecond step.
+    // grew as playback advanced. Each packet is checked two ways, which together
+    // cover what a short 6-chunk run would say and then some:
+    //   - ABSOLUTE: packet n sits exactly n * kStepPs past packet 0, so n == 0
+    //     also pins the recording as starting on a whole second.
+    //   - STEP: consecutive packets differ by exactly kStepPs, which is what
+    //     catches drift that only accumulates over a long playback.
+    // The expectation accumulates a precomputed step rather than restating the
+    // component's k * kChunk * kPsPerSec / kRate, whose numerator overflows 64
+    // bits well inside this run.
     constexpr uint64_t kRate = 100000000;   // 100 MSPS
     constexpr uint64_t kChunk = 8192;
     constexpr uint64_t kPsPerSec = 1000000000000ULL;
@@ -543,6 +495,7 @@ TEST_CASE("timestamp: the per-chunk step stays exact deep into a recording", "[s
     uint64_t base_sec = 0;
     uint64_t prev_total = 0;
     int bad_steps = 0;
+    int bad_offsets = 0;
     uint64_t max_ps = 0;
 
     for (int i = 0; i < want * 4 && seen < want; ++i) {
@@ -557,6 +510,14 @@ TEST_CASE("timestamp: the per-chunk step stays exact deep into a recording", "[s
         // Offset from the first packet, in picoseconds. Bounded by a few seconds
         // here, so this stays well inside 64 bits.
         const uint64_t total = (p.ts.seconds - base_sec) * kPsPerSec + p.ts.picoseconds;
+        const uint64_t want_total = static_cast<uint64_t>(seen) * kStepPs;
+        if (total != want_total) {
+            if (bad_offsets == 0) {
+                UNSCOPED_INFO("packet " << seen << " sat at " << total
+                              << " ps, expected " << want_total);
+            }
+            ++bad_offsets;
+        }
         if (seen > 0 && total - prev_total != kStepPs) {
             if (bad_steps == 0) {
                 UNSCOPED_INFO("step " << seen << " advanced by " << (total - prev_total)
@@ -569,6 +530,7 @@ TEST_CASE("timestamp: the per-chunk step stays exact deep into a recording", "[s
     }
 
     REQUIRE(seen == want);
+    CHECK(bad_offsets == 0);
     CHECK(bad_steps == 0);
     // The documented invariant on composite::timestamp.
     CHECK(max_ps < kPsPerSec);

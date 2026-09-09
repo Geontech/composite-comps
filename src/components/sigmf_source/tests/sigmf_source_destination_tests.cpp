@@ -198,36 +198,26 @@ TEST_CASE("sigmf_source: absent destination_ip emits no annotation", "[sigmf_sou
     CHECK(streams["7"]["destination_port"] == kComponentDefaultPort);
 }
 
-TEST_CASE("sigmf_source: per-file destination_port overrides the component default", "[sigmf_source][destination]") {
+TEST_CASE("sigmf_source: destination_port falls from per-file to component", "[sigmf_source][destination]") {
     destination_fixture fx;
 
-    fx.add_file("custom_port", 1, "239.0.10.3", 6100);
-    fx.add_file("default_port", 2, "239.0.10.4");
+    // Both arms of the port fallback at once, and against a component port that
+    // is NOT the built-in 5000 -- otherwise the inheriting stream cannot tell the
+    // component property from a hardcoded default. The built-in itself is covered
+    // by the tests above, which never set the property.
+    fx.source->set_properties({{"destination_port", 7000}});
+    fx.add_file("explicit_port", 1, "239.0.10.3", 6100);
+    fx.add_file("inherits_port", 2, "239.0.10.4");
     fx.start_streaming();
 
     auto streams = fx.collect_annotations(2);
     REQUIRE(streams.size() == 2);
 
     CHECK(streams["1"]["destination_port"] == "6100");
-    CHECK(streams["2"]["destination_port"] == kComponentDefaultPort);
-}
-
-TEST_CASE("sigmf_source: component destination_port applies to every stream", "[sigmf_source][destination]") {
-    destination_fixture fx;
-
-    fx.source->set_properties({{"destination_port", 7000}});
-    fx.add_file("stream_a", 1, "239.0.10.3");
-    fx.add_file("stream_b", 2, "239.0.10.4");
-    fx.start_streaming();
-
-    auto streams = fx.collect_annotations(2);
-    REQUIRE(streams.size() == 2);
-
-    CHECK(streams["1"]["destination_port"] == "7000");
     CHECK(streams["2"]["destination_port"] == "7000");
 }
 
-TEST_CASE("sigmf_source: editing a live spec re-stamps the destination", "[sigmf_source][destination]") {
+TEST_CASE("sigmf_source: a live edit re-stamps, then clears, the destination", "[sigmf_source][destination]") {
     destination_fixture fx;
 
     auto index = fx.add_file("movable", 1, "239.0.10.3");
@@ -237,32 +227,28 @@ TEST_CASE("sigmf_source: editing a live spec re-stamps the destination", "[sigmf
     REQUIRE(before.size() == 1);
     REQUIRE(before["1"]["destination_ip"] == "239.0.10.3");
 
-    // Live edit goes through refresh_runtime_from_spec, a separate path from the
-    // initial load's build_metadata.
+    // refresh_runtime_from_spec and the initial load share one stamp_destination,
+    // so what a live edit has to prove is not that the values map correctly --
+    // that is already covered -- but that an edit re-runs the stamp at all and
+    // the new values reach an emitted packet.
     fx.update_file(index, {{"destination_ip", "239.0.10.9"}, {"destination_port", 6200}});
 
-    auto after = fx.collect_annotations(1);
-    REQUIRE(after.size() == 1);
-    CHECK(after["1"]["destination_ip"] == "239.0.10.9");
-    CHECK(after["1"]["destination_port"] == "6200");
-}
+    auto moved = fx.collect_annotations(1);
+    REQUIRE(moved.size() == 1);
+    CHECK(moved["1"]["destination_ip"] == "239.0.10.9");
+    CHECK(moved["1"]["destination_port"] == "6200");
 
-TEST_CASE("sigmf_source: clearing destination_ip falls back to the udp_sink default", "[sigmf_source][destination]") {
-    destination_fixture fx;
-
-    auto index = fx.add_file("clearable", 1, "239.0.10.3");
-    fx.start_streaming();
-
-    auto before = fx.collect_annotations(1);
-    REQUIRE(before["1"]["destination_ip"] == "239.0.10.3");
-
-    // A stale annotation here would keep transmitting to the old group after the
-    // controller has released it.
+    // Clearing exercises the erase arm, which only a live edit can reach: a spec
+    // that never carried an IP never populates the key in the first place. A
+    // stale value here would keep transmitting to the group the controller has
+    // already released.
     fx.update_file(index, {{"destination_ip", ""}});
 
-    auto after = fx.collect_annotations(1);
-    REQUIRE(after.size() == 1);
-    CHECK_FALSE(after["1"].contains("destination_ip"));
+    auto cleared = fx.collect_annotations(1);
+    REQUIRE(cleared.size() == 1);
+    CHECK_FALSE(cleared["1"].contains("destination_ip"));
+    // Dropping the group must not also drop the port.
+    CHECK(cleared["1"]["destination_port"] == "6200");
 }
 
 TEST_CASE("sigmf_source: duplicate destinations do not both stream", "[sigmf_source][destination]") {
