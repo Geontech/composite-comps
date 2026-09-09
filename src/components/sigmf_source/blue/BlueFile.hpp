@@ -363,13 +363,14 @@ inline std::optional<BlueFileInfo> parseBlueFile(const std::string& path) {
     info.sampleCount = info.dataSize / info.format.sampleSize;
     info.typeCode = hcb.typeCode;
 
-    // Check if data needs byte swapping (data endianness differs from host)
-    // After header swap, headerEndianness should be IEEE (native)
-    // dataEndianness tells us about the data
-    constexpr bool hostLittleEndian = (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
-    bool dataIsBigEndian = (hcb.dataEndianness == EEEI) != headerSwapped;
-    // If header was swapped, the original data rep was opposite of what we read
-    // Actually simpler: after byteswap, if dataEndianness == EEEI, data is non-native
+    // Does the sample data need swapping? headerSwapped deliberately plays no
+    // part: headerEndianness and dataEndianness are 4-byte character tags, which
+    // is why byteswapHeader starts at `detached` and leaves both alone. Folding
+    // headerSwapped in here would invert the decision for exactly the files that
+    // carry a byte-swapped header.
+    static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
+                  "Blue data-swap detection assumes a little-endian host: it treats "
+                  "EEEI as non-native. On a big-endian host the sense reverses.");
     info.needsDataSwap = (hcb.dataEndianness == EEEI);
 
     // Extract sample rate from xDelta if this is a Type 1000 file
