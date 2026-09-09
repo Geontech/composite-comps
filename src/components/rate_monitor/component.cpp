@@ -8,7 +8,6 @@
 
 #include <composite/core/register.hpp>
 
-#include <spdlog/spdlog.h>
 
 #include <format>
 #include <iostream>

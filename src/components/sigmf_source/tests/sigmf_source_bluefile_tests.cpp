@@ -463,3 +463,113 @@ TEST_CASE("swap: a looped read re-delivers the same native bytes", "[sigmf_sourc
         CHECK(got == want);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Timestamp arithmetic. At 100 MSPS with a power-of-two chunk the exact answer
+// is a whole number of picoseconds, so the emitted field can be compared against
+// integer math rather than against another float computation.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("timestamp: picoseconds are exact at 100 MSPS", "[sigmf_source][timestamp]") {
+    temp_dir d;
+    constexpr uint64_t kRate = 100000000;   // 100 MSPS
+    constexpr uint64_t kChunk = 8192;       // samples per packet
+    constexpr uint64_t kBytesPerSample = 4; // ci16
+    constexpr int kChunks = 6;
+
+    // ci16 little-endian so no swap is involved in this measurement.
+    std::vector<unsigned char> payload(kChunk * kBytesPerSample * kChunks, 0x00);
+    const auto path = write_raw_sigmf(d.path, "ts100", "ci16_le", payload);
+    {   // the helper hardcodes 1 MHz; this case needs the rate under test
+        std::ofstream meta(d.path / "ts100.sigmf-meta");
+        meta << R"({"global":{"core:datatype":"ci16_le","core:sample_rate":)" << kRate
+             << R"(.0,"core:version":"1.0.0"},"captures":[{"core:sample_start":0}],"annotations":[]})";
+    }
+
+    testable_sigmf_source src("ts100");
+    composite::properties::json files = composite::properties::json::array();
+    files.push_back({{"path", path}, {"stream_id", 1}, {"rate_control", false}});
+    src.set_properties({{"chunk_samples", kChunk}, {"files", files}, {"streaming", true}});
+
+    std::vector<composite::timestamp> stamps;
+    for (int i = 0; i < 200 && static_cast<int>(stamps.size()) < kChunks; ++i) {
+        auto p = src.produce();
+        if (p.status == testable_sigmf_source::produce_status::data) {
+            stamps.push_back(p.ts);
+        }
+    }
+    REQUIRE(stamps.size() == static_cast<std::size_t>(kChunks));
+
+    // Exact expectation, integer-only: sample k*kChunk sits at
+    // k*kChunk*1e12/kRate picoseconds into the recording.
+    constexpr uint64_t kPsPerSec = 1000000000000ULL;
+    const uint64_t base_sec = stamps.front().seconds;
+    for (int k = 0; k < kChunks; ++k) {
+        const uint64_t total_ps = static_cast<uint64_t>(k) * kChunk * kPsPerSec / kRate;
+        INFO("chunk " << k << " expected total " << total_ps << " ps");
+        CHECK(stamps[k].picoseconds == total_ps % kPsPerSec);
+        CHECK(stamps[k].seconds - base_sec == total_ps / kPsPerSec);
+    }
+}
+
+TEST_CASE("timestamp: the per-chunk step stays exact deep into a recording", "[sigmf_source][timestamp]") {
+    temp_dir d;
+    // The old code subtracted the whole-seconds part off a double, so its error
+    // grew as playback advanced. Rather than recompute the absolute expectation
+    // (which overflows 64 bits past a few tens of thousands of chunks, and would
+    // only restate the component's own formula), this asserts the INVARIANT: at a
+    // fixed rate every packet must advance by exactly the same picosecond step.
+    constexpr uint64_t kRate = 100000000;   // 100 MSPS
+    constexpr uint64_t kChunk = 8192;
+    constexpr uint64_t kPsPerSec = 1000000000000ULL;
+    // 8192 samples at 1e8 Hz = 81.92 us, a whole number of picoseconds.
+    constexpr uint64_t kStepPs = kChunk * kPsPerSec / kRate;   // 81'920'000
+
+    std::vector<unsigned char> payload(kChunk * 4 * 4, 0x00);
+    const auto path = write_raw_sigmf(d.path, "tsdeep", "ci16_le", payload);
+    {
+        std::ofstream meta(d.path / "tsdeep.sigmf-meta");
+        meta << R"({"global":{"core:datatype":"ci16_le","core:sample_rate":)" << kRate
+             << R"(.0,"core:version":"1.0.0"},"captures":[{"core:sample_start":0}],"annotations":[]})";
+    }
+
+    testable_sigmf_source src("tsdeep");
+    composite::properties::json files = composite::properties::json::array();
+    files.push_back({{"path", path}, {"stream_id", 1}, {"rate_control", false}, {"loop", true}});
+    src.set_properties({{"chunk_samples", kChunk}, {"files", files}, {"streaming", true}});
+
+    const int want = 40000;   // ~3.3 s of timeline, so several whole-second rollovers
+    int seen = 0;
+    uint64_t base_sec = 0;
+    uint64_t prev_total = 0;
+    int bad_steps = 0;
+    uint64_t max_ps = 0;
+
+    for (int i = 0; i < want * 4 && seen < want; ++i) {
+        auto p = src.produce();
+        if (p.status != testable_sigmf_source::produce_status::data) {
+            continue;
+        }
+        if (seen == 0) {
+            base_sec = p.ts.seconds;
+        }
+        max_ps = std::max(max_ps, p.ts.picoseconds);
+        // Offset from the first packet, in picoseconds. Bounded by a few seconds
+        // here, so this stays well inside 64 bits.
+        const uint64_t total = (p.ts.seconds - base_sec) * kPsPerSec + p.ts.picoseconds;
+        if (seen > 0 && total - prev_total != kStepPs) {
+            if (bad_steps == 0) {
+                UNSCOPED_INFO("step " << seen << " advanced by " << (total - prev_total)
+                              << " ps, expected " << kStepPs);
+            }
+            ++bad_steps;
+        }
+        prev_total = total;
+        ++seen;
+    }
+
+    REQUIRE(seen == want);
+    CHECK(bad_steps == 0);
+    // The documented invariant on composite::timestamp.
+    CHECK(max_ps < kPsPerSec);
+}

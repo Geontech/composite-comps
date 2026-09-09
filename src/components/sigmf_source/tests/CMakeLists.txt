@@ -16,7 +16,6 @@ target_link_libraries(sigmf_source_destination_tests
     PRIVATE
         Catch2::Catch2WithMain
         composite::composite
-        spdlog::spdlog_header_only
         nlohmann_json::nlohmann_json
 )
 target_include_directories(sigmf_source_destination_tests
@@ -35,7 +34,6 @@ target_link_libraries(sigmf_source_bluefile_tests
     PRIVATE
         Catch2::Catch2WithMain
         composite::composite
-        spdlog::spdlog_header_only
         nlohmann_json::nlohmann_json
 )
 target_include_directories(sigmf_source_bluefile_tests

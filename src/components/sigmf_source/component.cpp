@@ -13,7 +13,6 @@
 #include <composite/properties/property_set.hpp>
 
 #include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <bit>
@@ -874,31 +873,59 @@ auto sigmf_source::next_chunk(file_runtime& rt) -> produce_result {
     // Offset from start is computed as either elapsed wall-clock or sample-based time,
     // then anchored to the UTC epoch captured at start.
     composite::timestamp ts;
-    double offset_seconds;
+    constexpr uint64_t kPsPerSec = 1000000000000ULL;
 
-    if (rt.wallclock_timestamps) {
-        // Wall-clock mode: offset based on real elapsed time since start
-        auto now = std::chrono::steady_clock::now();
-        offset_seconds = std::chrono::duration<double>(now - rt.start_time).count();
+    // File-time mode uses the RECORDING's own rate. effective_sample_rate is the
+    // throttled playback rate -- deriving file time from it let max_sample_rate
+    // silently rewrite the recording's timestamps.
+    const double file_rate = rt.cached_meta.sample_rate > 0.0
+        ? rt.cached_meta.sample_rate
+        : rt.effective_sample_rate;
+    const auto rate_int = static_cast<uint64_t>(file_rate);
+    const bool rate_is_integral =
+        file_rate > 0.0 && static_cast<double>(rate_int) == file_rate;
+
+    uint64_t whole_seconds = 0;
+    uint64_t picoseconds = 0;
+
+    if (!rt.wallclock_timestamps && rate_is_integral) {
+        // Integer arithmetic, exact. Splitting a double instead -- take the whole
+        // part, subtract it back off, scale the remainder to picoseconds -- is a
+        // cancelling subtraction: once the seconds part is large the fraction keeps
+        // only the precision left over, and truncating the scaled result floors it.
+        // At 100 MSPS that made nearly every packet one picosecond low.
+        //
+        // Sample n sits at n * 1e12 / rate picoseconds. That product overflows 64
+        // bits, so the remainder is scaled in two 1e6 steps, each of which stays in
+        // range for any realistic rate, and the result is still an exact floor.
+        whole_seconds = chunk_start_sample / rate_int;
+        const uint64_t rem = chunk_start_sample % rate_int;   // samples into this second
+        const uint64_t scaled = rem * 1000000ULL;
+        picoseconds = (scaled / rate_int) * 1000000ULL
+                    + ((scaled % rate_int) * 1000000ULL) / rate_int;
     } else {
-        // File-time mode (default): position on the RECORDING's timeline, so this
-        // uses the file's true rate. effective_sample_rate is the throttled playback
-        // rate -- deriving file time from it let max_sample_rate silently rewrite the
-        // recording's timestamps.
-        const double file_rate = rt.cached_meta.sample_rate > 0.0
-            ? rt.cached_meta.sample_rate
-            : rt.effective_sample_rate;
-        offset_seconds = file_rate > 0.0
-            ? static_cast<double>(chunk_start_sample) / file_rate
-            : 0.0;
+        // Wall-clock mode, or a fractional sample rate: no exact integer form, so
+        // round instead of truncating and carry if rounding reaches a full second.
+        double offset_seconds = 0.0;
+        if (rt.wallclock_timestamps) {
+            const auto now = std::chrono::steady_clock::now();
+            offset_seconds = std::chrono::duration<double>(now - rt.start_time).count();
+        } else if (file_rate > 0.0) {
+            offset_seconds = static_cast<double>(chunk_start_sample) / file_rate;
+        }
+
+        const double whole = std::floor(offset_seconds);
+        whole_seconds = static_cast<uint64_t>(whole);
+        picoseconds = static_cast<uint64_t>(std::llround((offset_seconds - whole) * 1e12));
+        if (picoseconds >= kPsPerSec) {   // rounding can land on the next second
+            picoseconds -= kPsPerSec;
+            ++whole_seconds;
+        }
     }
 
-    // Split offset into integer seconds and sub-second fractional part
-    auto offset_int = static_cast<uint32_t>(offset_seconds);
-    double offset_frac = offset_seconds - offset_int;
-
-    ts.seconds = rt.utc_epoch_seconds + offset_int;
-    ts.picoseconds = static_cast<uint64_t>(offset_frac * 1e12);
+    // composite::timestamp documents picoseconds < 1e12 as an invariant.
+    ts.seconds = static_cast<uint32_t>(rt.utc_epoch_seconds + whole_seconds);
+    ts.picoseconds = picoseconds;
 
     // send_metadata() is gone in 0.5.2: metadata travels with the packet. Re-latch
     // only when it actually changed, so the hot path reuses one shared instance.
