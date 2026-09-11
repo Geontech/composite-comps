@@ -1,5 +1,5 @@
 {
-    "_comment": "Local rate-control check: sigmf_source replays a recording into rate_monitor, which reports observed vs expected sample rate. Library paths are build-tree paths; the installed image resolves modules by bare name (see examples/).",
+    "_comment": "Local rate-control check: sigmf_source replays a recording into rate_monitor, which reports observed vs expected sample rate. EDIT files[].path to point at your own recording before running. Run from the repository root: the library paths below are build-tree relative, and the installed image resolves modules by bare name instead (see examples/).",
     "components": [
         {
             "id": "source",
@@ -9,7 +9,7 @@
                 "destination_port": 5000,
                 "files": [
                     {
-                        "path": "/home/chinkey/temp/sigmf_test/test_1000msps_big",
+                        "path": "/path/to/your/recording",
                         "stream_id": 0,
                         "loop": true,
                         "rate_control": true,
