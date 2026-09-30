@@ -41,7 +41,7 @@ cmake_minimum_required(VERSION 3.22)
 #     not a convenience;
 #   * an image's framework pairing must be discoverable from the image itself --
 #     see the com.geontech.composite.version label in docker/Dockerfile.rocky9.
-project(composite-comps VERSION 0.1.0 LANGUAGES CXX)
+project(composite-comps VERSION 0.2.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
