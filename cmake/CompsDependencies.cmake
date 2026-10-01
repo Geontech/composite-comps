@@ -21,10 +21,37 @@
 # External dependencies, declared once for the whole project.
 #
 # Supersedes the former cmake/composite.cmake and cmake/vrtgen.cmake, and is the
-# only place composite, vrtgen, Catch2, IXWebSocket and Threads are declared.
+# only place composite, vrtgen, Catch2, IXWebSocket, nlohmann_json and Threads
+# are declared.
 # ---------------------------------------------------------------------------
 
 include(FetchContent)
+
+# --- nlohmann_json -------------------------------------------------------
+# sigmf_source parses .sigmf-meta JSON sidecars with it. Declared here with the
+# rest of the fleet's dependencies rather than in the component, so a second
+# consumer cannot redeclare it at a different version (the Catch2 note below is
+# what that mistake looks like in practice).
+#
+# Declared BEFORE the framework section on purpose: composite's own CMakeLists
+# calls find_package(nlohmann_json 3.11.3), so a fetched framework fails to
+# configure unless the target already exists at that point.
+find_package(nlohmann_json 3.11.0 QUIET)
+if(NOT TARGET nlohmann_json::nlohmann_json)
+    # OVERRIDE_FIND_PACKAGE so the framework's own
+    # find_package(nlohmann_json 3.11.3 REQUIRED) resolves to this copy. composite
+    # treats nlohmann_json as an installed system dep; without the override a
+    # fetched framework hard-fails on a box that has no system nlohmann_json.
+    FetchContent_Declare(nlohmann_json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+        OVERRIDE_FIND_PACKAGE
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+    message(STATUS "composite-comps: nlohmann_json fetched at v3.11.3")
+else()
+    message(STATUS "composite-comps: using installed nlohmann_json ${nlohmann_json_VERSION}")
+endif()
 
 # --- composite framework -------------------------------------------------
 # How the framework is acquired determines what a qualification run actually

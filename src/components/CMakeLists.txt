@@ -40,6 +40,8 @@ set(COMPS_COMPONENTS
     pkt_builder
     pkt_parser
     psd
+    rate_monitor
+    sigmf_source
     udp_sink
     udp_source
     ws_sink

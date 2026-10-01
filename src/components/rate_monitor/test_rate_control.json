@@ -1,0 +1,47 @@
+{
+    "_comment": "Local rate-control check: sigmf_source replays a recording into rate_monitor, which reports observed vs expected sample rate. EDIT files[].path to point at your own recording before running. Run from the repository root: the library paths below are build-tree relative, and the installed image resolves modules by bare name instead (see examples/).",
+    "components": [
+        {
+            "id": "source",
+            "library": "build/src/components/sigmf_source/libsigmf_source.so",
+            "properties": {
+                "chunk_samples": 8192,
+                "destination_port": 5000,
+                "files": [
+                    {
+                        "path": "/path/to/your/recording",
+                        "stream_id": 0,
+                        "loop": true,
+                        "rate_control": true,
+                        "wallclock_timestamps": false,
+                        "max_sample_rate": -1
+                    }
+                ],
+                "streaming": true
+            }
+        },
+        {
+            "id": "monitor",
+            "library": "build/src/components/rate_monitor/librate_monitor.so",
+            "args": {
+                "type": "bytes"
+            },
+            "properties": {
+                "report_interval_sec": 1.0,
+                "elements_per_sample": 8
+            }
+        }
+    ],
+    "connections": [
+        {
+            "output": {
+                "component": "source",
+                "port": "data_out"
+            },
+            "input": {
+                "component": "monitor",
+                "port": "data_in"
+            }
+        }
+    ]
+}
